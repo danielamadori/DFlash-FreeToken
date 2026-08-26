@@ -39,7 +39,6 @@ class ServerArgs(SchedulerConfig):
     # Comma-separated CORS allow-list for browser/webview clients (e.g. the desktop
     # app). Empty string disables CORS headers entirely; "*" allows any origin.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
-    api_key: str | None = None
     # --gpu entries in TP-rank order, empty = not given
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
@@ -626,13 +625,6 @@ def parse_args(
             "Comma-separated CORS allow-list for browser/webview clients "
             "(default: local Tauri/Vite dev origins). '' disables, '*' allows any."
         ),
-    )
-
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=os.environ.get("FREETOKEN_API_KEY", ServerArgs.api_key),
-        help="API key / password required for authentication (env: FREETOKEN_API_KEY).",
     )
 
     parser.add_argument(

@@ -444,6 +444,26 @@ def _served_model_name() -> str | None:
 
 
 @app.middleware("http")
+async def _api_key_auth_middleware(request: Request, call_next):
+    """Enforce API key authentication if --api-key / FREETOKEN_API_KEY is configured."""
+    st = _GLOBAL_STATE
+    cfg = getattr(st, "config", None) if st is not None else None
+    api_key = getattr(cfg, "api_key", None)
+    if api_key:
+        path = request.url.path
+        if path not in ("/health", "/docs", "/openapi.json", "/favicon.ico"):
+            auth_header = request.headers.get("authorization", "")
+            x_api_key = request.headers.get("x-api-key", "")
+            bearer = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else auth_header
+            if bearer != api_key and x_api_key != api_key:
+                return JSONResponse(
+                    {"error": {"message": "Invalid or missing API key", "type": "authentication_error", "code": 401}},
+                    status_code=401,
+                )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def _record_request_middleware(request: Request, call_next):
     """Time every generation request into the ring for /v1/requests + /v1/stats p95. Single-
     model server, so model = served_model_name; stream is inferred from the response media

@@ -420,6 +420,24 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+
+        self.draft_runner = None
+        if getattr(config, "spec_draft_model", None):
+            try:
+                from freetoken.engine.draft_runner import DFlashRunner
+
+                draft_dt = torch_dtype(config.spec_draft_dtype) if isinstance(config.spec_draft_dtype, str) else config.spec_draft_dtype
+                self.draft_runner = DFlashRunner(
+                    draft_model_path=config.spec_draft_model,
+                    target_model=self.model,
+                    device=self.device,
+                    dtype=draft_dt,
+                    block_size=config.spec_block_size,
+                )
+            except Exception as exc:
+                logger.warning_rank0(f"Failed to initialize DFlash draft runner: {exc}")
+                self.draft_runner = None
+
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
