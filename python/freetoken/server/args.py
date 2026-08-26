@@ -627,6 +627,32 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--draft-model",
+        "--spec-draft",
+        type=str,
+        dest="spec_draft_model",
+        default=ServerArgs.spec_draft_model,
+        help="Path or HuggingFace repo ID for the DFlash draft model used in speculative decoding.",
+    )
+
+    parser.add_argument(
+        "--spec-block-size",
+        type=int,
+        dest="spec_block_size",
+        default=ServerArgs.spec_block_size,
+        help="Block size (K tokens) for speculative decoding drafting (default: 5).",
+    )
+
+    parser.add_argument(
+        "--spec-draft-dtype",
+        type=str,
+        dest="spec_draft_dtype",
+        default=ServerArgs.spec_draft_dtype,
+        choices=["bfloat16", "float16", "float32"],
+        help="Data type for the draft model (default: bfloat16).",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
