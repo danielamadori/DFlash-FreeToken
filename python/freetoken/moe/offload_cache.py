@@ -5,8 +5,16 @@ import os
 from dataclasses import dataclass
 from typing import Iterator
 
-import torch
-from flashlib.kernels.slot_cache import N_STATS, Stat
+try:
+    from flashlib.kernels.slot_cache import N_STATS, Stat
+except ImportError:
+    N_STATS = 4
+
+    class Stat:
+        HITS = 0
+        MISSES = 1
+        EVICTIONS = 2
+        ALLOCATIONS = 3
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
