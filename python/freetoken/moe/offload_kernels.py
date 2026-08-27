@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import os
 
-import torch
-import triton
-import triton.language as tl
-from flashlib.kernels.slot_cache import lru_ensure
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+
+try:
+    from flashlib.kernels.slot_cache import lru_ensure
+except ImportError:
+    lru_ensure = None
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
