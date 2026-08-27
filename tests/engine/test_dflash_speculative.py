@@ -71,3 +71,37 @@ def test_server_args_spec_draft():
     assert server_args.spec_draft_model == "z-lab/Qwen3.6-35B-A3B-DFlash"
     assert server_args.spec_block_size == 7
     assert server_args.spec_draft_dtype == "bfloat16"
+
+
+def test_sampling_probs_temperature():
+    logits = torch.tensor([[2.0, 1.0, 0.0]])
+    probs_greedy = _sampling_probs(logits, temperature=0.0)
+    assert torch.allclose(probs_greedy, torch.tensor([[1.0, 0.0, 0.0]]))
+
+    probs_temp = _sampling_probs(logits, temperature=1.0)
+    assert probs_temp[0, 0] > probs_temp[0, 1] > probs_temp[0, 2]
+    assert torch.allclose(probs_temp.sum(dim=-1), torch.tensor([1.0]))
+
+
+def test_rejection_sample_stochastic():
+    gamma = 2
+    vocab_size = 10
+    draft_tokens = torch.tensor([[1, 2]], dtype=torch.long)
+    target_probs = torch.zeros((1, gamma + 1, vocab_size))
+    target_probs[0, 0, 1] = 1.0
+    target_probs[0, 1, 2] = 1.0
+    target_probs[0, 2, 3] = 1.0
+
+    draft_probs = torch.zeros((1, gamma, vocab_size))
+    draft_probs[0, 0, 1] = 1.0
+    draft_probs[0, 1, 2] = 1.0
+
+    accepted, next_tok = rejection_sample(
+        draft_tokens=draft_tokens,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        temperature=0.7,
+    )
+    assert accepted == 2
+    assert next_tok.item() == 3
+
