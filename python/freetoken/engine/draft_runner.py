@@ -29,6 +29,60 @@ def _ensure_dflash_importable() -> None:
                 break
 
 
+def _output_head(target: nn.Module) -> nn.Module:
+    """Output head of the target, transformers-style or FreeToken-style."""
+    head = getattr(target, "lm_head", None)
+    if head is not None:
+        return head
+    get_output_embeddings = getattr(target, "get_output_embeddings", None)
+    if get_output_embeddings is None:
+        raise TypeError(f"cannot locate the output head of {type(target).__name__}")
+    return get_output_embeddings()
+
+
+def _target_embedding_weight(target: nn.Module) -> torch.Tensor:
+    """Raw, un-normalised input embedding matrix of the target model.
+
+    DFlash's own helper reaches it through `get_input_embeddings()`, which exists only on
+    transformers modules. FreeToken models are plain objects holding a
+    VocabParallelEmbedding, and a vocabulary sharded across ranks would have to be
+    gathered first, so refuse that instead of drafting against a slice of the vocabulary.
+    """
+    get_input_embeddings = getattr(target, "get_input_embeddings", None)
+    if get_input_embeddings is not None:
+        return get_input_embeddings().weight
+
+    embedding = getattr(getattr(target, "model", None), "embed_tokens", None)
+    if embedding is None:
+        raise TypeError(
+            f"cannot locate the input embeddings of {type(target).__name__}: DFlash needs "
+            "either a transformers `get_input_embeddings()` or a `.model.embed_tokens`"
+        )
+    if getattr(embedding, "tp_size", 1) != 1:
+        raise NotImplementedError(
+            "DFlash drafting against a tensor-parallel sharded vocabulary is not supported"
+        )
+    return embedding.weight
+
+
+def _target_output_logits(target: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Project draft hidden states with the target's output head.
+
+    FreeToken's ParallelLMHead.forward reads the engine's current batch to slice the last
+    prefill position out, which is wrong for a [1, K, hidden] draft block, so apply the
+    linear it wraps directly.
+    """
+    head = _output_head(target)
+    if callable(head):
+        return head(hidden_states)
+    if getattr(head, "tp_size", 1) != 1:
+        raise NotImplementedError(
+            "DFlash drafting against a tensor-parallel sharded output head is not supported"
+        )
+    weight_owner = getattr(head, "tied_embedding", None) or head
+    return F.linear(hidden_states, weight_owner.weight, getattr(head, "bias", None))
+
+
 def _sampling_probs(
     logits: torch.Tensor,
     temperature: float,
@@ -142,8 +196,6 @@ class DFlashRunner:
             _make_cache,
             _crop_to,
             _draft_value,
-            _raw_input_embeddings,
-            _output_head,
             extract_context_feature,
         )
 
@@ -174,8 +226,6 @@ class DFlashRunner:
         
         self._make_cache = _make_cache
         self._crop_to = _crop_to
-        self._raw_input_embeddings = _raw_input_embeddings
-        self._output_head = _output_head
         self._extract_context_feature = extract_context_feature
         self._draft_cache = None
 
@@ -217,8 +267,9 @@ class DFlashRunner:
         )
         block_output_ids[:, 0] = current_token_id.view(1)
 
-        noise_emb = self._raw_input_embeddings(
-            self._target, block_output_ids, self.input_embedding_scale
+        noise_emb = (
+            F.embedding(block_output_ids, _target_embedding_weight(self._target))
+            * self.input_embedding_scale
         )
         
         pos = position_ids[:, seq_len - target_hidden.shape[1] : seq_len + k]
@@ -232,8 +283,7 @@ class DFlashRunner:
         
         self._crop_to(self._draft_cache, seq_len)
         
-        lm_head = self._output_head(self._target)
-        draft_logits = lm_head(draft_hidden)
+        draft_logits = _target_output_logits(self._target, draft_hidden)
         draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
         
         if temperature <= 0:

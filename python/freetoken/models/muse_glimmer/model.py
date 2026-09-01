@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -98,11 +99,40 @@ class MuseGlimmerModel(BaseOP):
         # Final norm scales by the raw checkpoint weight (plain RMSNorm, not the
         # centered (1+w) form the decoder norms use).
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Underscore-prefixed so BaseOP.state_dict skips them: they are runtime scratch,
+        # not weights.
+        self._capture_layer_ids: tuple[int, ...] = ()
+        self._captured_hidden_states: list[torch.Tensor | None] | None = None
+
+    def set_capture_layer_ids(self, layer_ids: Sequence[int]) -> None:
+        """Select which layers publish their output; empty disables the capture."""
+        num_layers = len(self.layers.op_list)
+        for layer_id in layer_ids:
+            if layer_id < -1 or layer_id >= num_layers:
+                raise ValueError(
+                    f"hidden-state capture asked for layer {layer_id}, but this model has "
+                    f"{num_layers} layers (-1 selects the embedding output)"
+                )
+        self._capture_layer_ids = tuple(layer_ids)
+        self._captured_hidden_states = None
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_norm.forward(self.embed_tokens.forward(input_ids))
-        for layer in self.layers.op_list:
+        if not self._capture_layer_ids:
+            for layer in self.layers.op_list:
+                x = layer.forward(x)
+            return self.norm.forward(x)
+
+        # Each layer returns a freshly allocated `residual + h`, so keeping the reference
+        # is enough -- nothing downstream writes into it in place.
+        captured: list[torch.Tensor | None] = [None] * (len(self.layers.op_list) + 1)
+        if -1 in self._capture_layer_ids:
+            captured[0] = x
+        for layer_id, layer in enumerate(self.layers.op_list):
             x = layer.forward(x)
+            if layer_id in self._capture_layer_ids:
+                captured[layer_id + 1] = x
+        self._captured_hidden_states = captured
         return self.norm.forward(x)
 
 
@@ -118,6 +148,13 @@ class MuseGlimmerForCausalLM(BaseLLMModel):
         self._output_multiplier = config.output_multiplier
         self._final_logit_softcapping = config.final_logit_softcapping
         super().__init__()
+
+    @property
+    def last_hidden_states(self) -> list[torch.Tensor | None] | None:
+        return self.model._captured_hidden_states
+
+    def enable_hidden_state_capture(self, layer_ids: Sequence[int]) -> None:
+        self.model.set_capture_layer_ids(layer_ids)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

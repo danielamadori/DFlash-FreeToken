@@ -285,3 +285,95 @@ def test_engine_speculative_missing_hidden_states_raises():
         with pytest.raises(RuntimeError, match="last_hidden_states"):
             mock_engine.forward_speculative_batch(batch, None)
     mock_engine._forward_batch_standard.assert_not_called()
+
+
+def test_base_model_refuses_hidden_state_capture_by_default():
+    """A model that cannot publish hidden states must say so, not capture nothing."""
+    from freetoken.models.blocks import BaseLLMModel
+
+    class _Plain(BaseLLMModel):
+        def forward(self):  # noqa: ANN201 - test stub
+            return torch.zeros(1)
+
+    model = _Plain()
+    assert model.last_hidden_states is None
+    with pytest.raises(NotImplementedError, match="hidden-state capture"):
+        model.enable_hidden_state_capture([0])
+
+
+def test_muse_glimmer_capture_uses_the_hf_layer_offset():
+    """Entry 0 is the embedding output and entry i+1 layer i, as DFlash indexes them."""
+    from types import SimpleNamespace
+    from freetoken.models.muse_glimmer.model import MuseGlimmerModel
+
+    class _StubLayer:
+        def __init__(self, delta: float) -> None:
+            self._delta = delta
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x + self._delta
+
+    # Bypass __init__: allocating real weights needs a checkpoint and a GPU, and the
+    # layout logic under test does not depend on either.
+    model = object.__new__(MuseGlimmerModel)
+    model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.zeros(1, len(ids), 4))
+    model.embed_norm = SimpleNamespace(forward=lambda x: x)
+    model.norm = SimpleNamespace(forward=lambda x: x)
+    model.layers = SimpleNamespace(op_list=[_StubLayer(1.0), _StubLayer(2.0), _StubLayer(4.0)])
+    model._capture_layer_ids = ()
+    model._captured_hidden_states = None
+
+    # capture off -> nothing published
+    model.forward(torch.tensor([7]))
+    assert model._captured_hidden_states is None
+
+    model.set_capture_layer_ids([-1, 1])
+    out = model.forward(torch.tensor([7]))
+    captured = model._captured_hidden_states
+
+    assert len(captured) == 4  # embeddings + 3 layers
+    assert captured[1] is None and captured[3] is None  # layers 0 and 2 not requested
+    assert torch.equal(captured[0], torch.zeros(1, 1, 4))  # embedding output
+    assert torch.equal(captured[2], torch.full((1, 1, 4), 3.0))  # after layers 0 and 1
+    assert torch.equal(out, torch.full((1, 1, 4), 7.0))  # all three layers applied
+
+    with pytest.raises(ValueError, match="layer 9"):
+        model.set_capture_layer_ids([9])
+
+
+def test_draft_runner_accessors_speak_both_module_protocols():
+    """The draft reads the target through FreeToken's plain objects and HF modules alike."""
+    from types import SimpleNamespace
+    from freetoken.engine.draft_runner import _target_embedding_weight, _target_output_logits
+
+    embed_weight = torch.randn(10, 4)
+    head_weight = torch.randn(10, 4)
+    hidden = torch.randn(1, 3, 4)
+
+    # FreeToken: plain objects, a non-callable head, no get_input_embeddings()
+    ft_head = SimpleNamespace(weight=head_weight, bias=None, tied_embedding=None, tp_size=1)
+    ft_target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=embed_weight, tp_size=1)),
+        lm_head=ft_head,
+    )
+    assert torch.equal(_target_embedding_weight(ft_target), embed_weight)
+    assert torch.allclose(
+        _target_output_logits(ft_target, hidden),
+        torch.nn.functional.linear(hidden, head_weight),
+    )
+
+    # transformers: get_input_embeddings() and a callable head
+    hf_head = torch.nn.Linear(4, 10, bias=False)
+    hf_target = SimpleNamespace(
+        get_input_embeddings=lambda: SimpleNamespace(weight=embed_weight),
+        lm_head=hf_head,
+    )
+    assert torch.equal(_target_embedding_weight(hf_target), embed_weight)
+    assert torch.allclose(_target_output_logits(hf_target, hidden), hf_head(hidden))
+
+    # a sharded vocabulary is refused, not silently drafted against a slice
+    sharded = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=embed_weight, tp_size=2))
+    )
+    with pytest.raises(NotImplementedError, match="tensor-parallel"):
+        _target_embedding_weight(sharded)

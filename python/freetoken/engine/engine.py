@@ -435,6 +435,9 @@ class Engine:
                 dtype=draft_dt,
                 block_size=config.spec_block_size,
             )
+            # The draft is conditioned on the target's hidden states at the layers its
+            # checkpoint was trained against, so the target has to publish them.
+            self.model.enable_hidden_state_capture(self.draft_runner.target_layer_ids)
 
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1005,12 +1008,12 @@ class Engine:
             top_k=top_k,
         )
 
-        # Verification forward pass on target model
+        # Verification forward pass on target model. Deliberately eager: a CUDA graph
+        # replay does not run the Python forward, so the captured hidden states would
+        # still be the previous step's and the next draft would be conditioned on stale
+        # context features -- wrong output, not just a slow one.
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
-                logits = self.graph_runner.replay(batch)
-            else:
-                logits = self.model.forward()
+            logits = self.model.forward()
 
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from freetoken.layers import (
@@ -22,6 +23,30 @@ if TYPE_CHECKING:
 class BaseLLMModel(ABC, BaseOP):
     @abstractmethod
     def forward(self) -> torch.Tensor: ...
+
+    @property
+    def last_hidden_states(self) -> list[torch.Tensor | None] | None:
+        """Per-layer hidden states of the last forward, or None when capture is off.
+
+        Laid out the way DFlash's ``extract_context_feature`` indexes them: entry 0 is
+        the embedding output and entry ``i + 1`` the output of layer ``i``. Layers that
+        were not requested stay None, so a draft needing two layers out of sixty does
+        not pin the other fifty-eight for the lifetime of the step.
+        """
+        return None
+
+    def enable_hidden_state_capture(self, layer_ids: Sequence[int]) -> None:
+        """Ask the model to publish `last_hidden_states` for `layer_ids` on each forward.
+
+        Models opt in by overriding this. The default refuses instead of quietly
+        capturing nothing: a draft model fed empty or stale context features produces
+        garbage candidates that the target then rejects, which looks like a bad
+        acceptance rate rather than the wiring bug it is.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement hidden-state capture, so it "
+            "cannot drive DFlash speculative decoding."
+        )
 
 
 class GatedMLP(BaseOP):
