@@ -256,7 +256,15 @@ class FlashInferBackend(BaseAttnBackend):
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
-            wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            # A speculative verification batch is a decode batch carrying several query
+            # tokens per request. FlashInfer's decode wrapper plans one query per request
+            # and rejects the mismatch, so multi-query decode goes through the append
+            # (prefill) wrapper, which takes an explicit qo_indptr.
+            wrapper=(
+                self.decode_wrappers
+                if batch.is_decode and max_seqlen_q == 1
+                else self.prefill_wrapper
+            ),
         )
 
     def reset_capture(self) -> None:

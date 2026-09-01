@@ -156,7 +156,7 @@ def test_muse_glimmer_capture_uses_the_hf_layer_offset():
     # Bypass __init__: allocating real weights needs a checkpoint and a GPU, and the
     # layout logic under test does not depend on either.
     model = object.__new__(MuseGlimmerModel)
-    model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.zeros(1, len(ids), 4))
+    model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.zeros(len(ids), 4))
     model.embed_norm = SimpleNamespace(forward=lambda x: x)
     model.norm = SimpleNamespace(forward=lambda x: x)
     model.layers = SimpleNamespace(op_list=[_StubLayer(1.0), _StubLayer(2.0), _StubLayer(4.0)])
@@ -173,9 +173,9 @@ def test_muse_glimmer_capture_uses_the_hf_layer_offset():
 
     assert len(captured) == 4  # embeddings + 3 layers
     assert captured[1] is None and captured[3] is None  # layers 0 and 2 not requested
-    assert torch.equal(captured[0], torch.zeros(1, 1, 4))  # embedding output
-    assert torch.equal(captured[2], torch.full((1, 1, 4), 3.0))  # after layers 0 and 1
-    assert torch.equal(out, torch.full((1, 1, 4), 7.0))  # all three layers applied
+    assert torch.equal(captured[0], torch.zeros(1, 4))  # embedding output
+    assert torch.equal(captured[2], torch.full((1, 4), 3.0))  # after layers 0 and 1
+    assert torch.equal(out, torch.full((1, 4), 7.0))  # all three layers applied
 
     with pytest.raises(ValueError, match="layer 9"):
         model.set_capture_layer_ids([9])
@@ -235,7 +235,7 @@ def test_qwen3_capture_materialises_the_carried_residual():
             return torch.full_like(x, self._delta), new_residual
 
     model = object.__new__(Qwen3Model)
-    model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.ones(1, len(ids), 4))
+    model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.ones(len(ids), 4))
     model.norm = SimpleNamespace(forward=lambda x, residual: (residual + x, None))
     model.layers = SimpleNamespace(op_list=[_StubLayer(2.0), _StubLayer(3.0)])
 
@@ -244,9 +244,9 @@ def test_qwen3_capture_materialises_the_carried_residual():
     captured = model._captured_hidden_states
 
     assert len(captured) == 3
-    assert torch.equal(captured[0], torch.ones(1, 1, 4))          # embeddings
-    assert torch.equal(captured[1], torch.full((1, 1, 4), 3.0))   # 1 (residual) + 2 (mlp out)
-    assert torch.equal(captured[2], torch.full((1, 1, 4), 6.0))   # 3 (residual) + 3 (mlp out)
+    assert torch.equal(captured[0], torch.ones(1, 4))          # embeddings
+    assert torch.equal(captured[1], torch.full((1, 4), 3.0))   # 1 (residual) + 2 (mlp out)
+    assert torch.equal(captured[2], torch.full((1, 4), 6.0))   # 3 (residual) + 3 (mlp out)
 
 
 def test_rejection_sample_refuses_a_single_verification_row():

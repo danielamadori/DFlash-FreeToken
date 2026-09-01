@@ -48,6 +48,7 @@ def _gib(n_bytes: int) -> str:
 
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
+from freetoken.engine.engine import ForwardOutput
 from freetoken.engine.draft_runner import _sampling_probs, rejection_sample
 from freetoken.engine.speculative import (
     DraftBlock,
@@ -136,6 +137,9 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         # --- speculative decoding state (one draft block in flight at a time) ---
         self._speculative_enabled = self.engine.draft_runner is not None
+        self._spec_blocks = 0
+        self._spec_drafted = 0
+        self._spec_accepted = 0
         self._draft_block: DraftBlock | None = None
         self._draft_tokens: torch.Tensor | None = None
         self._draft_probs: torch.Tensor | None = None
@@ -969,7 +973,13 @@ class Scheduler(SchedulerIOMixin):
         # The anchor is the token sampled last step: committed, but its KV is computed by
         # this forward, so it sits at cached_len.
         anchor_position = req.cached_len
-        visible = [None if h is None else h[:, : self._valid_hidden_rows] for h in hidden]
+        # FreeToken runs on a flat [num_tokens, hidden] activation, while DFlash expects the
+        # batched [1, tokens, hidden] transformers layout: take the committed rows and add
+        # the batch dimension back.
+        visible = [
+            None if h is None else h[: self._valid_hidden_rows].unsqueeze(0)
+            for h in hidden
+        ]
         positions = torch.arange(
             anchor_position + runner.block_size + 1, device=self.device, dtype=torch.int64
         ).unsqueeze(0)
@@ -1013,6 +1023,20 @@ class Scheduler(SchedulerIOMixin):
         rejected = commit_verified(req, block, accepted)
         self.cache_manager.free_rejected_positions(req, rejected)
         self._valid_hidden_rows = accepted + 1
+
+        # Acceptance is the whole economics of speculation: without it in the log, a draft that
+        # is never accepted looks like an engine that is merely slow.
+        self._spec_blocks += 1
+        self._spec_drafted += block.size
+        self._spec_accepted += accepted
+        if self._spec_blocks % 40 == 0:
+            logger.info_rank0(
+                f"DFlash: {self._spec_blocks} blocks, "
+                f"{self._spec_accepted / self._spec_blocks:.2f} accepted of "
+                f"{self._spec_drafted / self._spec_blocks:.1f} drafted per block "
+                f"({self._spec_accepted / max(self._spec_drafted, 1):.1%} acceptance, "
+                f"{1 + self._spec_accepted / self._spec_blocks:.2f} tokens per forward)"
+            )
 
         bonus_gpu = bonus.view(1).to(dtype=self.token_pool.dtype)
         # The bonus token is what the next forward reads back as its anchor.
