@@ -7,7 +7,7 @@ from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
 from freetoken.utils import nvtx_annotate
 
-from freetoken.models.blocks import BaseLLMModel, GatedMLP as Qwen3MLP
+from freetoken.models.blocks import BaseLLMModel, GatedMLP as Qwen3MLP, HiddenStateCapture
 
 from .attention import Qwen3Attention as Qwen3Attn
 
@@ -41,7 +41,7 @@ class Qwen3DecoderLayer(BaseOP):
         return x, residual
 
 
-class Qwen3Model(BaseOP):
+class Qwen3Model(BaseOP, HiddenStateCapture):
     def __init__(self, config: ModelConfig):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -58,8 +58,23 @@ class Qwen3Model(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        if not self._capture_layer_ids:
+            for layer in self.layers.op_list:
+                x, residual = layer.forward(x, residual)
+            return self.norm.forward(x, residual)[0]
+
+        # This family carries the residual forward: layer i returns (mlp_out, residual) and
+        # the add itself lands in the next layer's fused add+norm. Layer i's hidden state in
+        # HF terms is therefore residual + x, and it has to be materialised -- both buffers
+        # are written in place further down the stack, so a reference would go stale.
+        captured = self._new_capture_store()
+        if -1 in self._capture_layer_ids:
+            captured[0] = x.clone()
+        for layer_id, layer in enumerate(self.layers.op_list):
             x, residual = layer.forward(x, residual)
+            if layer_id in self._capture_layer_ids:
+                captured[layer_id + 1] = residual + x
+        self._captured_hidden_states = captured
         return self.norm.forward(x, residual)[0]
 
 

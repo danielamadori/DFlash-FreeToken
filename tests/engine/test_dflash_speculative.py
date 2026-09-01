@@ -377,3 +377,33 @@ def test_draft_runner_accessors_speak_both_module_protocols():
     )
     with pytest.raises(NotImplementedError, match="tensor-parallel"):
         _target_embedding_weight(sharded)
+
+
+def test_qwen3_capture_materialises_the_carried_residual():
+    """Qwen3 carries the residual to the next layer, so the capture must add it in."""
+    from types import SimpleNamespace
+    from freetoken.models.qwen3.model import Qwen3Model
+
+    class _StubLayer:
+        """Mimics the fused-residual contract: returns (mlp_out, residual)."""
+
+        def __init__(self, delta: float) -> None:
+            self._delta = delta
+
+        def forward(self, x, residual):  # noqa: ANN001 - test stub
+            new_residual = x if residual is None else residual + x
+            return torch.full_like(x, self._delta), new_residual
+
+    model = object.__new__(Qwen3Model)
+    model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.ones(1, len(ids), 4))
+    model.norm = SimpleNamespace(forward=lambda x, residual: (residual + x, None))
+    model.layers = SimpleNamespace(op_list=[_StubLayer(2.0), _StubLayer(3.0)])
+
+    model.set_capture_layer_ids([-1, 0, 1])
+    model.forward(torch.tensor([5]))
+    captured = model._captured_hidden_states
+
+    assert len(captured) == 3
+    assert torch.equal(captured[0], torch.ones(1, 1, 4))          # embeddings
+    assert torch.equal(captured[1], torch.full((1, 1, 4), 3.0))   # 1 (residual) + 2 (mlp out)
+    assert torch.equal(captured[2], torch.full((1, 1, 4), 6.0))   # 3 (residual) + 3 (mlp out)
