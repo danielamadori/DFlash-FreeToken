@@ -274,6 +274,23 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def free_rejected_positions(self, req: Req, positions: range) -> None:
+        """Return the KV pages computed for rejected speculative candidates.
+
+        The verification forward writes KV for every candidate; the ones past the accepted
+        prefix are dead the moment the target disagrees, and their pages have to go back to
+        the allocator or the request leaks a page per rejected token per step.
+
+        Only valid at page_size == 1, which the speculative path checks at startup: with a
+        larger page a rejected token can share its page with an accepted one, and freeing it
+        would drop KV that is still live.
+        """
+        if len(positions) == 0:
+            return
+        assert self.page_size == 1, "speculative rollback needs one page per token"
+        # clone: the row is a live view that allocate_paged rewrites on the next step
+        self._free(self.page_table[req.table_idx, positions.start : positions.stop].clone())
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)

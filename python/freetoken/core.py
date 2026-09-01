@@ -126,6 +126,10 @@ class Batch:
     # the scheduler/graph didn't set it.
     fla_metadata: "FLAMetadata | None" = field(default=None, init=False)
     padded_reqs: List[Req] = field(init=False)
+    # Speculative verification: score every position of the extend window, not just the last
+    # one. A normal extend batch only needs the logits that continue the sequence; verifying a
+    # draft block needs one row per candidate plus the bonus row.
+    all_logits: bool = field(default=False, init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.
     # This decode batch's padded per-row page-table rows. Attention backends that must read
     # positions anywhere in a request's history snapshot those rows before a captured replay

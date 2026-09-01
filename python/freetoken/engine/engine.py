@@ -288,6 +288,10 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Speculative step: every token it committed for its single request -- the accepted
+    # candidates followed by the target's bonus token. None for a plain step, where
+    # next_tokens_cpu already holds exactly one token per request.
+    committed_tokens_cpu: torch.Tensor | None = None
 
 
 class Engine:
@@ -425,7 +429,16 @@ class Engine:
         if getattr(config, "spec_draft_model", None):
             from freetoken.engine.draft_runner import DFlashRunner
 
-            draft_dt = torch_dtype(config.spec_draft_dtype) if isinstance(config.spec_draft_dtype, str) else config.spec_draft_dtype
+            # torch_dtype() is the default-dtype context manager, not a parser: calling it
+            # here handed transformers a context manager as the draft's dtype.
+            draft_dt = config.spec_draft_dtype
+            if isinstance(draft_dt, str):
+                resolved = getattr(torch, draft_dt, None)
+                if not isinstance(resolved, torch.dtype):
+                    raise ValueError(
+                        f"spec_draft_dtype {draft_dt!r} does not name a torch dtype"
+                    )
+                draft_dt = resolved
             # The draft model was requested explicitly, so a load failure is fatal: swallowing
             # it here would serve every request at 1x while the logs claim DFlash is enabled.
             self.draft_runner = DFlashRunner(
@@ -954,93 +967,25 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        if self.draft_runner is not None and not batch.is_prefill and batch.size == 1:
-            return self.forward_speculative_batch(batch, args)
         return self._forward_batch_standard(batch, args)
 
-    def forward_speculative_batch(
-        self,
-        batch: Batch,
-        args: BatchSamplingArgs,
-    ) -> ForwardOutput:
-        """Execute speculative decoding step using DFlash draft runner if available."""
-        if self.draft_runner is None or batch.is_prefill or batch.size != 1:
-            return self._forward_batch_standard(batch, args)
+    def forward_logits(self, batch: Batch) -> torch.Tensor:
+        """Run the target eagerly and return the logits of every scored position.
 
-        req = batch.reqs[0]
-        if not req.can_decode:
-            return self._forward_batch_standard(batch, args)
+        The scheduler's speculative step verifies a draft block with this: it needs one row
+        per candidate plus the bonus row (the batch carries all_logits), and it samples them
+        itself rather than taking a single next token.
 
+        Deliberately not a CUDA graph replay. A replay does not execute the Python forward,
+        so the hidden states captured for the next draft would still be the previous step's
+        -- wrong output rather than merely slow.
+        """
         assert torch.cuda.current_stream() == self.stream
-
-        # Target model intermediate representations for DFlash context feature extraction.
-        # No model in this tree publishes `last_hidden_states` yet, so this raises until the
-        # target forward pass is taught to keep its per-layer hidden states around. Returning
-        # the standard path instead would serve at 1x forever without a single log line.
-        target_hidden_states = getattr(self.model, "last_hidden_states", None)
-        if target_hidden_states is None:
-            raise RuntimeError(
-                f"DFlash speculative decoding is enabled but {type(self.model).__name__} does "
-                "not expose `last_hidden_states`, so the draft model cannot be fed the target's "
-                "context features. Publish them from the target forward pass, or start the "
-                "server without --draft-model."
-            )
-
-        current_token_id = batch.input_ids[0:1] if batch.input_ids is not None else req.input_ids[-1:]
-        seq_len = req.device_len
-        position_ids = (
-            batch.positions.unsqueeze(0)
-            if batch.positions is not None
-            else torch.arange(seq_len, device=self.device).unsqueeze(0)
-        )
-        temp = getattr(args, "temperature", 0.0) if args is not None else 0.0
-        top_p = getattr(args, "top_p", 1.0) if args is not None else 1.0
-        top_k = getattr(args, "top_k", 0) if args is not None else 0
-
-        # Draft candidate tokens block via DFlash runner
-        draft_tokens, draft_probs = self.draft_runner.draft(
-            target_hidden_states=target_hidden_states,
-            current_token_id=current_token_id,
-            position_ids=position_ids,
-            seq_len=seq_len,
-            temperature=temp,
-            top_p=top_p,
-            top_k=top_k,
-        )
-
-        # Verification forward pass on target model. Deliberately eager: a CUDA graph
-        # replay does not run the Python forward, so the captured hidden states would
-        # still be the previous step's and the next draft would be conditioned on stale
-        # context features -- wrong output, not just a slow one.
         with self.ctx.forward_batch(batch):
             logits = self.model.forward()
-
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
-
-        from freetoken.engine.draft_runner import rejection_sample, _sampling_probs
-
-        target_probs = _sampling_probs(logits[:1], temperature=temp, top_p=top_p, top_k=top_k)
-        if target_probs.dim() == 2:
-            target_probs = target_probs.unsqueeze(1)
-
-        accepted_count, next_token = rejection_sample(
-            draft_tokens=draft_tokens,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            temperature=temp,
-        )
-
-        for _ in range(accepted_count + 1):
-            req.complete_one()
-
-        next_tokens_gpu = next_token.to(dtype=torch.int32, device=self.device)
-        if next_tokens_gpu.dim() == 0:
-            next_tokens_gpu = next_tokens_gpu.unsqueeze(0)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
-        copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return logits
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

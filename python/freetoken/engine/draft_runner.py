@@ -139,6 +139,17 @@ def rejection_sample(
         (accepted_count, next_token_tensor)
     """
     gamma = draft_tokens.shape[1]
+    if target_probs.shape[1] != gamma + 1:
+        # The verification forward must score every candidate plus the bonus position.
+        # Handed a single decode row instead, the greedy branch below broadcasts one target
+        # token against all gamma candidates: it silently accepts nothing (speculation
+        # becomes pure overhead) until the draft happens to repeat that token, and then it
+        # indexes past the end. Refuse the shape instead of returning a plausible number.
+        raise ValueError(
+            f"target_probs must score all {gamma + 1} positions of the draft block "
+            f"(gamma={gamma} candidates + 1 bonus), got {tuple(target_probs.shape)}: the "
+            "verification forward has to run over the drafted tokens, not the last one"
+        )
     if temperature <= 0:
         # Greedy acceptance: accept as long as argmax matches
         target_tokens = torch.argmax(target_probs[:, :gamma], dim=-1)
@@ -259,6 +270,24 @@ class DFlashRunner:
         k = block_size or self.block_size
         if self._draft_cache is None:
             self.reset_cache()
+
+        if not target_hidden_states:
+            raise RuntimeError(
+                "DFlash drafting needs the target's per-layer hidden states, but the target "
+                "published none: either enable_hidden_state_capture was never called or the "
+                "model does not implement it."
+            )
+        missing = [
+            layer_id
+            for layer_id in self.target_layer_ids
+            if target_hidden_states[layer_id + 1] is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"the target published no hidden states for layers {missing}, which this "
+                "draft checkpoint was trained against; capture was enabled for a different "
+                "set of layers"
+            )
 
         target_hidden = self._extract_context_feature(target_hidden_states, self.target_layer_ids)
         

@@ -48,6 +48,15 @@ def _gib(n_bytes: int) -> str:
 
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
+from freetoken.engine.draft_runner import _sampling_probs, rejection_sample
+from freetoken.engine.speculative import (
+    DraftBlock,
+    commit_verified,
+    open_draft_block,
+    unsupported_reason,
+)
+
+
 class ForwardInput(NamedTuple):
     batch: Batch
     sample_args: BatchSamplingArgs
@@ -125,6 +134,28 @@ class Scheduler(SchedulerIOMixin):
                 toolcall_opener_for(getattr(config, "tool_call_parser", "")),
             )
         self.token_pool = self.table_manager.token_pool
+        # --- speculative decoding state (one draft block in flight at a time) ---
+        self._speculative_enabled = self.engine.draft_runner is not None
+        self._draft_block: DraftBlock | None = None
+        self._draft_tokens: torch.Tensor | None = None
+        self._draft_probs: torch.Tensor | None = None
+        # Hidden-state rows of the last forward that belong to committed tokens: the whole
+        # window after a prefill chunk, 1 after a plain decode step, accepted + 1 after a
+        # speculative one. The next draft is conditioned on exactly those rows.
+        self._valid_hidden_rows = 0
+        if self.engine.draft_runner is not None:
+            reason = unsupported_reason(
+                page_size=config.page_size,
+                is_swa=self.cache_manager.is_swa,
+                is_hybrid=self.cache_manager.is_hybrid,
+                tp_size=config.tp_info.size,
+                overlap_scheduling=not ENV.DISABLE_OVERLAP_SCHEDULING,
+            )
+            if reason is not None:
+                raise RuntimeError(
+                    "a draft model was requested but speculative decoding cannot run in this "
+                    f"configuration: {reason}"
+                )
         # Floor the prefill chunk by the cache manager's cap (DSV4: ~half the window pool) so a
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
@@ -303,7 +334,11 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, forward_output = last_data[0].batch, last_data[1]
+        # Indexed, not by name: ForwardOutput is a NamedTuple and the scheduler unit tests
+        # drive this path with a plain tuple standing in for one.
+        next_tokens_cpu, copy_done = forward_output[1], forward_output[2]
+        committed_tokens = getattr(forward_output, "committed_tokens_cpu", None)
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -334,42 +369,21 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
-                    )
-                )
+                if committed_tokens is not None:
+                    # Speculative step: one forward committed the accepted candidates and the
+                    # target's bonus token. The output-budget check belongs to the last of
+                    # them -- device_len already spans the whole block, so asking it for every
+                    # token would finish the request one token early.
+                    finished = False
+                    last = len(committed_tokens) - 1
+                    for j, token in enumerate(committed_tokens):
+                        finished = self._commit_one_token(
+                            req, token, reply, check_length=(j == last)
+                        )
+                        if finished:
+                            break
+                else:
+                    finished = self._commit_one_token(req, next_tokens_cpu[i], reply)
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -416,6 +430,55 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _commit_one_token(
+        self,
+        req: Req,
+        next_token_t: torch.Tensor,
+        reply: List[DetokenizeMsg],
+        *,
+        check_length: bool = True,
+    ) -> bool:
+        """Append one generated token, queue its reply, and report whether the request ended.
+
+        ``check_length`` is False for every token of a speculative block but the last: they
+        all share the request's post-block device_len, so each would read the same exhausted
+        budget and end the request before its own tokens were shipped.
+        """
+        req.append_host(next_token_t.unsqueeze(0))
+        next_token = int(next_token_t.item())
+        # EOS / stop-string -> "stop", output budget exhausted -> "length";
+        # EOS and stop strings win over length.
+        hit_length = check_length and not req.can_decode
+        hit_eos = not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+        matched_stop = (
+            self._match_stop_str(req)
+            if not hit_eos and req.sampling_params.stop_strs
+            else None
+        )
+        finished = hit_length or hit_eos or matched_stop is not None
+        finish_reason = (
+            ("stop" if (hit_eos or matched_stop is not None) else "length")
+            if finished
+            else None
+        )
+        if (
+            next_token == self.toolcall_anchor_id
+            and req.toolcall_anchor_len is None
+            and not finished
+        ):
+            req.toolcall_anchor_len = req.input_ids.numel()
+        reply.append(
+            DetokenizeMsg(
+                uid=req.uid,
+                next_token=next_token,
+                finished=finished,
+                finish_reason=finish_reason,
+                matched_stop=matched_stop,
+                stop_strs=req.sampling_params.stop_strs or None,
+            )
+        )
+        return finished
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -836,6 +899,9 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        # getattr: the scheduler unit tests call this on instances built without __init__.
+        if getattr(self, "_speculative_enabled", False):
+            self._maybe_draft(batch)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
@@ -868,10 +934,105 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
-        forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if getattr(self, "_draft_block", None) is not None:
+            # The speculative step places its own tokens: the accepted candidates are already
+            # in the pool where the forward read them, and the bonus goes to a slot that
+            # output_mapping -- built before verification decided how much survives -- cannot
+            # know.
+            forward_output = self._verify_draft(forward_input)
+        else:
+            # Snapshot before the forward: complete_one() collapses extend_len to 1.
+            self._valid_hidden_rows = batch.reqs[0].extend_len if batch.size == 1 else 0
+            forward_output = self.engine.forward_batch(batch, sample_args)
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+    def _maybe_draft(self, batch: Batch) -> None:
+        """Draft a block of candidates for a single-request decode batch.
+
+        Runs before _prepare_batch so the pages for the whole verification window are
+        allocated in one pass, and stages the candidates in the token pool, which is what the
+        forward actually reads. Any condition that makes a block unverifiable simply leaves
+        the batch as a plain decode step.
+        """
+        self._draft_block = None
+        runner = self.engine.draft_runner
+        if runner is None or not batch.is_decode or batch.size != 1:
+            return
+        hidden = self.engine.model.last_hidden_states
+        if not hidden or self._valid_hidden_rows == 0:
+            return
+
+        req = batch.reqs[0]
+        params = req.sampling_params
+        # The anchor is the token sampled last step: committed, but its KV is computed by
+        # this forward, so it sits at cached_len.
+        anchor_position = req.cached_len
+        visible = [None if h is None else h[:, : self._valid_hidden_rows] for h in hidden]
+        positions = torch.arange(
+            anchor_position + runner.block_size + 1, device=self.device, dtype=torch.int64
+        ).unsqueeze(0)
+        draft_tokens, draft_probs = runner.draft(
+            target_hidden_states=visible,
+            current_token_id=self.token_pool[req.table_idx, anchor_position].view(1),
+            position_ids=positions,
+            seq_len=anchor_position,
+            temperature=params.temperature,
+            top_p=params.top_p,
+            top_k=max(params.top_k, 0),
+        )
+
+        block = open_draft_block(req, int(draft_tokens.shape[1]))
+        if block.size == 0:
+            return
+        self._draft_tokens = draft_tokens[:, : block.size]
+        self._draft_probs = draft_probs[:, : block.size]
+        self.token_pool[
+            req.table_idx, block.first_position : block.first_position + block.size
+        ] = self._draft_tokens[0].to(self.token_pool.dtype)
+        batch.all_logits = True
+        self._draft_block = block
+
+    def _verify_draft(self, forward_input: ForwardInput) -> ForwardOutput:
+        """Score the drafted block with the target and keep the prefix it agrees with."""
+        batch = forward_input.batch
+        block = self._draft_block
+        req = batch.reqs[0]
+        params = req.sampling_params
+
+        logits = self.engine.forward_logits(batch)  # one row per drafted position + the bonus
+        target_probs = _sampling_probs(
+            logits, params.temperature, params.top_p, max(params.top_k, 0)
+        ).unsqueeze(0)
+        accepted_t, bonus = rejection_sample(
+            self._draft_tokens, target_probs, self._draft_probs, params.temperature
+        )
+        accepted = int(accepted_t)
+
+        rejected = commit_verified(req, block, accepted)
+        self.cache_manager.free_rejected_positions(req, rejected)
+        self._valid_hidden_rows = accepted + 1
+
+        bonus_gpu = bonus.view(1).to(dtype=self.token_pool.dtype)
+        # The bonus token is what the next forward reads back as its anchor.
+        self.token_pool[req.table_idx, req.device_len - 1] = bonus_gpu[0]
+        committed_cpu = torch.cat(
+            [self._draft_tokens[0, :accepted].to(bonus_gpu.dtype), bonus_gpu]
+        ).to("cpu")
+
+        self._draft_block = None
+        self._draft_tokens = None
+        self._draft_probs = None
+
+        copy_done = torch.cuda.Event()
+        copy_done.record(self.engine.stream)
+        return ForwardOutput(
+            next_tokens_gpu=bonus_gpu,
+            next_tokens_cpu=committed_cpu[-1:],
+            copy_done_event=copy_done,
+            committed_tokens_cpu=committed_cpu,
+        )
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

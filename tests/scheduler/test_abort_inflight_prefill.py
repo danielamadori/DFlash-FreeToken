@@ -16,7 +16,7 @@ Tests drive the real (unbound) Scheduler methods against CPU-built hybrid manage
 """
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -68,9 +68,12 @@ def _setup():
         _swa_token_usage=lambda: None,
         _gpu_mem_bytes=lambda: 0,
         _match_stop_str=lambda _req: None,
+        # real implementation: _process_last_data commits each generated token through it
+        _commit_one_token=None,  # bound below, once the stub object exists
         _pending_abort_acks=set(),
         _last_data=None,
     )
+    stub._commit_one_token = MethodType(Scheduler._commit_one_token, stub)
     stub._free_req_resources = lambda req: Scheduler._free_req_resources(stub, req)
     return pool, cm, tm, dm, pm, sent, stub
 
