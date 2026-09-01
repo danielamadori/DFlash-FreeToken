@@ -423,20 +423,18 @@ class Engine:
 
         self.draft_runner = None
         if getattr(config, "spec_draft_model", None):
-            try:
-                from freetoken.engine.draft_runner import DFlashRunner
+            from freetoken.engine.draft_runner import DFlashRunner
 
-                draft_dt = torch_dtype(config.spec_draft_dtype) if isinstance(config.spec_draft_dtype, str) else config.spec_draft_dtype
-                self.draft_runner = DFlashRunner(
-                    draft_model_path=config.spec_draft_model,
-                    target_model=self.model,
-                    device=self.device,
-                    dtype=draft_dt,
-                    block_size=config.spec_block_size,
-                )
-            except Exception as exc:
-                logger.warning_rank0(f"Failed to initialize DFlash draft runner: {exc}")
-                self.draft_runner = None
+            draft_dt = torch_dtype(config.spec_draft_dtype) if isinstance(config.spec_draft_dtype, str) else config.spec_draft_dtype
+            # The draft model was requested explicitly, so a load failure is fatal: swallowing
+            # it here would serve every request at 1x while the logs claim DFlash is enabled.
+            self.draft_runner = DFlashRunner(
+                draft_model_path=config.spec_draft_model,
+                target_model=self.model,
+                device=self.device,
+                dtype=draft_dt,
+                block_size=config.spec_block_size,
+            )
 
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -972,10 +970,18 @@ class Engine:
 
         assert torch.cuda.current_stream() == self.stream
 
-        # Target model intermediate representations for DFlash context feature extraction
+        # Target model intermediate representations for DFlash context feature extraction.
+        # No model in this tree publishes `last_hidden_states` yet, so this raises until the
+        # target forward pass is taught to keep its per-layer hidden states around. Returning
+        # the standard path instead would serve at 1x forever without a single log line.
         target_hidden_states = getattr(self.model, "last_hidden_states", None)
         if target_hidden_states is None:
-            return self._forward_batch_standard(batch, args)
+            raise RuntimeError(
+                f"DFlash speculative decoding is enabled but {type(self.model).__name__} does "
+                "not expose `last_hidden_states`, so the draft model cannot be fed the target's "
+                "context features. Publish them from the target forward pass, or start the "
+                "server without --draft-model."
+            )
 
         current_token_id = batch.input_ids[0:1] if batch.input_ids is not None else req.input_ids[-1:]
         seq_len = req.device_len

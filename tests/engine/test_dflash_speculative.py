@@ -252,3 +252,36 @@ def unittest_mock_cuda_stream(engine):
     return _mock_ctx()
 
 
+
+
+def test_engine_speculative_missing_hidden_states_raises():
+    """A target that publishes no hidden states must fail loudly, not decode at 1x."""
+    from unittest.mock import MagicMock
+    from freetoken.engine.engine import Engine
+    from freetoken.core import Batch, Req
+
+    mock_engine = MagicMock()
+    mock_engine.stream = None
+    mock_engine.draft_runner = MagicMock()
+    # spec=[] -> the model exposes no attributes, so `last_hidden_states` is missing
+    mock_engine.model = MagicMock(spec=[])
+    mock_engine.forward_speculative_batch = Engine.forward_speculative_batch.__get__(
+        mock_engine, Engine
+    )
+
+    req = Req(
+        input_ids=torch.tensor([1, 2, 3]),
+        table_idx=0,
+        cached_len=2,
+        output_len=1,
+        uid=1,
+        sampling_params=None,
+        cache_handle=None,
+    )
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+
+    with unittest_mock_cuda_stream(mock_engine):
+        with pytest.raises(RuntimeError, match="last_hidden_states"):
+            mock_engine.forward_speculative_batch(batch, None)
+    mock_engine._forward_batch_standard.assert_not_called()
