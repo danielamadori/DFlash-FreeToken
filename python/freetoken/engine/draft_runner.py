@@ -124,7 +124,13 @@ def _target_output_logits(target: nn.Module, hidden_states: torch.Tensor) -> tor
     from freetoken.layers.gguf import GGUFLinear
 
     if isinstance(head, GGUFLinear):
-        return GGUFLinear.forward(head, hidden_states)
+        # fused_mul_mat_gguf treats dim 0 as the batch and accepts no further leading dims,
+        # unlike F.linear, so a [1, K, hidden] draft block is folded and restored around it.
+        # Leaving it 3-D does not raise: it comes back with a rank the caller then indexes
+        # past the end of, far from here.
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        out = GGUFLinear.forward(head, flat)
+        return out.reshape(*hidden_states.shape[:-1], out.shape[-1])
 
     weight_owner = getattr(head, "tied_embedding", None) or head
     return F.linear(hidden_states, weight_owner.weight, getattr(head, "bias", None))

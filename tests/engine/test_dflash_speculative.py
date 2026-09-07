@@ -261,6 +261,8 @@ def test_draft_projects_through_a_quantized_head_without_its_last_position_slice
 
     def plain_projection(self, x: torch.Tensor) -> torch.Tensor:
         used.append("GGUFLinear")
+        # Like the real fused GGUF matmul: 2-D only, dim 0 is the batch.
+        assert x.dim() == 2, f"the GGUF matmul takes [tokens, features], got {tuple(x.shape)}"
         return x @ table.T
 
     monkeypatch.setattr(gguf_layers.GGUFLinear, "forward", plain_projection)
