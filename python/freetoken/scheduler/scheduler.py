@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import time
+
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -58,6 +61,30 @@ from freetoken.engine.speculative import (
     open_draft_block,
     unsupported_reason,
 )
+
+
+
+_SPEC_TIMING = bool(os.environ.get("FREETOKEN_SPEC_TIMING"))
+
+
+def _spec_timing_start():
+    """A synchronised timestamp, or None when timing is off. CUDA is async: without the
+    synchronise the numbers attribute a phase's cost to whichever phase happens to wait."""
+    if not _SPEC_TIMING:
+        return None
+    import torch
+
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _spec_timing_mark(scheduler, phase: str, started) -> None:
+    if started is None:
+        return
+    import torch
+
+    torch.cuda.synchronize()
+    scheduler._spec_ms[phase] += (time.perf_counter() - started) * 1000.0
 
 
 class ForwardInput(NamedTuple):
@@ -140,6 +167,11 @@ class Scheduler(SchedulerIOMixin):
         # --- speculative decoding state (one draft block in flight at a time) ---
         self._speculative_enabled = self.engine.draft_runner is not None
         self._spec_blocks = 0
+        # Phase timings for one speculative block, in milliseconds, accumulated when
+        # FREETOKEN_SPEC_TIMING is set. Speculation can cost more than it saves, and the only
+        # way to know which phase is doing it is to time them separately: the acceptance rate
+        # says how well the draft guesses, never what the guessing cost.
+        self._spec_ms: dict[str, float] = {"draft": 0.0, "verify": 0.0, "rewind": 0.0}
         self._spec_drafted = 0
         self._spec_accepted = 0
         self._draft_block: DraftBlock | None = None
@@ -998,6 +1030,7 @@ class Scheduler(SchedulerIOMixin):
         positions = torch.arange(
             anchor_position + runner.block_size + 1, device=self.device, dtype=torch.int64
         ).unsqueeze(0)
+        _t0 = _spec_timing_start()
         draft_tokens, draft_probs = runner.draft(
             target_hidden_states=visible,
             current_token_id=self.token_pool[req.table_idx, anchor_position].view(1),
@@ -1008,6 +1041,7 @@ class Scheduler(SchedulerIOMixin):
             top_k=max(params.top_k, 0),
         )
 
+        _spec_timing_mark(self, "draft", _t0)
         block = open_draft_block(req, int(draft_tokens.shape[1]))
         if block.size == 0:
             return
@@ -1031,10 +1065,12 @@ class Scheduler(SchedulerIOMixin):
         if rollback is not None:
             rollback.open(req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx)
             ctx.gdn_rollback = rollback
+        _t0 = _spec_timing_start()
         try:
             logits = self.engine.forward_logits(batch)  # one row per drafted position + bonus
         finally:
             ctx.gdn_rollback = None
+        _spec_timing_mark(self, "verify", _t0)
         if spec_trace.enabled():
             # Row i decides the token at first_position + i, which is the same position the
             # plain path reports as req.device_len when it predicts it.
@@ -1050,7 +1086,9 @@ class Scheduler(SchedulerIOMixin):
 
         # Before the KV rollback, so both caches leave this block agreeing on the same prefix.
         if rollback is not None:
+            _t1 = _spec_timing_start()
             rollback.rewind(accepted)
+            _spec_timing_mark(self, "rewind", _t1)
 
         rejected = commit_verified(req, block, accepted)
         self.cache_manager.free_rejected_positions(req, rejected)
@@ -1063,7 +1101,14 @@ class Scheduler(SchedulerIOMixin):
         self._spec_accepted += accepted
         if self._spec_blocks % 40 == 0:
             logger.info_rank0(
-                f"DFlash: {self._spec_blocks} blocks, "
+                (
+                    f"DFlash phases per block (ms): "
+                    + ", ".join(
+                        f"{k}={v / self._spec_blocks:.1f}" for k, v in self._spec_ms.items()
+                    )
+                    + " | " if _SPEC_TIMING else ""
+                )
+                + f"DFlash: {self._spec_blocks} blocks, "
                 f"{self._spec_accepted / self._spec_blocks:.2f} accepted of "
                 f"{self._spec_drafted / self._spec_blocks:.1f} drafted per block "
                 f"({self._spec_accepted / max(self._spec_drafted, 1):.1%} acceptance, "
