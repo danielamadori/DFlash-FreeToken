@@ -36,9 +36,6 @@ from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
-# Verify that LinearGatedDeltaGroupConfig is available for isinstance checks
-# (imported above in the config module import)
-
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
@@ -57,6 +54,10 @@ from freetoken.models.gguf.dequant import (
 
 if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
+
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 _ARCH = "qwen35moe"
 
@@ -100,10 +101,22 @@ def _uniform_expert_types(model_path: str, num_layers: int) -> tuple[int, int] |
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     block_count = int(_kv(shim, "block_count"))
-    # llama.cpp appends the NextN/MTP block to the decoder stack. FreeToken serves
-    # text-only without speculative decoding, so the MTP block is not a decoder layer.
+    # llama.cpp appends its NextN/MTP block to the decoder stack. That block is llama.cpp's
+    # OWN speculative mechanism -- a head trained to predict the following token from the
+    # same trunk -- and this engine does not implement it. Its speculative decoding is
+    # DFlash, which runs a SEPARATE draft checkpoint, so the MTP block is not a decoder
+    # layer here and its weights are skipped (see gguf_tensor_name and iter_gguf_weights).
+    #
+    # Do not read this as "no speculation": with --draft-model set, this engine speculates,
+    # just not with the block inside this file.
     nextn = int(_kv(shim, "nextn_predict_layers", 0))
     num_layers = block_count - nextn
+    if nextn:
+        logger.info_rank0(
+            f"GGUF carries {nextn} NextN/MTP block(s) after the {num_layers} decoder layers: "
+            "skipped. That is llama.cpp's own speculative head, which this engine does not "
+            "serve; DFlash speculation uses a separate --draft-model."
+        )
 
     hidden_size = int(_kv(shim, "embedding_length"))
     num_qo_heads = int(_kv(shim, "attention.head_count"))
@@ -299,7 +312,9 @@ def gguf_name_to_freetoken(name: str, num_layers: int) -> str | None:
     _, idx, suffix = name.split(".", 2)
     layer = int(idx)
     if layer >= num_layers:
-        return None  # the trailing NextN/MTP block: served text-only, no speculation
+        # The trailing NextN/MTP block: llama.cpp's own speculative head, not a decoder
+        # layer and not what DFlash uses (that is a separate draft checkpoint).
+        return None
     if suffix.startswith("nextn."):
         return None
     if suffix in _EXPERT_SUFFIXES:
@@ -549,7 +564,10 @@ def iter_gguf_weights(
         if not name.startswith("blk."):
             continue
 
-        # Skip block 40 (NextN/MTP, dropped) and nextn.* tensors.
+        # Skip the trailing NextN/MTP block and its nextn.* tensors. The bound is
+        # config.num_layers, already net of nextn_predict_layers -- the block index varies
+        # by checkpoint (64 on Qwen3.8-27B, 40 on Ornith-1.5-35B-A3B), so do not read a
+        # specific number into this.
         if layer >= config.num_layers:
             continue
         if "nextn." in name:
