@@ -206,7 +206,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        # The decode kernel takes one token per sequence: its `q` is [1, num_seqs, ...] and it
+        # indexes state by sequence. A verification forward carries a whole drafted block for
+        # one sequence, so it must go down the chunk path even though the phase says decode.
+        one_token_each = total == fla.cu_seqlens.numel() - 1
+        if batch.is_decode and one_token_each:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

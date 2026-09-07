@@ -63,14 +63,20 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     def gdn_slot(r):
         return r.linear_slot_idx if r.linear_slot_idx is not None else r.table_idx
 
-    if batch.is_decode:
+    # "decode" is a phase, not a promise of one token per request: a speculative verification
+    # scores a whole drafted block in the decode phase. The arange below encodes exactly that
+    # promise, so taking it with an 8-token block hands the kernels a cu_seqlens of [0, 1] for
+    # 8 rows -- which the GDN decode kernel reads past, as an illegal memory access. Fall
+    # through to the general branch, which derives the lengths from the requests themselves.
+    if batch.is_decode and all(r.extend_len == 1 for r in reqs):
         bs = len(reqs)
         cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
         assert batch.linear_table_idx is not None
         return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)
 
-    # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
+    # Extend windows (prefill, or a speculative block being verified): cumsum of query
+    # lengths, per-request slot + continuation flags.
     lens = [r.extend_len for r in reqs]
     cu_host = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0)
     idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
