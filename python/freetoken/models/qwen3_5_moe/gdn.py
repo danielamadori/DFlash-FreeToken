@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+import os
+
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, LinearColParallelMerged
 
@@ -38,6 +40,9 @@ class _GatedRMSNorm(BaseOP):
             x=x, weight=self.weight, bias=None, z=z, eps=self.eps,
             is_rms_norm=True, norm_before_gate=True, activation="silu",
         )
+
+
+_FORWARD_TIMING = bool(os.environ.get("FREETOKEN_FORWARD_TIMING"))
 
 
 def rescan_prefix_fused(entries, *, live_slot: int, scratch_slot: int, committed: int) -> None:
@@ -256,6 +261,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
+        _t_proj0 = None
+        # The verification forward is in the decode PHASE but takes the extend path (several
+        # rows for one sequence), so the phase flag is the wrong test here; row count is right.
+        if _FORWARD_TIMING and total > fla.cu_seqlens.numel() - 1 and not torch.cuda.is_current_stream_capturing():
+            _t_proj0 = torch.cuda.Event(enable_timing=True); _t_proj0.record()
         if self._fp8:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
@@ -266,6 +276,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
+        if _t_proj0 is not None:
+            from .model import _PENDING_EVENTS
+            _t_proj1 = torch.cuda.Event(enable_timing=True); _t_proj1.record()
+            _PENDING_EVENTS.append(("gdn.in_proj", _t_proj0, _t_proj1))
 
         # The decode kernel takes one token per sequence: its `q` is [1, num_seqs, ...] and it
         # indexes state by sequence. A verification forward carries a whole drafted block for
@@ -287,8 +301,15 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
         else:
+            timing = _FORWARD_TIMING and not torch.cuda.is_current_stream_capturing()
+            if timing:
+                from .model import _PENDING_EVENTS
+                ev = lambda: (lambda e: (e.record(), e)[1])(torch.cuda.Event(enable_timing=True))
+                t_conv0 = ev()
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            if timing:
+                t_conv1 = ev()
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
@@ -302,12 +323,19 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
             track = fla.track_dst is not None
+            if timing:
+                t_chunk0 = ev()
             result = gdn_prefill_chunk_fla(
                 q, k, v, g, beta,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
                 return_h=track,
             )
+            if timing:
+                t_chunk1 = ev()
+                _PENDING_EVENTS.append(("gdn.conv", t_conv0, t_conv1))
+                _PENDING_EVENTS.append(("gdn.gate+reshape", t_conv1, t_chunk0))
+                _PENDING_EVENTS.append(("gdn.chunk", t_chunk0, t_chunk1))
             rollback = ctx.gdn_rollback
             if rollback is not None and rollback.recording:
                 # Kept for a possible rewind: a rejected block needs these rows to walk the
@@ -325,8 +353,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
+        if _t_proj0 is not None:
+            _t_out0 = torch.cuda.Event(enable_timing=True); _t_out0.record()
         out = self.norm.forward(core_out, z).reshape(total, -1)
-        return self.out_proj.forward(out)
+        result_out = self.out_proj.forward(out)
+        if _t_proj0 is not None:
+            _t_out1 = torch.cuda.Event(enable_timing=True); _t_out1.record()
+            _PENDING_EVENTS.append(("gdn.norm+out_proj", _t_out0, _t_out1))
+        return result_out
 
 
 __all__ = ["Qwen3_5GatedDeltaNet"]

@@ -31,6 +31,11 @@ _FORWARD_TIMING = bool(os.environ.get("FREETOKEN_FORWARD_TIMING"))
 # rows -> [transformer_ms, head_ms, calls]; keyed by row count so a one-row decode and an
 # eight-row verification are never averaged into one meaningless number.
 _FORWARD_MS: dict[int, list[float]] = {}
+# (kind, start_event, end_event) for every sublayer of the forward in flight; drained and
+# bucketed by kind once the forward has been synchronised.
+_PENDING_EVENTS: list = []
+# rows -> kind -> accumulated ms across calls
+_SUBLAYER_MS: dict[int, dict[str, float]] = {}
 
 
 class Qwen3_5DecoderLayer(BaseOP):
@@ -73,6 +78,20 @@ class Qwen3_5DecoderLayer(BaseOP):
             hidden = self.input_layernorm.forward(hidden)
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
+        if _FORWARD_TIMING and not torch.cuda.is_current_stream_capturing():
+            # CUDA events, not host syncs: a sync per layer would serialise the stream and time
+            # the stalls it created. Elapsed times are read once, after the whole forward.
+            e0 = torch.cuda.Event(enable_timing=True); e0.record()
+            hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+            e1 = torch.cuda.Event(enable_timing=True); e1.record()
+            hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
+            e2 = torch.cuda.Event(enable_timing=True); e2.record()
+            hidden = self.mlp.forward(hidden)
+            e3 = torch.cuda.Event(enable_timing=True); e3.record()
+            _PENDING_EVENTS.append(("gdn" if self._is_linear else "attn", e0, e1))
+            _PENDING_EVENTS.append(("norm", e1, e2))
+            _PENDING_EVENTS.append(("mlp", e2, e3))
+            return hidden, residual
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
         hidden = self.mlp.forward(hidden)
@@ -175,10 +194,15 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         entry[0] += (t1 - t0) * 1000.0
         entry[1] += (t2 - t1) * 1000.0
         entry[2] += 1
+        by_kind = _SUBLAYER_MS.setdefault(rows, {})
+        for kind, e_start, e_end in _PENDING_EVENTS:
+            by_kind[kind] = by_kind.get(kind, 0.0) + e_start.elapsed_time(e_end)
+        _PENDING_EVENTS.clear()
         if entry[2] % 40 == 0:
+            parts = ", ".join(f"{k}={v / entry[2]:.1f}" for k, v in sorted(by_kind.items()))
             logger.info_rank0(
                 f"forward @{rows} rows x{entry[2]}: transformer={entry[0] / entry[2]:.1f}ms "
-                f"head={entry[1] / entry[2]:.1f}ms"
+                f"head={entry[1] / entry[2]:.1f}ms | sublayers(ms): {parts}"
             )
         return logits
 
