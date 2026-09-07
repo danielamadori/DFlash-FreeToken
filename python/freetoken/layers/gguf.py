@@ -63,23 +63,24 @@ _UNQUANTIZED_DTYPE = {
 
 from .base import BaseOP
 
-# Up to this many activation rows the batched MMVQ kernel is used for every quant type, MMQ
-# above it. The value is measured, not inherited: vLLM's heuristic (6) was the original, and
-# raising it looked like a loss in one end-to-end test -- until the conv's host sync was
-# removed, which had been amplifying every per-launch latency difference. Measured after that
-# on Qwen3.8-27B-UD-Q4_K_S at 8 rows, per (type, shape) on the real tensors and end to end:
-# MMVQ beats MMQ by ~2.8 ms per forward across the MMQ-capable types, the Q6_K head by 0.6 ms
-# alone, and picking per shape adds only 0.3 ms, so a threshold is enough. Matches llama.cpp's
-# own MMVQ_MAX_BATCH_SIZE of 8. See docs/plans/gdn-speculative-rollback.md, kernel table.
-_MMVQ_SAFE = 8
+# Up to this many activation rows the quantized GEMV (MMVQ, or the planar kernel at 2..8
+# columns) is used; above it the weight is dequantized once and multiplied dense on the tensor
+# cores. The two thresholds differ only because the types split into two cost curves, measured
+# DRAM-cold on the real tensors of Qwen3.8-27B-UD-Q4_K_S (scripts/spec/kernel_rows.py in the
+# Agents repo, 2026-09-08): the GEMV grows linearly with the row count (it re-reads the weight
+# once per group of 8 columns) while dequantize+GEMM is nearly flat (0.46 ms for a 17408x5120
+# tensor from 8 to 128 rows, the dequantization dominating), so they cross at ~52 rows for the
+# K-quants and ~72 for the I-quants, whose GEMV is cheaper per column.
+_MMVQ_SAFE = 48
+_MMVQ_NO_MMQ_LIMIT = 72
 
-# Above _MMVQ_SAFE, a type with no MMQ kernel is not choosing between two GEMMs: its only other
-# option is dequantizing the whole matrix and multiplying dense. That is worth it for a long
-# prefill, where the dequantized weight is reused across hundreds of rows, and ruinous for the
-# handful of rows a speculative verification carries -- on Qwen3.8-27B-UD-Q4_K_S it means
-# dequantizing 6.82 GiB per forward to multiply seven rows. So MMVQ stays the choice for those
-# types up to a window this size, since its kernel takes any row count.
-_MMVQ_NO_MMQ_LIMIT = 32
+# The vendored MMQ (kernel/csrc/gguf/mmq.cuh) is llama.cpp b2899's dp4a tile kernel: no tensor
+# cores. Measured against both alternatives at 8, 16, 24, 32, 48, 64, 128 and 256 rows on every
+# type and shape of this model, it never won a single case -- 1.2x to 2x slower than the GEMV
+# below the crossover (Q3_K 17408x5120 at 48 rows: 0.833 vs 0.413 ms) and 2x to 5x slower than
+# dequantize+GEMM above it (the same tensor at 256 rows: 4.385 vs 0.563). It stays in the tree
+# because the MoE path still calls it, and because a port of upstream's tensor-core MMQ would
+# replace it; it is simply not on this dispatch any more.
 
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
@@ -87,9 +88,9 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 
     Dispatch order:
     1. Unquantized (F32/F16/BF16): plain torch matmul
-    2. Small-batch quantized (batch <= 6, in MMVQ_TYPES): GEMV kernel
-    3. Large-batch standard quants (in MMQ_TYPES): MMQ kernel
-    4. Large-batch with I-quants (in DEQUANT_TYPES but not MMQ_TYPES): dequant + torch matmul
+    2. Few rows (see _MMVQ_SAFE / _MMVQ_NO_MMQ_LIMIT), in MMVQ_TYPES: quantized GEVM kernel
+    3. More rows, in DEQUANT_TYPES: dequantize the weight once, then a dense tensor-core matmul
+    4. Otherwise MMQ, which today only a type outside DEQUANT_TYPES can reach
     """
     from freetoken.kernel.gguf import (
         ggml_dequantize,
@@ -121,13 +122,13 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         _MMVQ_SAFE if qweight_type in MMQ_TYPES else _MMVQ_NO_MMQ_LIMIT
     ):
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
-    if qweight_type in MMQ_TYPES:
-        return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
     if qweight_type in DEQUANT_TYPES:
         block, type_size = BLOCK_SHAPE[qweight_type]
         in_features = qweight.shape[1] // type_size * block
         weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
         return x @ weight.T
+    if qweight_type in MMQ_TYPES:
+        return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
     raise NotImplementedError(f"unsupported GGUF type {GGML_NAME.get(qweight_type, qweight_type)}")
 
 

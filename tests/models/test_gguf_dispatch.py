@@ -191,15 +191,20 @@ class TestSmallBatchMMVQ:
 
 
 class TestLargeBatchStandardQuants:
-    """Test large-batch K-quants and standard quants dispatch to ggml_mul_mat_a8 (MMQ)."""
+    """Above the threshold a K-quant is dequantized once and multiplied dense, not sent to MMQ.
+
+    The vendored MMQ has no tensor cores and lost every measured case on this hardware (see the
+    comment on _MMVQ_SAFE), so the dispatch prefers the dense path wherever a dequant kernel
+    exists, which for this model is every type it serves.
+    """
 
     @pytest.mark.parametrize("qweight_type", [
         GGML_Q2_K,
         GGML_Q4_K,
         GGML_Q6_K,
     ])
-    def test_kquant_large_batch_takes_mmq(self, mock_kernel_module, qweight_type):
-        """K-quants at large batch call ggml_mul_mat_a8."""
+    def test_kquant_large_batch_takes_dequant(self, mock_kernel_module, qweight_type):
+        """K-quants above the threshold dequantize and use a dense matmul."""
         out_features = 4096
         in_features = 4096
         batch_size = _MMVQ_SAFE + 1  # Large batch (above threshold)
@@ -209,15 +214,12 @@ class TestLargeBatchStandardQuants:
 
         result = fused_mul_mat_gguf(x, qweight, qweight_type)
 
-        # MMQ kernel should have been called
-        assert mock_kernel_module["ggml_mul_mat_a8"] is not None
+        assert mock_kernel_module["ggml_dequantize"] is not None
+        assert mock_kernel_module["ggml_mul_mat_a8"] is None
         assert mock_kernel_module["ggml_mul_mat_vec_a8"] is None
-        assert mock_kernel_module["ggml_dequantize"] is None
 
-        call_info = mock_kernel_module["ggml_mul_mat_a8"]
-        assert call_info["x_shape"] == (batch_size, in_features)
+        call_info = mock_kernel_module["ggml_dequantize"]
         assert call_info["qweight_type"] == qweight_type
-        assert call_info["out_features"] == out_features
         assert result.shape == (batch_size, out_features)
 
 
@@ -326,7 +328,7 @@ class TestMMVQThresholdTracking:
     """Test that _MMVQ_SAFE constant is properly used in dispatch."""
 
     def test_mmvq_threshold_boundary(self, mock_kernel_module):
-        """At batch == _MMVQ_SAFE, MMVQ path is taken; at +1, MMQ path is taken."""
+        """At batch == _MMVQ_SAFE the GEVM is used; at +1 the dense (dequantized) path is."""
         out_features = 4096
         in_features = 4096
         qweight_type = GGML_Q4_K
@@ -342,8 +344,9 @@ class TestMMVQThresholdTracking:
         mock_kernel_module["ggml_mul_mat_vec_a8"] = None
         mock_kernel_module["ggml_mul_mat_a8"] = None
 
-        # Test above threshold: should use MMQ
+        # Test above threshold: should dequantize and multiply dense
         x_above_threshold = torch.randn(_MMVQ_SAFE + 1, in_features, dtype=torch.bfloat16)
         result = fused_mul_mat_gguf(x_above_threshold, qweight, qweight_type)
-        assert mock_kernel_module["ggml_mul_mat_a8"] is not None
+        assert mock_kernel_module["ggml_dequantize"] is not None
+        assert mock_kernel_module["ggml_mul_mat_a8"] is None
         assert mock_kernel_module["ggml_mul_mat_vec_a8"] is None
