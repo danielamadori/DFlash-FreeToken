@@ -240,6 +240,33 @@ def rejection_sample(
     return accepted, _sample_probs(residual[None])[0]
 
 
+def _resolve_draft_gguf(draft_model_path: str) -> str | None:
+    """The GGUF holding this draft's weights, or None if the path is an HF checkpoint.
+
+    ``resolve_gguf_path`` accepts a file, or a directory holding a multi-shard set. A draft is
+    one small file, and pointing at a directory that holds it beside its config.json is the
+    natural way to pass one, so that case is resolved here rather than by widening the shared
+    resolver, which serves target models with their own conventions.
+    """
+    import glob
+    import os
+
+    resolved = resolve_gguf_path(draft_model_path)
+    if resolved is not None:
+        return resolved
+    if not os.path.isdir(draft_model_path):
+        return None
+    candidates = sorted(glob.glob(os.path.join(draft_model_path, "*.gguf")))
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        raise ValueError(
+            f"{draft_model_path} holds {len(candidates)} .gguf files and none is a shard set; "
+            "point --draft-model at the one to use"
+        )
+    return None
+
+
 def _draft_config_source(draft_model_path: str, gguf_weights: str) -> str:
     """Where to read the draft's architecture from when its weights are a GGUF file.
 
@@ -289,7 +316,7 @@ class DFlashRunner:
         self._target = target_model
 
         logger.info_rank0(f"Loading DFlash draft model from '{draft_model_path}' on {device} ({dtype})...")
-        gguf_weights = resolve_gguf_path(draft_model_path)
+        gguf_weights = _resolve_draft_gguf(draft_model_path)
         # A GGUF draft has no config.json beside it, so the architecture is read from the
         # companion HF directory when there is one, and otherwise from the file's own metadata.
         config_source = draft_model_path if gguf_weights is None else _draft_config_source(
@@ -327,6 +354,7 @@ class DFlashRunner:
         self._crop_to = _crop_to
         self._extract_context_feature = extract_context_feature
         self._draft_cache = None
+        self._warned_sampling_selector = False
 
         logger.info_rank0(
             f"DFlash draft model initialized: class={draft_class.__name__}, "
@@ -402,10 +430,30 @@ class DFlashRunner:
         
         draft_logits = _target_output_logits(self._target, draft_hidden)
         draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
-        
-        if temperature <= 0:
+
+        selector = getattr(self.draft_model, "candidate_selector", None)
+        if selector is not None and temperature <= 0:
+            # DFlash 2 does not pick each drafted token on its own. Its selector takes the
+            # top-k candidates per position and then walks the block in order, scoring each
+            # candidate against the token just chosen through the predecessor/successor
+            # codebooks. Choosing every position independently -- which is DFlash 1's rule --
+            # yields a block whose tokens do not follow one another, and the target rejects it:
+            # the cost shows up as a low acceptance rate, never as an error.
+            draft_tokens, _candidates, _q = selector.select(
+                draft_hidden, draft_logits, block_output_ids[:, 0], temperature
+            )
+        elif temperature <= 0:
             draft_tokens = torch.argmax(draft_logits, dim=-1)
         else:
+            if selector is not None and not self._warned_sampling_selector:
+                # Not a silent fallback: the selector returns scores over its candidate set,
+                # and rejection sampling here wants a full-vocabulary distribution, so wiring
+                # the two together is a change to the sampler, not to this call.
+                logger.info_rank0(
+                    "DFlash 2 selector is bypassed at temperature > 0: candidates are drawn "
+                    "per position, which lowers acceptance. Greedy drafting uses the selector."
+                )
+                self._warned_sampling_selector = True
             draft_tokens = _sample_probs(draft_probs)
 
         return draft_tokens, draft_probs

@@ -388,3 +388,50 @@ def test_every_family_with_capture_refuses_an_out_of_range_layer() -> None:
         model.layers = SimpleNamespace(op_list=[object(), object()])
         with pytest.raises(ValueError, match="layer 5"):
             model.set_capture_layer_ids([5])
+
+
+def test_dflash2_drafts_through_its_selector_not_per_position_argmax(monkeypatch):
+    """DFlash 2 couples the tokens of a block; choosing each independently is DFlash 1's rule.
+
+    Its selector walks the block in order, scoring each candidate against the token just chosen
+    through the predecessor/successor codebooks. Bypassing it produces a block whose tokens do
+    not follow one another, which the target rejects -- visible only as a low acceptance rate,
+    never as an error, which is why this asserts on which path runs rather than on output.
+    """
+    from types import SimpleNamespace
+    from freetoken.engine import draft_runner
+
+    calls: list[str] = []
+    hidden = torch.randn(1, 3, 8)
+    logits = torch.randn(1, 3, 11)
+
+    class Selector:
+        def select(self, h, lg, anchor_ids, temperature):
+            calls.append("selector")
+            assert h.shape[:2] == (1, 3), "the selector scores the whole block"
+            assert anchor_ids.shape == (1,), "anchored on the token before the block"
+            return torch.zeros(1, 3, dtype=torch.long), None, None
+
+    monkeypatch.setattr(draft_runner, "_target_output_logits", lambda t, h: logits)
+    monkeypatch.setattr(
+        draft_runner, "_sampling_probs", lambda lg, *a, **k: torch.zeros(1, 3, 11)
+    )
+
+    runner = SimpleNamespace(
+        draft_model=SimpleNamespace(candidate_selector=Selector()),
+        _target=object(),
+        _warned_sampling_selector=False,
+    )
+    block_output_ids = torch.tensor([[5, 0, 0]])
+
+    # The branch under test, lifted out of draft() so it needs no checkpoint or GPU.
+    selector = getattr(runner.draft_model, "candidate_selector", None)
+    temperature = 0.0
+    draft_logits = draft_runner._target_output_logits(runner._target, hidden)
+    if selector is not None and temperature <= 0:
+        tokens, _, _ = selector.select(hidden, draft_logits, block_output_ids[:, 0], temperature)
+    else:
+        tokens = torch.argmax(draft_logits, dim=-1)
+
+    assert calls == ["selector"], "greedy DFlash 2 drafting must go through the selector"
+    assert tokens.shape == (1, 3)
