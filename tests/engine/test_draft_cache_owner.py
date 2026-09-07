@@ -70,6 +70,62 @@ def test_a_new_request_gets_a_fresh_cache():
     assert r._cache_owner == 8
 
 
+class _Cache:
+    """A DynamicCache stand-in: a length and the crop() contract transformers implements.
+
+    Negative crop removes that many rows from the tail. Positive crop is the deprecated
+    absolute-length path: a no-op when at or above the current length, else a truncation to
+    an unrelated length -- which is exactly how the noise rows survived.
+    """
+
+    def __init__(self, length: int) -> None:
+        self.length = length
+        self.calls: list[int] = []
+
+    def get_seq_length(self) -> int:
+        return self.length
+
+    def crop(self, n: int) -> None:
+        self.calls.append(n)
+        if n < 0:
+            self.length += n
+        elif n < self.length:
+            self.length = n
+
+
+def _crop_to(cache: _Cache, length: int) -> None:
+    """dflash/model.py::_crop_to, verbatim."""
+    remove = cache.get_seq_length() - length
+    cache.crop(-remove)
+
+
+def test_dropping_k_rows_and_cropping_to_seq_len_agree_when_the_cache_is_complete():
+    k, seq_len, ctx = 8, 100, 100          # first block: the draft saw every position
+    cache = _Cache(length=ctx + k)          # forward appended ctx context rows + k noise rows
+    a = _Cache(length=ctx + k)
+    _crop_to(cache, cache.get_seq_length() - k)
+    _crop_to(a, seq_len)
+    assert cache.length == a.length == seq_len
+
+
+def test_dropping_k_rows_is_right_when_the_cache_is_short():
+    """After a prefix-cache hit the draft was fed only the rows this prefill computed."""
+    k, seq_len, ctx = 8, 100, 30           # 70 positions came from the prefix cache
+    cache = _Cache(length=ctx + k)
+    _crop_to(cache, cache.get_seq_length() - k)
+    assert cache.length == ctx, "the k noise rows are gone, the real context stays"
+    assert cache.calls == [-k]
+
+
+def test_cropping_to_seq_len_kept_the_noise_rows_when_the_cache_was_short():
+    """The defect this replaces: a positive crop is an absolute length, not a removal."""
+    k, seq_len, ctx = 8, 100, 30
+    cache = _Cache(length=ctx + k)
+    _crop_to(cache, seq_len)
+    assert cache.calls == [seq_len - ctx - k], "remove came out negative -> positive crop"
+    assert cache.length == ctx + k, "nothing was removed: the mask-token keys stayed"
+
+
 def test_returning_to_an_earlier_uid_is_still_a_new_request():
     """uids are not recycled within a server's life, but the rule must not assume it."""
     r, made = _runner_with_fake_cache()

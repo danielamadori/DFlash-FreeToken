@@ -315,6 +315,12 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            # The 8-token verification block stays on the chunk path. Routing it through the
+            # fused recurrent decode kernel (sglang's target_verify) was tried and measured:
+            # 17.9 ms against the chunk path's 2.3 ms, and 0 of 4 outputs identical. That
+            # kernel is one warp per (sequence, head) walking T tokens sequentially -- built for
+            # many sequences of one token, not one sequence of eight. Do not re-test without
+            # a different kernel.
             g, beta = self._gate_params(a, b)
             g = g.reshape(1, total, self.num_v_heads)
             beta = beta.float().reshape(1, total, self.num_v_heads)
