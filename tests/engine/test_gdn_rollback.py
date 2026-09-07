@@ -70,23 +70,36 @@ def test_open_snapshots_live_into_a_scratch_slot():
     rb.close()
 
 
-def test_close_returns_the_scratch_slot():
+def test_the_scratch_slot_is_held_across_blocks_not_borrowed():
+    """It competed with the donated-snapshot cache when borrowed, and the pool ran dry.
+
+    The cache grows as requests complete, so a slot handed back between blocks is a slot the
+    cache can take. Holding one for the scheduler's lifetime is what keeps a rewind possible on
+    the hundredth block as much as the first.
+    """
     pool = FakePool()
     before = pool.num_free
     rb = GDNRollback(pool)
     rb.open(live_slot=3)
     assert pool.num_free == before - 1
     rb.close()
-    assert pool.num_free == before
+    assert pool.num_free == before - 1, "close() must keep the slot"
     assert not rb.recording
+    rb.open(live_slot=3)
+    assert pool.num_free == before - 1, "and reopening must not take a second one"
+    rb.release()
+    assert pool.num_free == before
 
 
-def test_close_is_idempotent():
+def test_close_is_idempotent_and_release_frees_once():
     pool = FakePool()
     rb = GDNRollback(pool)
     rb.open(live_slot=1)
     rb.close()
     rb.close()
+    assert pool.freed == []
+    rb.release()
+    rb.release()
     assert len(pool.freed) == 1
 
 
@@ -116,7 +129,7 @@ def test_full_acceptance_does_no_rescan_and_no_restore():
     rb.rewind(accepted=7)
     assert calls == []
     assert pool.copies == []      # no restore
-    assert pool.freed == [7]      # but the scratch slot still came back
+    assert pool.freed == []       # and the scratch slot stays held for the next block
 
 
 def test_partial_acceptance_restores_then_rescans_every_layer():
@@ -152,8 +165,8 @@ def test_rejecting_everything_still_commits_the_pending_token():
     assert calls == [(0, 4, scratch, 1, 5)]
 
 
-def test_scratch_slot_is_returned_even_if_a_layer_rescan_raises():
-    """A leaked slot would shrink the pool silently until it could not serve a request."""
+def test_a_failed_rescan_still_ends_the_block():
+    """Otherwise the next open() raises "called twice" and the request never recovers."""
     pool = FakePool()
     rb = GDNRollback(pool)
 
@@ -166,13 +179,12 @@ def test_scratch_slot_is_returned_even_if_a_layer_rescan_raises():
         q=torch.zeros(1, 4, 2, 4), k=torch.zeros(1, 4, 2, 4), v=torch.zeros(1, 4, 2, 4),
         g=torch.zeros(1, 4, 2), beta=torch.zeros(1, 4, 2), conv_in=torch.zeros(4, 6),
     )
-    before = pool.num_free
     try:
         rb.rewind(accepted=2)
     except RuntimeError:
         pass
-    assert pool.num_free == before + 1
-    assert not rb.recording
+    assert not rb.recording, "a failed rescan must still end the block"
+    rb.open(live_slot=1)  # and must leave the rollback usable for the next one
 
 
 def test_the_window_carries_one_row_more_than_the_candidates():

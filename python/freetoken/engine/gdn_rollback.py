@@ -73,20 +73,28 @@ class GDNRollback:
         self._stash: dict[int, LayerStash] = {}
         self._live_slot: int | None = None
         self._scratch_slot: int | None = None
+        self._open = False
 
     @property
     def recording(self) -> bool:
         """Whether layers should stash on this forward."""
-        return self._scratch_slot is not None
+        return self._open
 
     def open(self, live_slot: int) -> None:
-        """Snapshot the live state of ``live_slot`` into a scratch slot and start recording."""
-        if self._scratch_slot is not None:
+        """Snapshot the live state of ``live_slot`` into the scratch slot and start recording.
+
+        The scratch slot is taken once and held for the scheduler's lifetime, not borrowed per
+        block. Borrowing put it in competition with the donated-snapshot cache, which fills as
+        requests complete: the pool then ran out mid-run even after being sized one slot larger,
+        because that one slot was exactly what the cache had grown into.
+        """
+        if self._open:
             raise RuntimeError("GDNRollback.open() called twice without a rewind or close")
-        (scratch,) = self._pool.alloc(1)
-        self._pool.copy_from(live_slot, scratch)
+        if self._scratch_slot is None:
+            (self._scratch_slot,) = self._pool.alloc(1)
+        self._pool.copy_from(live_slot, self._scratch_slot)
         self._live_slot = live_slot
-        self._scratch_slot = scratch
+        self._open = True
         self._stash.clear()
 
     def stash(
@@ -101,7 +109,7 @@ class GDNRollback:
         conv_in: torch.Tensor,
     ) -> None:
         """Record one layer's recurrence inputs for this block. No-op unless recording."""
-        if self._scratch_slot is None:
+        if not self._open:
             return
         self._stash[layer_id] = LayerStash(rescan, q, k, v, g, beta, conv_in)
 
@@ -117,7 +125,7 @@ class GDNRollback:
         Getting that wrong leaves the recurrent state one token behind the KV cache on every
         single block, and the sequence re-emits what it has already said.
         """
-        if self._scratch_slot is None:
+        if not self._open:
             raise RuntimeError("GDNRollback.rewind() without an open block")
         if accepted < 0:
             raise ValueError(f"accepted must not be negative, got {accepted}")
@@ -144,12 +152,17 @@ class GDNRollback:
             self.close()
 
     def close(self) -> None:
-        """Release the scratch slot and stop recording. Idempotent."""
+        """End the block and stop recording. Idempotent; the scratch slot is kept."""
+        self._open = False
+        self._live_slot = None
+        self._stash.clear()
+
+    def release(self) -> None:
+        """Give the scratch slot back. For teardown, or a pool rebuild that reclaims slots."""
+        self.close()
         if self._scratch_slot is not None:
             self._pool.free([self._scratch_slot])
             self._scratch_slot = None
-        self._live_slot = None
-        self._stash.clear()
 
     def _window_len(self) -> int | None:
         """Rows in the verification window: the pending token plus the drafted candidates."""
