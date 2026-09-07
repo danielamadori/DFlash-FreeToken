@@ -116,6 +116,16 @@ def _target_output_logits(target: nn.Module, hidden_states: torch.Tensor) -> tor
         raise NotImplementedError(
             "DFlash drafting against a tensor-parallel sharded output head is not supported"
         )
+
+    # A GGUF head keeps its weights block-quantized, so there is no matrix to hand F.linear.
+    # Its own forward cannot be used either: GGUFLMHead slices the last position of each
+    # sequence, for the same reason ParallelLMHead does, and a draft block needs every row.
+    # The projection it inherits does exactly the wanted thing, so call that.
+    from freetoken.layers.gguf import GGUFLinear
+
+    if isinstance(head, GGUFLinear):
+        return GGUFLinear.forward(head, hidden_states)
+
     weight_owner = getattr(head, "tied_embedding", None) or head
     return F.linear(hidden_states, weight_owner.weight, getattr(head, "bias", None))
 

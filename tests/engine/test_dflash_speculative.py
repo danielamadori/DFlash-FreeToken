@@ -244,6 +244,42 @@ def test_draft_embeds_through_a_target_whose_table_has_no_weight():
     assert torch.equal(_embed_with_target(target, ids), table[ids])
 
 
+def test_draft_projects_through_a_quantized_head_without_its_last_position_slice(monkeypatch):
+    """A GGUF head has no weight matrix, and its own forward keeps only the last position.
+
+    Asserted through which projection runs rather than through numbers: the slicing forward
+    would return one row where a draft block needs one per drafted position, and that shape
+    error would surface far from its cause.
+    """
+    from types import SimpleNamespace
+    from freetoken.engine.draft_runner import _target_output_logits
+    from freetoken.layers import gguf as gguf_layers
+
+    hidden = torch.randn(1, 4, 6)
+    table = torch.randn(3, 6)
+    used: list[str] = []
+
+    def plain_projection(self, x: torch.Tensor) -> torch.Tensor:
+        used.append("GGUFLinear")
+        return x @ table.T
+
+    monkeypatch.setattr(gguf_layers.GGUFLinear, "forward", plain_projection)
+
+    class Head(gguf_layers.GGUFLinear):
+        tp_size = 1
+
+        def __init__(self) -> None:
+            pass
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            used.append("GGUFLMHead")
+            return (x @ table.T)[:, -1:]
+
+    out = _target_output_logits(SimpleNamespace(lm_head=Head()), hidden)
+    assert used == ["GGUFLinear"], "the head's slicing forward must not be used for a block"
+    assert out.shape == (1, 4, 3)
+
+
 def test_qwen3_capture_materialises_the_carried_residual():
     """Qwen3 carries the residual to the next layer, so the capture must add it in."""
     from types import SimpleNamespace
