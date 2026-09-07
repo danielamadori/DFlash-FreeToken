@@ -13,6 +13,7 @@
 #include "vecdotq.cuh"
 #include "dequantize.cuh"
 #include "mmvq.cuh"
+#include "mmvq_planar.cuh"
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
@@ -71,6 +72,66 @@ static void quantize_row_q8_1_cuda(const scalar_t* x, void* vy, const int kx, co
   }
 }
 
+// Planar q8_1 activation for the 2..8-row MMVQ path (mmvq_planar.cuh): yq[ky][kx_padded] int8
+// and ds[ky][kx_padded / 32] = {d, d * sum_q}. Same quants as quantize_q8_1 (amax / 127, roundf,
+// zero past kx); d is stored half-rounded when MMVQ_PLANAR_HALF_D so the products use the same
+// scale the block_q8_1 kernels read through __low2float(ds). One warp per 32-block, as above.
+template <typename scalar_t>
+static __global__ void quantize_planar(
+    const scalar_t* __restrict__ x,
+    int8_t* __restrict__ yq,
+    float2* __restrict__ ds,
+    const int kx,
+    const int kx_padded) {
+  const int ix = blockDim.x * blockIdx.x + threadIdx.x;
+  if (ix >= kx_padded) {
+    return;  // kx_padded and blockDim.x are multiples of 32: whole warps leave, the shuffles below are full
+  }
+  const int iy = blockIdx.y;
+  const float xi = ix < kx ? static_cast<float>(x[(size_t)iy * kx + ix]) : 0.0f;
+  float amax = fabsf(xi);
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    amax = fmaxf(amax, SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), amax, mask, 32));
+  }
+  const float d = amax / 127;
+  const int q = amax == 0.0f ? 0 : (int)roundf(xi / d);
+  int sum_q = q;
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    sum_q += SGLANG_SHFL_XOR_SYNC_WIDTH(uint32_t(-1), sum_q, mask, 32);
+  }
+  yq[(size_t)iy * kx_padded + ix] = (int8_t)q;
+  if ((ix & 31) == 0) {
+#if MMVQ_PLANAR_HALF_D
+    const float dq = __half2float(__float2half(d));
+#else
+    const float dq = d;
+#endif
+    ds[(size_t)iy * (kx_padded / 32) + (ix >> 5)] = make_float2(dq, dq * (float)sum_q);
+  }
+}
+
+template <typename scalar_t>
+static void quantize_row_planar_cuda(
+    const scalar_t* x, int8_t* yq, float2* ds, const int kx, const int ky, const int kx_padded, cudaStream_t stream) {
+  const int block_num_x = (kx_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+  constexpr int MAX_BLOCK_SIZE = 65535;
+  for (int off = 0; off < ky; off += MAX_BLOCK_SIZE) {
+    const int num_blocks_y = std::min(ky, off + MAX_BLOCK_SIZE) - off;
+    const dim3 num_blocks(block_num_x, num_blocks_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    quantize_planar<<<num_blocks, block_size, 0, stream>>>(
+        &x[(size_t)off * kx], yq + (size_t)off * kx_padded, ds + (size_t)off * (kx_padded / 32), kx, kx_padded);
+  }
+}
+
+// Byte size of the planar activation buffer (yq then ds; ds starts at vecs * padded, a multiple of
+// 512 B, so its float4 loads stay 16 B aligned).
+static inline int64_t mmvq_planar_bytes(const int64_t vecs, const int64_t padded) {
+  return vecs * padded + vecs * (padded / 32) * (int64_t)sizeof(float2);
+}
+
 torch::Tensor ggml_dequantize(
     torch::Tensor W,  // quant weight
     int64_t type,
@@ -109,6 +170,23 @@ torch::Tensor ggml_mul_mat_vec_a8(
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({vecs, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  // 2..8 activation rows of a type with a planar kernel (mmvq_planar.cuh; -DMMVQ_PLANAR=0 compiles
+  // this block out, FREETOKEN_MMVQ_PLANAR=0 skips it at runtime): quantize to the planar layout
+  // instead of block_q8_1. Everything below the block is the previous dispatch, unchanged.
+#if MMVQ_PLANAR
+  if (mmvq_planar_ok((int)type, vecs)) {
+    options = torch::TensorOptions().dtype(torch::kInt8).device(W.device());
+    at::Tensor planar_X = torch::empty({mmvq_planar_bytes(vecs, padded)}, options);
+    int8_t* yq = (int8_t*)planar_X.data_ptr();
+    float2* ds = (float2*)(yq + (size_t)vecs * padded);
+    DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
+      quantize_row_planar_cuda<scalar_t>((scalar_t*)X.data_ptr(), yq, ds, col, vecs, padded, stream);
+      mmvq_planar_dispatch<scalar_t>(
+          (int)type, (const void*)W.data_ptr(), yq, ds, (scalar_t*)Y.data_ptr(), col, row, vecs, padded, stream);
+    });
+    return Y;
+  }
+#endif
   options = torch::TensorOptions().dtype(torch::kInt32).device(W.device());
   at::Tensor quant_X = torch::empty({vecs, padded / 32 * 9}, options);
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {

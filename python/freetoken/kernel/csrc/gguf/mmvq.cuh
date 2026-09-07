@@ -181,6 +181,11 @@ static void mmvq_switch(
 #undef MMVQ_CASE
 }
 
+// Types with a planar kernel (mmvq_planar.cuh: Q4_K, plus whatever registers there) do not reach
+// this dispatch at 2..8 activation rows when MMVQ_PLANAR is on: ggml_mul_mat_vec_a8 routes them
+// through mmvq_planar_ok / mmvq_planar_dispatch before quantizing to block_q8_1. Everything else
+// (1 row, > 8 rows, other types, MMVQ_PLANAR=0) takes the path below, unchanged.
+//
 // Up to 8 activation rows go to the exact instantiation, so no column-count check runs inside
 // the K loop. Beyond 8 the rows are cut into groups of 8 along grid.y (the weight is re-read
 // once per group, still far better than once per row) and the remainder gets its own exact
