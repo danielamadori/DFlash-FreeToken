@@ -1,22 +1,40 @@
 """Availability probes for the optional native kernel packages.
 
-When flashinfer / sgl_kernel are installed the call-sites use their fused CUDA
-ops; otherwise they fall back to the pure-Triton kernels in
-``freetoken.kernel.triton``. ``find_spec`` only checks that the package is
-importable (no import side effects), and the result is cached.
+When flashinfer / sgl_kernel are USABLE the call-sites use their fused CUDA ops;
+otherwise they fall back to the pure-Triton kernels in ``freetoken.kernel.triton``.
+
+Usable, not merely installed: these packages ship prebuilt per-architecture binaries
+and raise from their own __init__ when none matches the GPU or its CUDA runtime is
+absent. Probing with find_spec alone reported them present in exactly that case and
+sent the caller into an import that then failed, which is why each probe now imports
+the package once. The result is cached, so the cost is paid at most once per name.
 """
 from __future__ import annotations
 
 import functools
+import importlib
 import importlib.util
 
 
 def _importable(name: str) -> bool:
-    # find_spec normally returns None when a package is absent, but it can raise
-    # (broken parent package, or a meta_path finder that blocks the name); treat
-    # any failure as "not available" so callers cleanly fall back to triton.
+    """True when ``name`` can actually be IMPORTED, not merely located on disk.
+
+    find_spec answers "is this installed", and callers need "can I use this". The two
+    differ for exactly the packages here: sgl_kernel installs cleanly and then RAISES from
+    its __init__ when no prebuilt variant matches the GPU -- an sm_89 card against wheels
+    shipping sm90/sm100, or a binary linked against a CUDA runtime that is not present
+    (libnvrtc.so.13 with a CUDA 12 install). find_spec still returns a spec for that, so
+    every caller took the accelerated branch and died on the import instead of falling
+    back to triton, which is the whole point of asking.
+
+    The import is attempted once per name (the callers are cached) and any failure means
+    "not available", as the callers' fallbacks already assume.
+    """
     try:
-        return importlib.util.find_spec(name) is not None
+        if importlib.util.find_spec(name) is None:
+            return False
+        importlib.import_module(name)
+        return True
     except Exception:
         return False
 
