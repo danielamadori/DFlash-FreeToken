@@ -9,7 +9,15 @@
 //
 // The arithmetic per output is unchanged: the same vec_dot over the same blocks in the same
 // order, reduced the same way. Only which thread block does it moved.
-template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_y>
+// Shape of the upstream llama.cpp kernel (mmvq.cu, GENERIC table): ``nwarps`` warps split the K
+// dimension of the same rows and combine through shared memory, and every thread carries
+// ``rows_per_block`` weight rows, so the activation-side loads and the activation-only
+// partial sums inside vec_dot are shared by two outputs instead of being redone per row.
+// The vendored shape was one warp and one row per block: at 8 activation columns that
+// kernel spends twice the memory time in per-column instructions (measured, DRAM-cold).
+template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda,
+          int ncols_y, int nwarps, int rows_per_block, bool guard_cols>
+__launch_bounds__(nwarps * WARP_SIZE, 1)
 static __global__ void mul_mat_vec_q(
     const void* __restrict__ vx,
     const void* __restrict__ vy,
@@ -17,87 +25,121 @@ static __global__ void mul_mat_vec_q(
     const int ncols,
     const int nrows,
     const int nvecs) {
-  const auto row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+  const int row0 = rows_per_block * blockIdx.x;
   const int vec0 = blockIdx.y * ncols_y;
 
-  if (row >= nrows || vec0 >= nvecs) {
-    return;
-  }
-
   const int blocks_per_row = ncols / qk;
-  const int blocks_per_warp = vdr * WARP_SIZE / qi;
+  constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
   const int nrows_y = (ncols + 512 - 1) / 512 * 512;
+  const int y_stride = nrows_y / QK8_1;  // q8_1 blocks per activation row
 
-  // partial sum for each thread, one per activation row this block carries
-  float tmp[ncols_y];
+  // partial sums: one per (activation column, weight row) this thread carries
+  float tmp[ncols_y][rows_per_block];
 #pragma unroll
   for (int j = 0; j < ncols_y; ++j) {
-    tmp[j] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < rows_per_block; ++i) {
+      tmp[j][i] = 0.0f;
+    }
   }
 
   const block_q_t* x = (const block_q_t*)vx;
   const block_q8_1* y = (const block_q8_1*)vy;
 
-  for (auto i = threadIdx.x / (qi / vdr); i < blocks_per_row; i += blocks_per_warp) {
-    const int ibx = row * blocks_per_row + i;  // x block index, independent of the activation row
+  // A row past the end (odd nrows) is clamped to the last row: its dot products are computed
+  // on valid memory and discarded at the write.
+  int row_of[rows_per_block];
+#pragma unroll
+  for (int i = 0; i < rows_per_block; ++i) {
+    row_of[i] = (row0 + i < nrows) ? (row0 + i) : (nrows - 1);
+  }
 
-    const int iqs = vdr * (threadIdx.x % (qi / vdr));  // x block quant index when casting the quants to int
+  for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);          // y block index that aligns with kbx
+    const int kqs = vdr * (tid % (qi / vdr));    // x block quant index when casting the quants to int
 
 #pragma unroll
     for (int j = 0; j < ncols_y; ++j) {
-      if (vec0 + j >= nvecs) {
+      if (guard_cols && vec0 + j >= nvecs) {
         break;
       }
-      // y block index that aligns with ibx
-      const int iby = (vec0 + j) * (nrows_y / QK8_1) + i * (qk / QK8_1);
-      tmp[j] += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+      const block_q8_1* yj = &y[(vec0 + j) * y_stride + kby];
+#pragma unroll
+      for (int i = 0; i < rows_per_block; ++i) {
+        tmp[j][i] += vec_dot_q_cuda(&x[row_of[i] * blocks_per_row + kbx], yj, kqs);
+      }
     }
+  }
+
+  __shared__ float tmp_shared[nwarps - 1 > 0 ? nwarps - 1 : 1][ncols_y][rows_per_block][WARP_SIZE];
+  if (threadIdx.y > 0) {
+#pragma unroll
+    for (int j = 0; j < ncols_y; ++j) {
+#pragma unroll
+      for (int i = 0; i < rows_per_block; ++i) {
+        tmp_shared[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.y > 0) {
+    return;
   }
 
   // sum up partial sums and write back result
 #pragma unroll
   for (int j = 0; j < ncols_y; ++j) {
-    if (vec0 + j >= nvecs) {
+    if (guard_cols && vec0 + j >= nvecs) {
       break;
     }
-    float sum = tmp[j];
 #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-      sum += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), sum, mask);
-    }
-    if (threadIdx.x == 0) {
-      dst[(vec0 + j) * nrows + row] = sum;
+    for (int i = 0; i < rows_per_block; ++i) {
+#pragma unroll
+      for (int l = 0; l < nwarps - 1; ++l) {
+        tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+      }
+      float sum = tmp[j][i];
+#pragma unroll
+      for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        sum += SGLANG_SHFL_XOR_SYNC(uint32_t(-1), sum, mask);
+      }
+      if (threadIdx.x == i && row0 + i < nrows) {
+        dst[(vec0 + j) * nrows + row0 + i] = sum;
+      }
     }
   }
 }
 
-// How many activation rows one block carries. Bounded so the per-thread partial sums stay in
-// registers; beyond it the weight is re-read once per group, which is still far better than
-// once per row.
-#define MMVQ_LAUNCH(QK_, QI_, BLOCK_, VDR_, VECDOT_)                                            \
-  do {                                                                                          \
-    const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;                     \
-    const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);                                        \
-    if (nvecs <= 1) {                                                                            \
-      const dim3 block_nums(block_num_y, 1, 1);                                                   \
-      mul_mat_vec_q<scalar_t, QK_, QI_, BLOCK_, VDR_, VECDOT_, 1>                                 \
-          <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);              \
-    } else if (nvecs <= 2) {                                                                      \
-      const dim3 block_nums(block_num_y, 1, 1);                                                   \
-      mul_mat_vec_q<scalar_t, QK_, QI_, BLOCK_, VDR_, VECDOT_, 2>                                 \
-          <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);              \
-    } else if (nvecs <= 4) {                                                                      \
-      const dim3 block_nums(block_num_y, 1, 1);                                                   \
-      mul_mat_vec_q<scalar_t, QK_, QI_, BLOCK_, VDR_, VECDOT_, 4>                                 \
-          <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);              \
-    } else if (nvecs <= 8) {                                                                      \
-      const dim3 block_nums(block_num_y, 1, 1);                                                   \
-      mul_mat_vec_q<scalar_t, QK_, QI_, BLOCK_, VDR_, VECDOT_, 8>                                 \
-          <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);              \
-    } else {                                                                                      \
-      const dim3 block_nums(block_num_y, (nvecs + 8 - 1) / 8, 1);                                  \
-      mul_mat_vec_q<scalar_t, QK_, QI_, BLOCK_, VDR_, VECDOT_, 8>                                  \
-          <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);              \
+// One exact instantiation per column count up to 8 (no per-iteration column check), with the
+// upstream GENERIC parameters: 4 warps below 5 columns, 2 above; 2 rows per thread except at
+// 1 column. Above 8 columns the weight is re-read once per group of 8, with the column guard.
+#define MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, N_, NW_, RPB_)                                                                \
+  case N_: {                                                                                      \
+    const dim3 block_nums((nrows + RPB_ - 1) / RPB_, 1, 1);                                       \
+    const dim3 block_dims(WARP_SIZE, NW_, 1);                                                     \
+    mul_mat_vec_q<scalar_t, QK_, QI_, BLOCK_, VDR_, VECDOT_, N_, NW_, RPB_, false>                \
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);                \
+    break;                                                                                        \
+  }
+#define MMVQ_LAUNCH(QK_, QI_, BLOCK_, VDR_, VECDOT_)                                              \
+  do {                                                                                            \
+    switch (nvecs) {                                                                              \
+      MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, 1, 4, 1)                                                                          \
+      MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, 2, 4, 2)                                                                          \
+      MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, 3, 4, 2)                                                                          \
+      MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, 4, 4, 2)                                                                          \
+      MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, 5, 2, 2)                                                                          \
+      MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, 6, 2, 2)                                                                          \
+      MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, 7, 2, 2)                                                                          \
+      MMVQ_CASE(QK_, QI_, BLOCK_, VDR_, VECDOT_, 8, 2, 2)                                                                          \
+      default: {                                                                                  \
+        const dim3 block_nums((nrows + 2 - 1) / 2, (nvecs + 8 - 1) / 8, 1);                       \
+        const dim3 block_dims(WARP_SIZE, 2, 1);                                                   \
+        mul_mat_vec_q<scalar_t, QK_, QI_, BLOCK_, VDR_, VECDOT_, 8, 2, 2, true>                   \
+            <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows, nvecs);            \
+        break;                                                                                    \
+      }                                                                                           \
     }                                                                                             \
   } while (0)
 
