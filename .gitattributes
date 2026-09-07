@@ -1,0 +1,20 @@
+# Normalise line endings in the repository.
+#
+# WHY. Two commits on this fork rewrote eight files from LF to CRLF wholesale -- 5,734
+# lines of pure line-ending churn across engine/, moe/ and server/. Against upstream the
+# diff read 7,303 insertions and 4,910 deletions; ignoring whitespace, 2,443 and 50. The
+# rest was noise that made the fork's actual changes unreadable and would have conflicted
+# on every line of those files at the next rebase.
+#
+# text=auto tells git to store text files with LF and check them out with the platform's
+# convention; eol=lf pins the working copy too, so an editor on Windows cannot quietly
+# reintroduce the same problem.
+* text=auto eol=lf
+
+# Binary, byte for byte.
+*.png binary
+*.jpg binary
+*.gguf binary
+*.safetensors binary
+*.so binary
+*.whl binary
