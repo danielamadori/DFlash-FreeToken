@@ -91,6 +91,57 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """Turn each message's newly generated token into its incremental text chunk.
+
+        WHY GROUPED BY UID, ONE ROUND AT A TIME. A uid's read_ids/surr_ids for its Nth
+        message in this call depend on that uid's surr_offset/read_offset AFTER message
+        N-1 was processed -- and whether those offsets actually advance depends on the
+        DECODED TEXT (a trailing UTF-8 continuation byte holds them back, see below), so
+        message N's slice cannot be built before message N-1's decode result is known.
+
+        Every caller before speculative decoding sent at most one message per uid per
+        call (one token generated per request per scheduler round), so this never
+        mattered. A speculative round can commit several tokens for the SAME request in
+        one round, and the two-pass version this replaced built every message's slice
+        against the round's STARTING offsets: token 1's text was correct, but token 2's
+        slice re-included token 1 (offsets had not advanced yet), token 3's re-included
+        1 and 2, and so on -- read as duplicated, growing words. A minimal repro with a
+        stub tokenizer showed one round of tokens [user, is, asking] against three
+        one-token calls: "user is asking" one message at a time, "useruser isuser is
+        asking" as one three-message call.
+
+        Messages for DIFFERENT uids in the same call stay independent and are still
+        decoded together where possible: this processes uids in lockstep (every uid's
+        1st pending message together, then every uid's 2nd, ...), so a concurrent
+        multi-request serve keeps batching batch_decode across requests -- only the
+        within-one-uid ordering is now enforced.
+        """
+        pending: Dict[int, List[DetokenizeMsg]] = {}
+        order: List[int] = []
+        for msg in msgs:
+            if msg.uid not in pending:
+                order.append(msg.uid)
+            pending.setdefault(msg.uid, []).append(msg)
+
+        results: Dict[int, List[str]] = {uid: [] for uid in pending}
+        round_index = 0
+        while any(round_index < len(pending[uid]) for uid in order):
+            round_msgs = [pending[uid][round_index] for uid in order if round_index < len(pending[uid])]
+            round_texts = self._detokenize_round(round_msgs)
+            for uid, text in zip((m.uid for m in round_msgs), round_texts, strict=True):
+                results[uid].append(text)
+            round_index += 1
+
+        incremental_strs: List[str] = []
+        seen: Dict[int, int] = {}
+        for msg in msgs:
+            i = seen.get(msg.uid, 0)
+            incremental_strs.append(results[msg.uid][i])
+            seen[msg.uid] = i + 1
+        return incremental_strs
+
+    def _detokenize_round(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """Original single-pass batch logic, now guaranteed at most one msg per uid."""
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:
