@@ -61,8 +61,15 @@ _UNQUANTIZED_DTYPE = {
 
 from .base import BaseOP
 
-# Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
-_MMVQ_SAFE = 6
+# Up to this many activation rows the batched MMVQ kernel is used for every quant type, MMQ
+# above it. The value is measured, not inherited: vLLM's heuristic (6) was the original, and
+# raising it looked like a loss in one end-to-end test -- until the conv's host sync was
+# removed, which had been amplifying every per-launch latency difference. Measured after that
+# on Qwen3.8-27B-UD-Q4_K_S at 8 rows, per (type, shape) on the real tensors and end to end:
+# MMVQ beats MMQ by ~2.8 ms per forward across the MMQ-capable types, the Q6_K head by 0.6 ms
+# alone, and picking per shape adds only 0.3 ms, so a threshold is enough. Matches llama.cpp's
+# own MMVQ_MAX_BATCH_SIZE of 8. See docs/plans/gdn-speculative-rollback.md, kernel table.
+_MMVQ_SAFE = 8
 
 # Above _MMVQ_SAFE, a type with no MMQ kernel is not choosing between two GEMMs: its only other
 # option is dequantizing the whole matrix and multiplying dense. That is worth it for a long
