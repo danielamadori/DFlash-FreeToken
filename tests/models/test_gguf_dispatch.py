@@ -7,7 +7,8 @@ path was taken and return correctly-shaped CPU tensors.
 Dispatch order (from python/freetoken/layers/gguf.py:46-75):
 1. Empty input early return
 2. Unquantized (F32/F16/BF16) → torch matmul
-3. Small batch (<= _MMVQ_SAFE) AND MMVQ_TYPES → ggml_mul_mat_vec_a8
+3. Small batch (<= _MMVQ_SAFE, or <= _MMVQ_NO_MMQ_LIMIT when the type has no MMQ
+   kernel) AND MMVQ_TYPES → ggml_mul_mat_vec_a8
 4. MMQ_TYPES → ggml_mul_mat_a8
 5. DEQUANT_TYPES (but not MMQ_TYPES) → ggml_dequantize + torch matmul
 6. Else → NotImplementedError
@@ -32,7 +33,7 @@ from freetoken.models.gguf.dequant import (
     GGML_Q6_K,
     BLOCK_SHAPE,
 )
-from freetoken.layers.gguf import _MMVQ_SAFE, fused_mul_mat_gguf
+from freetoken.layers.gguf import _MMVQ_NO_MMQ_LIMIT, _MMVQ_SAFE, fused_mul_mat_gguf
 
 
 @pytest.fixture
@@ -251,31 +252,52 @@ class TestIQuantDispatch:
         GGML_IQ2_S,  # enum=22
         GGML_IQ1_M,  # enum=29
     ])
-    def test_iquant_large_batch_takes_dequant_path(self, mock_kernel_module, qweight_type):
-        """I-quants have no MMQ kernel, so large batch falls back to dequant + matmul.
+    def test_iquant_speculative_window_stays_on_mmvq(self, mock_kernel_module, qweight_type):
+        """A type with no MMQ kernel must never reach MMQ, and must not dequantize for a
+        handful of rows.
 
-        Rationale: I-quants have MMVQ and dequant kernels but no MMQ kernel. Routing them
-        to ggml_mul_mat_a8 (which doesn't support them) would return uninitialized memory.
-        Instead, we dequantize and use plain torch matmul.
+        Routing an I-quant to ggml_mul_mat_a8, which does not support it, returns
+        uninitialized memory -- that is the property this protects. But the alternative to
+        MMVQ is not a GEMM, it is dequantizing the entire matrix: on Qwen3.8-27B-UD-Q4_K_S
+        that is 6.82 GiB per forward, and a speculative verification carries seven rows.
+        MMVQ's kernel takes any row count, so it stays the choice for windows that small.
         """
         out_features = 4096
         in_features = 4096
-        batch_size = _MMVQ_SAFE + 1  # Large batch (above threshold)
+        batch_size = _MMVQ_SAFE + 1  # a verification window, not a prefill
 
         x = torch.randn(batch_size, in_features, dtype=torch.bfloat16)
         qweight = make_qweight(out_features, in_features, qweight_type)
 
         result = fused_mul_mat_gguf(x, qweight, qweight_type)
 
-        # Dequant path should have been used
-        assert mock_kernel_module["ggml_dequantize"] is not None
-        assert mock_kernel_module["ggml_mul_mat_a8"] is None
-        assert mock_kernel_module["ggml_mul_mat_vec_a8"] is None
+        assert mock_kernel_module["ggml_mul_mat_vec_a8"] is not None
+        assert mock_kernel_module["ggml_mul_mat_a8"] is None, "MMQ would return garbage here"
+        assert mock_kernel_module["ggml_dequantize"] is None
+        assert result.shape == (batch_size, out_features)
 
-        call_info = mock_kernel_module["ggml_dequantize"]
-        assert call_info["qweight_type"] == qweight_type
-        assert call_info["out_features"] == out_features
-        assert call_info["in_features"] == in_features
+    @pytest.mark.parametrize("qweight_type", [
+        GGML_IQ2_S,  # enum=22
+        GGML_IQ1_M,  # enum=29
+    ])
+    def test_iquant_real_batch_still_takes_dequant_path(self, mock_kernel_module, qweight_type):
+        """Past the window size, dequantizing once and multiplying dense wins again.
+
+        A long prefill reuses the dequantized weight across hundreds of rows, which is the
+        case the dequant path exists for; still never MMQ, which cannot decode these types.
+        """
+        out_features = 4096
+        in_features = 4096
+        batch_size = _MMVQ_NO_MMQ_LIMIT + 1
+
+        x = torch.randn(batch_size, in_features, dtype=torch.bfloat16)
+        qweight = make_qweight(out_features, in_features, qweight_type)
+
+        result = fused_mul_mat_gguf(x, qweight, qweight_type)
+
+        assert mock_kernel_module["ggml_dequantize"] is not None
+        assert mock_kernel_module["ggml_mul_mat_a8"] is None, "MMQ would return garbage here"
+        assert mock_kernel_module["ggml_mul_mat_vec_a8"] is None
         assert result.shape == (batch_size, out_features)
 
 

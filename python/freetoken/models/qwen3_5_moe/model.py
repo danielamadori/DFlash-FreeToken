@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING
 
 import torch
 from freetoken.core import get_global_ctx
+from freetoken.utils import init_logger
 from freetoken.layers import (
     BaseOP,
     GemmaRMSNorm,
@@ -20,6 +23,14 @@ from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
+
+
+logger = init_logger(__name__)
+
+_FORWARD_TIMING = bool(os.environ.get("FREETOKEN_FORWARD_TIMING"))
+# rows -> [transformer_ms, head_ms, calls]; keyed by row count so a one-row decode and an
+# eight-row verification are never averaged into one meaningless number.
+_FORWARD_MS: dict[int, list[float]] = {}
 
 
 class Qwen3_5DecoderLayer(BaseOP):
@@ -138,8 +149,38 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             convert_qwen35_to_gguf(self, config, model_path=config.gguf_model_path)
 
     def forward(self) -> torch.Tensor:
+        # Never time during graph capture: torch.cuda.synchronize() is not permitted on a
+        # capturing stream, and the failure surfaces as "operation not permitted when stream
+        # is capturing" from whichever kernel is capturing at the time.
+        if not _FORWARD_TIMING or torch.cuda.is_current_stream_capturing():
+            output = self.model.forward(get_global_ctx().batch.input_ids)
+            return self.lm_head.forward(output)
+        # Split the forward in two under FREETOKEN_FORWARD_TIMING, so a speculative
+        # verification that costs four decode steps can be attributed to the transformer or to
+        # the head instead of guessed at. Synchronised: CUDA's asynchrony would otherwise
+        # charge the transformer's cost to whichever call waits for it.
+        import time
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
         output = self.model.forward(get_global_ctx().batch.input_ids)
-        return self.lm_head.forward(output)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        logits = self.lm_head.forward(output)
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        rows = int(output.shape[0])
+        _FORWARD_MS.setdefault(rows, [0.0, 0.0, 0])
+        entry = _FORWARD_MS[rows]
+        entry[0] += (t1 - t0) * 1000.0
+        entry[1] += (t2 - t1) * 1000.0
+        entry[2] += 1
+        if entry[2] % 40 == 0:
+            logger.info_rank0(
+                f"forward @{rows} rows x{entry[2]}: transformer={entry[0] / entry[2]:.1f}ms "
+                f"head={entry[1] / entry[2]:.1f}ms"
+            )
+        return logits
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]

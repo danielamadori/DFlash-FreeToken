@@ -64,6 +64,14 @@ from .base import BaseOP
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
 
+# Above _MMVQ_SAFE, a type with no MMQ kernel is not choosing between two GEMMs: its only other
+# option is dequantizing the whole matrix and multiplying dense. That is worth it for a long
+# prefill, where the dequantized weight is reused across hundreds of rows, and ruinous for the
+# handful of rows a speculative verification carries -- on Qwen3.8-27B-UD-Q4_K_S it means
+# dequantizing 6.82 GiB per forward to multiply seven rows. So MMVQ stays the choice for those
+# types up to a window this size, since its kernel takes any row count.
+_MMVQ_NO_MMQ_LIMIT = 32
+
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
     """y = x @ dequant(qweight).T, dispatched by batch size and quant type.
@@ -100,7 +108,9 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         # so casting it is negligible, and computing in the stored precision is what
         # llama.cpp does for these tensors anyway.
         return (x.to(w.dtype) @ w.T).to(x.dtype)
-    if x.shape[0] <= _MMVQ_SAFE and qweight_type in MMVQ_TYPES:
+    if qweight_type in MMVQ_TYPES and x.shape[0] <= (
+        _MMVQ_SAFE if qweight_type in MMQ_TYPES else _MMVQ_NO_MMQ_LIMIT
+    ):
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in MMQ_TYPES:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)
