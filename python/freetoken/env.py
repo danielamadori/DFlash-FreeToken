@@ -74,6 +74,10 @@ class EnvClassSingleton:
     # recurrent state to a block's accepted prefix. Off until the rewound state is shown to
     # match a non-speculative run: a wrong rewind reads as fluent text, not as an error.
     SPEC_GDN_ROLLBACK = EnvBool(False)
+    # Replay the K+1-row speculative verify forward as a CUDA graph instead of launching its
+    # kernels one by one. Off until the replayed logits and rewound GDN state are shown to be
+    # bitwise equal to the eager verify: a stale captured buffer reads as fluent text.
+    SPEC_VERIFY_GRAPH = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state

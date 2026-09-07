@@ -118,6 +118,7 @@ class GraphRunner:
         self.moe_offload_cache = moe_offload_cache
         self.stream = stream
         self.device = device
+        self.model = model
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -132,6 +133,11 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        # Per-bs hidden-state store published by the captured forward (None when capture is
+        # off). The tensors live in the graph's pool and are rewritten in place by every
+        # replay; holding the list here also keeps a later capture sharing the pool from
+        # reusing their addresses.
+        self.hidden_map: Dict[int, list[torch.Tensor | None] | None] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
@@ -178,6 +184,10 @@ class GraphRunner:
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
+            # Read right after the capture: the warm-up forward above assigned an eager store
+            # that a replay never rewrites, so this is the only list that follows the graph.
+            # getattr: test doubles and models without capture publish nothing.
+            self.hidden_map[bs] = getattr(model, "last_hidden_states", None)
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
@@ -187,7 +197,14 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        # A speculative verify batch is a decode batch whose single request extends by the
+        # whole block (pending token + candidates); the captured graphs read one row per
+        # request, so routing it here would write 1 + block rows into a one-row buffer.
+        return (
+            batch.is_decode
+            and batch.size <= self.max_graph_bs
+            and all(req.extend_len == 1 for req in batch.reqs)
+        )
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
@@ -195,7 +212,20 @@ class GraphRunner:
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
+        self._rebind_hidden_states(batch.padded_size)
         return self.buffer.logits[: batch.size]
+
+    def _rebind_hidden_states(self, bs: int) -> None:
+        # A replay rewrites the captured hidden-state tensors but runs no Python, so the
+        # model's store still names whatever list the last eager forward built: a draft fed
+        # from it would see the previous step's context and its candidates get rejected,
+        # which reads as a poor acceptance rate rather than a wiring bug. Graphs captured
+        # before capture was enabled published nothing at all, hence the constructor order
+        # in Engine (enable before GraphRunner) and the None check here.
+        hidden = self.hidden_map.get(bs)
+        if hidden is None:
+            return
+        self.model.model._captured_hidden_states = hidden
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size
@@ -214,4 +244,13 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.buffer = None
+        # The model may still name a captured store; through it one small tensor would pin a
+        # whole segment of the pool being freed. The next forward publishes a fresh list.
+        inner = getattr(self.model, "model", None)
+        if inner is not None and any(
+            hidden is not None and getattr(inner, "_captured_hidden_states", None) is hidden
+            for hidden in self.hidden_map.values()
+        ):
+            inner._captured_hidden_states = None
+        self.hidden_map = {}
         gc.collect()

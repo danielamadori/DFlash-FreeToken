@@ -44,6 +44,30 @@ class FICaptureData(BaseCaptureData):
 
 
 @dataclass
+class FIVerifyBuffers:
+    """Static index buffers of the graph-mode prefill wrapper used for the K+1-row
+    speculative verify. They are NOT views into ``FICaptureData``: those slices belong
+    to the bs=1 decode graph wrapper, and a plan for one graph must not rewrite the
+    indices the other graph reads. One request: indptr buffers are ``[2]``, the
+    last-page buffer ``[1]``; ``kv_indices`` is the upper bound on the KV length."""
+
+    qo_indptr: torch.Tensor  # int32 [2]
+    kv_indptr: torch.Tensor  # int32 [2]
+    kv_indices: torch.Tensor  # int32 [max_seq_len]
+    last_page_len: torch.Tensor  # int32 [1]
+
+    @classmethod
+    def create(cls, max_seq_len: int, device: torch.device, rows: int = 8) -> FIVerifyBuffers:
+        kw = {"dtype": torch.int32, "device": device}
+        return cls(
+            qo_indptr=torch.tensor([0, rows], **kw),
+            kv_indptr=torch.zeros((2,), **kw),
+            kv_indices=torch.zeros((max_seq_len,), **kw),
+            last_page_len=torch.ones((1,), **kw),
+        )
+
+
+@dataclass
 class FIMetadata(BaseAttnMetadata):
     # fmt: off
     cu_seqlens_q_cpu:   torch.Tensor  # on cpu
@@ -141,6 +165,10 @@ class FlashInferBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
+        # graph-mode prefill wrapper for the K+1-row verify (prepare_verify_capture)
+        self.verify_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = None
+        self.verify_bufs: FIVerifyBuffers | None = None
+        self.verify_rows = 0
         self.last_event = torch.cuda.Event()
         self.last_event.record()
 
@@ -273,6 +301,11 @@ class FlashInferBackend(BaseAttnBackend):
         # long-lived workspace buffers. Lets init_capture_graph re-run after a cache rebuild.
         super().reset_capture()
         self.graph_wrappers = {}
+        # The verify wrapper's static buffers belong to the verify graph, which is torn
+        # down and re-captured together with the decode graphs after a rebuild.
+        self.verify_wrapper = None
+        self.verify_bufs = None
+        self.verify_rows = 0
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
@@ -318,4 +351,77 @@ class FlashInferBackend(BaseAttnBackend):
         assert isinstance(metadata, FIMetadata) and not metadata.initialized
         assert self.capture is not None and bs in self.capture_bs
         metadata.wrapper = self.graph_wrappers[bs]
+        self._initialize_metadata_once(metadata)
+
+    def prepare_verify_capture(self, batch: Batch, bufs: FIVerifyBuffers) -> None:
+        """Build the graph-mode prefill wrapper over ``bufs`` and plan the capture batch.
+
+        The eager ``prefill_wrapper`` cannot be captured: its plan() allocates fresh
+        index tensors, and a replay would read whatever those addresses hold later. In
+        graph mode flashinfer copies each plan into the caller's static buffers, freezes
+        the batch size at ``len(qo_indptr_buf) - 1`` and the row count at the FIRST
+        plan, so the capture batch must be the first plan and carry the full K+1 rows.
+        Plan runs here, outside the graph: the captured forward then finds
+        ``metadata.initialized`` and skips it (plan does host syncs).
+        """
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        assert self.verify_wrapper is None, "Verify capture already initialized."
+        assert bufs.qo_indptr.numel() == 2 and bufs.kv_indptr.numel() == 2
+        assert bufs.last_page_len.numel() == 1
+        # Check the capture batch before building anything, so a refused capture leaves
+        # the backend re-armable instead of tripping the assert above on retry.
+        self.prepare_metadata(batch)
+        metadata = batch.attn_metadata
+        assert isinstance(metadata, FIMetadata) and metadata.wrapper is self.prefill_wrapper
+        rows = int(metadata.cu_seqlens_q_cpu[-1])
+        assert rows > 1, "Verify capture batch must carry several query rows."
+        assert metadata.indices.numel() <= bufs.kv_indices.numel()
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            self.float_workspace_buffer,
+            kv_layout="NHD",
+            backend="fa2",
+            use_cuda_graph=True,
+            qo_indptr_buf=bufs.qo_indptr,
+            paged_kv_indptr_buf=bufs.kv_indptr,
+            paged_kv_indices_buf=bufs.kv_indices,
+            paged_kv_last_page_len_buf=bufs.last_page_len,
+        )
+        # Same int-workspace hack as prepare_for_capture: every wrapper plans into the one
+        # buffer, hence plan and replay must stay back-to-back on the stream.
+        wrapper._int_workspace_buffer = self.int_workspace_buffer
+        # Arm the backend only once the first plan succeeded: a plan that raises would
+        # otherwise leave verify_wrapper set, and the next capture attempt (after a rebuild)
+        # would trip "already initialized" instead of trying again.
+        self.verify_wrapper, self.verify_bufs, self.verify_rows = wrapper, bufs, rows
+        try:
+            self._plan_verify(metadata)
+        except Exception:
+            self.verify_wrapper = self.verify_bufs = None
+            self.verify_rows = 0
+            raise
+
+    def prepare_verify_replay(self, batch: Batch) -> None:
+        # The scheduler's 8-row decode batch chose the eager prefill wrapper; the graph
+        # must run the wrapper whose static buffers it was captured over, so swap it in
+        # and plan once (into the static buffers) right before g.replay().
+        metadata = batch.attn_metadata
+        assert self.verify_wrapper is not None, "Verify capture not initialized."
+        assert isinstance(metadata, FIMetadata) and not metadata.initialized
+        assert metadata.wrapper is self.prefill_wrapper, "Not a multi-row verify batch."
+        self._plan_verify(metadata)
+
+    def _plan_verify(self, metadata: FIMetadata) -> None:
+        assert self.verify_wrapper is not None and self.verify_bufs is not None
+        # flashinfer only rejects MORE rows than the first plan; fewer rows would plan
+        # fine and replay a graph captured for a different query count.
+        rows = int(metadata.cu_seqlens_q_cpu[-1])
+        assert metadata.cu_seqlens_q_cpu.numel() == 2 and rows == self.verify_rows, (
+            f"Verify graph captured for 1 request x {self.verify_rows} rows, "
+            f"got qo_indptr {metadata.cu_seqlens_q_cpu.tolist()}."
+        )
+        assert metadata.indices.numel() <= self.verify_bufs.kv_indices.numel(), (
+            "KV length exceeds the verify graph's static kv_indices buffer."
+        )
+        metadata.wrapper = self.verify_wrapper
         self._initialize_metadata_once(metadata)

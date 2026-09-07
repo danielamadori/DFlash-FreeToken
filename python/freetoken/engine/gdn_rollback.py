@@ -63,7 +63,8 @@ class GDNRollback:
 
     Lifecycle, driven by the scheduler around a speculative block:
     ``open()`` before the verification forward, the layers ``stash()`` into it during that
-    forward, then exactly one of ``rewind(k)`` or ``close()``.
+    forward -- or, when that forward is a CUDA-graph replay, the graph runner ``adopt()``s the
+    entries it recorded at capture time -- then exactly one of ``rewind(k)`` or ``close()``.
 
     Restricted to a single request per block, which is what the speculative scheduler drives
     today; ``open()`` refuses anything else rather than silently rewinding one sequence's state
@@ -122,6 +123,24 @@ class GDNRollback:
             rescan, local_index, head_k_dim, q, k, v, g, beta, conv_in
         )
 
+    def adopt(self, stash: dict[int, LayerStash], fused: Callable[..., None] | None) -> None:
+        """Install a stash recorded while capturing a CUDA graph into the open block.
+
+        A replayed verification forward runs no Python, so the layers never call ``stash()``
+        and a rewind would find nothing to walk forward over. The entries recorded at capture
+        time point at the graph's static activations, which the replay has just rewritten for
+        this block's rows, so installing them is the same as if the forward had stashed them.
+
+        Copied, not aliased: ``close()`` empties the installed dict, and emptying the graph
+        runner's own copy would leave every replay after the first with nothing to rewind.
+        """
+        if not self._open:
+            raise RuntimeError("GDNRollback.adopt() without an open block")
+        if not stash:
+            raise ValueError("GDNRollback.adopt() with an empty stash")
+        self._stash = dict(stash)
+        self._fused = fused
+
     def rewind(self, accepted: int) -> None:
         """Rewind every recorded layer's state to the tokens this block actually committed.
 
@@ -142,8 +161,17 @@ class GDNRollback:
         assert live is not None
         try:
             window = self._window_len()
+            if window is None:
+                # Nothing recorded means the forward that ran under this block never reached
+                # the layers' stash (a graph replay runs no Python), and the live state still
+                # holds every rejected row. Returning here would keep it, which reads as the
+                # sequence repeating itself rather than as an error.
+                raise RuntimeError(
+                    "GDNRollback.rewind() with no stashed layer: the verification forward "
+                    "recorded nothing, so the state cannot be walked back"
+                )
             committed = accepted + 1
-            if window is None or committed >= window:
+            if committed >= window:
                 # The whole window was committed: the live state already reflects it exactly.
                 # Rewinding would be a no-op scan, but it would still cost a kernel launch per
                 # layer on the common good case.

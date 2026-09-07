@@ -9,9 +9,10 @@ comparing tokenised output against the baseline on a GPU.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
-from freetoken.engine.gdn_rollback import GDNRollback
+from freetoken.engine.gdn_rollback import GDNRollback, LayerStash
 
 
 class FakePool:
@@ -57,6 +58,19 @@ def _stash_into(rb: GDNRollback, layer_id: int, n: int, calls: list) -> None:
         conv_in=torch.zeros(n, 6),
         local_index=layer_id,
         head_k_dim=4,
+    )
+
+
+def _capture_entry(layer_id: int, n: int, calls: list) -> LayerStash:
+    """A layer's entry as a graph runner would keep it from capture: window of ``n`` rows."""
+
+    def rescan(*, live_slot, scratch_slot, committed, stash):
+        calls.append((layer_id, live_slot, scratch_slot, committed, int(stash.q.shape[1])))
+
+    return LayerStash(
+        rescan, layer_id, 4,
+        q=torch.zeros(1, n, 2, 4), k=torch.zeros(1, n, 2, 4), v=torch.zeros(1, n, 2, 4),
+        g=torch.zeros(1, n, 2), beta=torch.zeros(1, n, 2), conv_in=torch.zeros(n, 6),
     )
 
 
@@ -112,8 +126,29 @@ def test_stash_is_ignored_when_not_recording():
     calls: list = []
     _stash_into(rb, 0, 8, calls)
     rb.open(live_slot=2)
-    rb.rewind(accepted=0)
+    assert rb._window_len() is None, "rows stashed before open() must not be recorded"
+    with pytest.raises(RuntimeError, match="no stashed layer"):
+        rb.rewind(accepted=0)
     assert calls == []
+
+
+def test_rewind_with_nothing_stashed_is_refused_not_skipped():
+    """This used to return silently, which a CUDA-graph replay would turn into wrong output.
+
+    A replayed verification forward runs no Python, so the layers never stash; if the rewind
+    then quietly did nothing, the live state would keep every rejected row and the sequence
+    would start repeating itself. An empty stash under an open block is a bug, and it must
+    say so -- while still ending the block, so the next open() does not raise "twice".
+    """
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    rb.open(live_slot=2)
+    pool.copies.clear()
+    with pytest.raises(RuntimeError, match="no stashed layer"):
+        rb.rewind(accepted=2)
+    assert pool.copies == [], "must not restore the snapshot when it cannot walk forward again"
+    assert not rb.recording
+    rb.open(live_slot=2)
 
 
 def test_full_acceptance_does_no_rescan_and_no_restore():
@@ -276,3 +311,109 @@ def test_rewind_without_open_is_refused():
         assert "without an open block" in str(e)
     else:
         raise AssertionError("rewinding with no block must raise")
+
+
+def test_adopt_installs_a_capture_time_stash_for_the_rewind():
+    """The replay of a verify graph stashes nothing; the runner hands over what capture recorded.
+
+    Three layers captured over an 8-row window, then 2 accepted candidates: one fused call
+    carrying all three entries, committing 3 rows, after the snapshot is restored.
+    """
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    per_layer: list = []
+    fused_calls: list = []
+
+    def fused(entries, *, live_slot, scratch_slot, committed):
+        fused_calls.append((len(list(entries)), live_slot, scratch_slot, committed))
+
+    captured = {layer: _capture_entry(layer, 8, per_layer) for layer in (0, 1, 2)}
+    rb.open(live_slot=5)
+    scratch = pool.copies[0][1]
+    pool.copies.clear()
+    rb.adopt(captured, fused)
+    rb.rewind(accepted=2)
+
+    assert pool.copies == [(scratch, 5)], "restored from the pre-block snapshot, once"
+    assert fused_calls == [(3, 5, scratch, 3)], "one call, every layer, accepted + 1 rows"
+    assert per_layer == [], "the fused path replaces the per-layer one for adopted entries too"
+    assert not rb.recording
+
+
+def test_adopt_without_a_fused_rescan_walks_each_layer():
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    calls: list = []
+    captured = {layer: _capture_entry(layer, 8, calls) for layer in (0, 1, 2)}
+    rb.open(live_slot=5)
+    scratch = pool.copies[0][1]
+    rb.adopt(captured, None)
+    rb.rewind(accepted=2)
+    assert [c[0] for c in calls] == [0, 1, 2]
+    for _, live, scr, committed, window in calls:
+        assert (live, scr, committed, window) == (5, scratch, 3, 8)
+
+
+def test_adopt_keeps_the_fast_path_on_full_acceptance():
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    fused_calls: list = []
+
+    def fused(entries, **kw):
+        fused_calls.append(1)
+
+    captured = {layer: _capture_entry(layer, 8, []) for layer in (0, 1, 2)}
+    rb.open(live_slot=5)
+    pool.copies.clear()
+    rb.adopt(captured, fused)
+    rb.rewind(accepted=7)
+    assert fused_calls == [] and pool.copies == []
+
+
+def test_adopt_on_a_closed_rollback_is_refused():
+    """Adopting outside a block would make the next rewind act on stale rows."""
+    rb = GDNRollback(FakePool())
+    captured = {0: _capture_entry(0, 8, [])}
+    with pytest.raises(RuntimeError, match="without an open block"):
+        rb.adopt(captured, None)
+    rb.open(live_slot=1)
+    rb.close()
+    with pytest.raises(RuntimeError, match="without an open block"):
+        rb.adopt(captured, None)
+
+
+def test_adopting_an_empty_stash_is_refused():
+    """A capture that recorded no layer is a bug; catching it at adopt is earlier than rewind."""
+    rb = GDNRollback(FakePool())
+    rb.open(live_slot=1)
+    with pytest.raises(ValueError, match="empty"):
+        rb.adopt({}, None)
+    rb.close()
+
+
+def test_close_after_adopt_clears_the_block_but_not_the_captured_copy():
+    """close() must drop the adopted entries from the rollback and leave the runner's alone.
+
+    The runner adopts the same dict on every replay; if the rollback aliased it, the first
+    close() would empty it and every later block would have nothing to rewind.
+    """
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    fused_calls: list = []
+
+    def fused(entries, **kw):
+        fused_calls.append(len(list(entries)))
+
+    captured = {layer: _capture_entry(layer, 8, []) for layer in (0, 1, 2)}
+    rb.open(live_slot=5)
+    rb.adopt(captured, fused)
+    rb.close()
+    assert rb._window_len() is None, "close() must drop the adopted entries"
+    assert len(captured) == 3, "and must not empty the graph runner's own copy"
+
+    # A second block adopts the same entries again, exactly as a second replay would.
+    rb.open(live_slot=5)
+    rb.adopt(captured, fused)
+    rb.rewind(accepted=1)
+    assert fused_calls == [3]
+    assert len(captured) == 3

@@ -123,6 +123,13 @@ def chunk_fwd_kernel_o(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+def chunk_fwd_o_block_size(T: int, chunk_size: int = 64) -> int:
+    """The chunk length ``chunk_fwd_o`` tiles ``T`` rows with. It shrinks below the shared
+    chunk size for short inputs, so its chunk indices are not the ones the other kernels use;
+    a caller precomputing ``chunk_indices`` for it must derive them from this length."""
+    return min(chunk_size, max(16, triton.next_power_of_2(T)))
+
+
 def chunk_fwd_o(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -132,13 +139,15 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    BT = chunk_fwd_o_block_size(T, chunk_size)
+    # ``chunk_indices``, when given, must have been built for this BT (chunk_fwd_o_block_size),
+    # not for the shared chunk size.
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5

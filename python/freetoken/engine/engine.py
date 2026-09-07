@@ -17,11 +17,13 @@ from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
 from freetoken.engine import spec_trace
+from freetoken.env import ENV
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from .verify_graph import VerifyGraphRunner
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -405,6 +407,37 @@ class Engine:
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
+        self.draft_runner = None
+        if getattr(config, "spec_draft_model", None):
+            from freetoken.engine.draft_runner import DFlashRunner
+
+            # torch_dtype() is the default-dtype context manager, not a parser: calling it
+            # here handed transformers a context manager as the draft's dtype.
+            draft_dt = config.spec_draft_dtype
+            if isinstance(draft_dt, str):
+                resolved = getattr(torch, draft_dt, None)
+                if not isinstance(resolved, torch.dtype):
+                    raise ValueError(
+                        f"spec_draft_dtype {draft_dt!r} does not name a torch dtype"
+                    )
+                draft_dt = resolved
+            # The draft model was requested explicitly, so a load failure is fatal: swallowing
+            # it here would serve every request at 1x while the logs claim DFlash is enabled.
+            self.draft_runner = DFlashRunner(
+                draft_model_path=config.spec_draft_model,
+                target_model=self.model,
+                device=self.device,
+                dtype=draft_dt,
+                block_size=config.spec_block_size,
+            )
+            # The draft is conditioned on the target's hidden states at the layers its
+            # checkpoint was trained against, so the target has to publish them. Enabled
+            # before the decode graphs are captured (below): a graph captured with capture
+            # off records no hidden-state writes, and its replays would leave the draft
+            # reading the last eager forward's store. The rebuild path already recaptures
+            # with capture on, so startup and rebuild now publish the same way.
+            self.model.enable_hidden_state_capture(self.draft_runner.target_layer_ids)
+
         # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
@@ -432,33 +465,9 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
-
-        self.draft_runner = None
-        if getattr(config, "spec_draft_model", None):
-            from freetoken.engine.draft_runner import DFlashRunner
-
-            # torch_dtype() is the default-dtype context manager, not a parser: calling it
-            # here handed transformers a context manager as the draft's dtype.
-            draft_dt = config.spec_draft_dtype
-            if isinstance(draft_dt, str):
-                resolved = getattr(torch, draft_dt, None)
-                if not isinstance(resolved, torch.dtype):
-                    raise ValueError(
-                        f"spec_draft_dtype {draft_dt!r} does not name a torch dtype"
-                    )
-                draft_dt = resolved
-            # The draft model was requested explicitly, so a load failure is fatal: swallowing
-            # it here would serve every request at 1x while the logs claim DFlash is enabled.
-            self.draft_runner = DFlashRunner(
-                draft_model_path=config.spec_draft_model,
-                target_model=self.model,
-                device=self.device,
-                dtype=draft_dt,
-                block_size=config.spec_block_size,
-            )
-            # The draft is conditioned on the target's hidden states at the layers its
-            # checkpoint was trained against, so the target has to publish them.
-            self.model.enable_hidden_state_capture(self.draft_runner.target_layer_ids)
+        # After the decode graphs (it captures the same model with hidden-state capture on)
+        # and after the draft runner (its target layers say which hidden rows to keep).
+        self._build_verify_graph(aligned_max_seq_len)
 
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -908,7 +917,10 @@ class Engine:
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
-        # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
+        # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc). The verify
+        #    graph first: reset_capture drops its attention wrapper, and the GDN pool base
+        #    pointers its kernels baked in are about to be reallocated.
+        self._destroy_verify_graph()
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
         # 2. Resize caches in place (each frees its old GPU tensors before allocating).
@@ -954,6 +966,73 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        self._build_verify_graph(aligned_max_seq_len)
+
+    def _verify_graph_unsupported_reason(self) -> str | None:
+        """Why the speculative verify has to stay eager here, or None if it can be replayed."""
+        if not ENV.SPEC_VERIFY_GRAPH:
+            return "FREETOKEN_SPEC_VERIFY_GRAPH is off"
+        if self.draft_runner is None:
+            return "no draft model"
+        from freetoken.attention.fi import FlashInferBackend
+
+        if not isinstance(self.attn_backend, FlashInferBackend):
+            return f"attention backend {type(self.attn_backend).__name__} has no verify wrapper"
+        if self.linear_state_pool is not None:
+            # The scheduler rewinds the GDN state of a rejected block only on hybrid-radix
+            # with the rollback switch; a replay that stashes nothing can only hand its
+            # entries to that rollback, so the same conditions gate the graph.
+            if getattr(self.config, "cache_type", None) != "hybrid_radix":
+                return "GDN state without a hybrid-radix cache"
+            if not ENV.SPEC_GDN_ROLLBACK:
+                return "GDN state without FREETOKEN_SPEC_GDN_ROLLBACK"
+        return None
+
+    def _build_verify_graph(self, aligned_max_seq_len: int) -> None:
+        """Capture the K+1-row verify graph, or leave the verify eager (``verify_graph`` None).
+
+        A failed capture is logged and falls back to the eager verify: the graph only
+        removes launch gaps, and the eager path is the one the outputs were validated on.
+        """
+        self.verify_graph: VerifyGraphRunner | None = None
+        reason = self._verify_graph_unsupported_reason()
+        if reason is not None:
+            if ENV.SPEC_VERIFY_GRAPH:
+                logger.info_rank0(f"Speculative verify stays eager: {reason}")
+            return
+        runner = VerifyGraphRunner(
+            stream=self.stream,
+            device=self.device,
+            model=self.model,
+            attn_backend=self.attn_backend,
+            linear_state_pool=self.linear_state_pool,
+            moe_offload_cache=self.moe_offload_cache,
+            # The draft block's first slot is the anchor token, so a block of size B yields
+            # B - 1 candidates; with the pending row the verify forward has exactly B rows
+            # (the log says "forward @8 rows" for --spec-block-size 8). A graph captured for
+            # B + 1 rows would never match a real batch and silently never replay.
+            rows=self.draft_runner.block_size,
+            vocab_size=self.config.model_config.vocab_size,
+            max_seq_len=aligned_max_seq_len,
+            capture_table_idx=self.dummy_req.table_idx,
+            sink_loc=self.num_pages * self.config.page_size,
+            target_layer_ids=self.draft_runner.target_layer_ids,
+        )
+        try:
+            runner.capture()
+        except Exception as e:
+            logger.warning_rank0(
+                f"Verify graph capture failed, speculative verify stays eager: {e!r}",
+                exc_info=True,
+            )
+            runner.destroy()
+            return
+        self.verify_graph = runner
+
+    def _destroy_verify_graph(self) -> None:
+        if self.verify_graph is not None:
+            self.verify_graph.destroy()
+            self.verify_graph = None
 
     def _forward_batch_standard(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -990,19 +1069,24 @@ class Engine:
         return self._forward_batch_standard(batch, args)
 
     def forward_logits(self, batch: Batch) -> torch.Tensor:
-        """Run the target eagerly and return the logits of every scored position.
+        """Run the target and return the logits of every scored position.
 
         The scheduler's speculative step verifies a draft block with this: it needs one row
         per candidate plus the bonus row (the batch carries all_logits), and it samples them
         itself rather than taking a single next token.
 
-        Deliberately not a CUDA graph replay. A replay does not execute the Python forward,
-        so the hidden states captured for the next draft would still be the previous step's
-        -- wrong output rather than merely slow.
+        Never the decode graphs: a replay does not execute the Python forward, so the hidden
+        states for the next draft and the rollback's stash would be the previous step's --
+        wrong output rather than merely slow. The verify graph replays only the batches it
+        was captured for and republishes both itself; everything else runs eagerly.
         """
         assert torch.cuda.current_stream() == self.stream
+        verify_graph = self.verify_graph
         with self.ctx.forward_batch(batch):
-            logits = self.model.forward()
+            if verify_graph is not None and verify_graph.can_replay(batch):
+                logits = verify_graph.replay(batch)
+            else:
+                logits = self.model.forward()
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
         return logits
@@ -1065,6 +1149,7 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        self._destroy_verify_graph()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

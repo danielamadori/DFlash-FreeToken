@@ -15,6 +15,9 @@ def gdn_prefill_chunk_fla(
     cu_seqlens: torch.Tensor,    # [num_seqs+1] int64
     scale: float,
     return_h: bool = False,
+    chunk_indices: torch.Tensor | None = None,    # [NT, 2] int64, prepare_chunk_indices(cu, 64)
+    chunk_indices_o: torch.Tensor | None = None,  # [NT_o, 2] int64, for chunk_fwd_o's own BT
+    chunk_offsets: torch.Tensor | None = None,    # [num_seqs+1] int64, prepare_chunk_offsets(cu, 64)
 ) -> torch.Tensor:
     """Chunked gated-delta-rule prefill via the vendored fla kernel. GQA is handled
     in-kernel (q/k at num_k_heads), q/k l2norm is done in-kernel, and the per-sequence
@@ -27,7 +30,11 @@ def gdn_prefill_chunk_fla(
     ``[1, NT_total, num_v_heads, head_v_dim, head_k_dim]`` (bf16). ``h[0, boh_i + c]`` is the
     recurrent state after ``c*64`` tokens of packed sequence ``i`` (chunk granularity 64), where
     ``boh_i = prepare_chunk_offsets(cu_seqlens, 64)[i]``. Note the last two dims are ``[V, K]`` --
-    transposed vs ``state_source``'s ``[K, V]``. Used by the hybrid-radix track-checkpoint path."""
+    transposed vs ``state_source``'s ``[K, V]``. Used by the hybrid-radix track-checkpoint path.
+
+    The three ``chunk_*`` tensors are the kernels' chunk bookkeeping (``FLAMetadata`` carries
+    them, built on the host). Without them the kernels derive them from ``cu_seqlens`` with a
+    device-to-host readback, which is a sync per forward and illegal under CUDA-graph capture."""
     from freetoken.kernel.fla import chunk_gated_delta_rule
 
     o, _, h = chunk_gated_delta_rule(
@@ -35,6 +42,8 @@ def gdn_prefill_chunk_fla(
         initial_state=state_source, initial_state_indices=indices.to(torch.int32),
         cu_seqlens=cu_seqlens.to(torch.int64), head_first=False,
         use_qk_l2norm_in_kernel=True,
+        chunk_indices=chunk_indices, chunk_indices_o=chunk_indices_o,
+        chunk_offsets=chunk_offsets,
     )
     if return_h:
         return o[0], h  # h: [1, NT_total, num_v_heads, head_v_dim, head_k_dim]

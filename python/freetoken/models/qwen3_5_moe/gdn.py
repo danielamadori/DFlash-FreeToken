@@ -86,14 +86,20 @@ def rescan_prefix_fused(entries, *, live_slot: int, scratch_slot: int, committed
     )
     num_slots = rec.shape[1]
     flat_state = rec.view(-1, *rec.shape[2:])
+    # Host-staged like FLAMetadata: a pageable copy here would block until the verification
+    # forward drains, and a fresh cu_seqlens object would make the kernels read their chunk
+    # bookkeeping back from the device on every rewind (the index cache is keyed by identity).
+    from freetoken.attention.linear import build_fla_chunk_indices
+
+    pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
     indices = torch.tensor(
         [st.local_index * num_slots + live_slot for st in stashes],
-        dtype=torch.int32,
-        device=device,
-    )
+        dtype=torch.int32, **pin,
+    ).to(device, non_blocking=True)
     cu_seqlens = torch.arange(
-        0, (n + 1) * committed, committed, dtype=torch.int64, device=device
-    )
+        0, (n + 1) * committed, committed, dtype=torch.int64, **pin
+    ).to(device, non_blocking=True)
+    chunks = build_fla_chunk_indices([committed] * n, device, pin_memory=pin["pin_memory"])
 
     def joined(name: str) -> torch.Tensor:
         return torch.cat([getattr(st, name)[:, :committed] for st in stashes], dim=1)
@@ -102,6 +108,7 @@ def rescan_prefix_fused(entries, *, live_slot: int, scratch_slot: int, committed
         joined("q"), joined("k"), joined("v"), joined("g"), joined("beta"),
         state_source=flat_state, indices=indices,
         cu_seqlens=cu_seqlens, scale=stashes[0].head_k_dim ** -0.5,
+        **chunks,
     )
 
     # The convolution state is a window over raw inputs, so it is rebuilt rather than rescanned:
@@ -352,6 +359,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
                 return_h=track,
+                chunk_indices=fla.chunk_indices, chunk_indices_o=fla.chunk_indices_o,
+                chunk_offsets=fla.chunk_offsets,
             )
             if timing:
                 t_chunk1 = ev()

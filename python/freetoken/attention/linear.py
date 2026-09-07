@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -26,12 +26,21 @@ class FLAMetadata:
       fresh_state_indices prefill only: the state-pool slots whose sequence is fresh
                           (cached_len == 0) and must be zeroed before the chunk kernel
                           reads them in place. None if there are none / for decode.
+      chunk_indices       extend only: the fla chunk kernels' (sequence, chunk) pairs for
+      chunk_indices_o     CHUNK_SIZE and for chunk_fwd_o's own block size, and the per-
+      chunk_offsets       sequence chunk offsets -- what the kernels would otherwise derive
+                          from cu_seqlens with a device-to-host readback, one sync per forward
+                          and an invalid operation under CUDA-graph capture. int64 on device;
+                          None for decode (the recurrent kernel has no chunks).
     """
 
     cu_seqlens: torch.Tensor
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor | None = None
     fresh_state_indices: torch.Tensor | None = None
+    chunk_indices: torch.Tensor | None = None
+    chunk_indices_o: torch.Tensor | None = None
+    chunk_offsets: torch.Tensor | None = None
 
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
@@ -85,6 +94,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
     track = _build_track_metadata(reqs, cu_host, device, pin)
+    chunks = build_fla_chunk_indices(lens, device, pin_memory=pin["pin_memory"])
 
     return FLAMetadata(
         cu_seqlens=cu_host.to(device, non_blocking=True),
@@ -94,6 +104,43 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
             fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
         ),
         **track,
+        **chunks,
+    )
+
+
+def build_fla_chunk_indices(
+    lens: Sequence[int], device: torch.device, *, pin_memory: bool
+) -> dict[str, torch.Tensor]:
+    """The fla chunk kernels' chunk bookkeeping for sequences of lengths ``lens``, built on the
+    host from Python ints and moved like the other metadata (pinned staging, non_blocking H2D).
+
+    Returns the ``FLAMetadata`` kwargs ``chunk_indices`` / ``chunk_indices_o`` /
+    ``chunk_offsets``. Left to the kernels, the same values come out of ``cu_seqlens`` through
+    a ``.tolist()`` -- a host sync per forward (twice: chunk_fwd_o tiles short inputs with a
+    smaller block, so it keys its own copy) and an invalid operation under CUDA-graph capture.
+    """
+    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.kernel.fla.chunk_o import chunk_fwd_o_block_size
+    from freetoken.kernel.fla.index import chunk_indices_from_lens, chunk_offsets_from_lens
+
+    pin = {"device": "cpu", "pin_memory": pin_memory}
+
+    def stage(rows, shape):
+        return torch.tensor(rows, dtype=torch.int64, **pin).reshape(shape).to(
+            device, non_blocking=True
+        )
+
+    chunk_indices = stage(chunk_indices_from_lens(lens, CHUNK_SIZE), (-1, 2))
+    bt_o = chunk_fwd_o_block_size(sum(lens), CHUNK_SIZE)
+    chunk_indices_o = (
+        chunk_indices
+        if bt_o == CHUNK_SIZE
+        else stage(chunk_indices_from_lens(lens, bt_o), (-1, 2))
+    )
+    return dict(
+        chunk_indices=chunk_indices,
+        chunk_indices_o=chunk_indices_o,
+        chunk_offsets=stage(chunk_offsets_from_lens(lens, CHUNK_SIZE), (-1,)),
     )
 
 
@@ -107,14 +154,17 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         return empty
     from freetoken.core import get_global_ctx
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
-    from freetoken.kernel.fla.index import prepare_chunk_offsets
+    from freetoken.kernel.fla.index import chunk_offsets_from_lens
 
     km1 = get_global_ctx().linear_state_pool.conv_states.shape[-1]  # conv_kernel_dim - 1
     assert km1 <= CHUNK_SIZE, (
         f"conv history {km1} exceeds CHUNK_SIZE {CHUNK_SIZE}: the snapshot window "
         "would reach before this forward's first token"
     )
-    boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
+    # Host formula rather than prepare_chunk_offsets on the host tensor: that call would park
+    # a host entry in the kernels' 4-deep identity cache, evicting the device entries a warm
+    # forward just seeded.
+    boh = chunk_offsets_from_lens([r.extend_len for r in reqs], CHUNK_SIZE)
     dst, h_row, conv_src, boundary_rows = [], [], [], []
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:
@@ -143,4 +193,4 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     )
 
 
-__all__ = ["FLAMetadata", "build_fla_metadata"]
+__all__ = ["FLAMetadata", "build_fla_metadata", "build_fla_chunk_indices"]
