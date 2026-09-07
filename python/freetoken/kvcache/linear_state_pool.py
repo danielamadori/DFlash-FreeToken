@@ -280,13 +280,21 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
 def _linear_pool_num_slots(config) -> int:
     """LinearStatePool slot count. Hybrid-radix non-evictable peak is 4 slots per running request
     (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request
-    snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1)."""
+    snapshot cache and a padding sink; naive GDN keeps the old (max_running_req + 1).
+
+    Plus one more when a draft model can speculate on this (necessarily hybrid) model: verifying
+    a block takes an extra scratch slot for the pre-block snapshot (GDNRollback.open(), see
+    engine/gdn_rollback.py), on top of the four the running request already holds. Sized in
+    here rather than left to the free list's slack, because that slack is not guaranteed --
+    it found this the hard way, as "LinearStatePool exhausted: need 1, have 0" a few requests
+    into a real run, once the snapshot cache had filled the margin that looked like room."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
-    return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
+    rollback_scratch = 1 if getattr(config, "spec_draft_model", None) else 0
+    return 4 * mr + n_cache + 1 + rollback_scratch  # + live + 2 ping-pong + locked snapshot + cache + padding + rollback scratch
 
 
 def _linear_pool_min_slots(config) -> int:
@@ -294,8 +302,13 @@ def _linear_pool_min_slots(config) -> int:
     zero snapshot cache. Hybrid-radix needs 4 per running request (1 live + 2 ping-pong + 1
     committed snapshot locked through decode) + the padding sink; naive needs 1 per request +
     padding. Below this, a full max_running_req batch can't get its slots and admission
-    deadlocks -- so a runtime rebuild rejects a smaller request."""
+    deadlocks -- so a runtime rebuild rejects a smaller request.
+
+    Plus the rollback scratch slot too, for the same reason _linear_pool_num_slots carries it:
+    a rebuild that shrinks the pool to exactly the old floor would silently recreate the
+    exhaustion this floor exists to prevent, just one block into the first draft after it."""
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1
-    return 4 * mr + 1
+    rollback_scratch = 1 if getattr(config, "spec_draft_model", None) else 0
+    return 4 * mr + 1 + rollback_scratch
