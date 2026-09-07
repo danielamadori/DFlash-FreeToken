@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from freetoken.models.gguf.reader import resolve_gguf_path
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -239,6 +240,25 @@ def rejection_sample(
     return accepted, _sample_probs(residual[None])[0]
 
 
+def _draft_config_source(draft_model_path: str, gguf_weights: str) -> str:
+    """Where to read the draft's architecture from when its weights are a GGUF file.
+
+    A DFlash GGUF ships no config.json. If the path given is a directory that has one, that is
+    the source; otherwise the caller has to point at a directory that does, because the draft's
+    own fields (block size, target layer ids, mask token) are not in the file's metadata and a
+    wrong guess produces candidates the target quietly rejects.
+    """
+    import os
+
+    directory = draft_model_path if os.path.isdir(draft_model_path) else os.path.dirname(gguf_weights)
+    if os.path.isfile(os.path.join(directory, "config.json")):
+        return directory
+    raise ValueError(
+        f"GGUF draft {gguf_weights} has no config.json beside it: point --draft-model at a "
+        "directory holding both, or at the HF snapshot whose config describes this draft"
+    )
+
+
 class DFlashRunner:
     """
     In-engine runner for DFlash and DFlash 2 block diffusion draft models.
@@ -269,17 +289,32 @@ class DFlashRunner:
         self._target = target_model
 
         logger.info_rank0(f"Loading DFlash draft model from '{draft_model_path}' on {device} ({dtype})...")
-        config = AutoConfig.from_pretrained(draft_model_path, trust_remote_code=True)
+        gguf_weights = resolve_gguf_path(draft_model_path)
+        # A GGUF draft has no config.json beside it, so the architecture is read from the
+        # companion HF directory when there is one, and otherwise from the file's own metadata.
+        config_source = draft_model_path if gguf_weights is None else _draft_config_source(
+            draft_model_path, gguf_weights
+        )
+        config = AutoConfig.from_pretrained(config_source, trust_remote_code=True)
         draft_class = (
             DFlash2DraftModel
             if "DFlash2DraftModel" in (getattr(config, "architectures", None) or [])
             else DFlashDraftModel
         )
-        self.draft_model = draft_class.from_pretrained(
-            draft_model_path,
-            config=config,
-            torch_dtype=dtype,
-        ).to(device)
+        if gguf_weights is not None:
+            # Quantized weights, kept quantized: 1.05 GiB for the DFlash2 draft of Qwen3.8-27B
+            # against 3.85 GiB in bf16, which is what lets the pair fit on a 24 GB card at all.
+            from freetoken.engine.draft_gguf import load_gguf_draft
+
+            self.draft_model = load_gguf_draft(
+                gguf_weights, draft_class, config, device=device, dtype=dtype
+            )
+        else:
+            self.draft_model = draft_class.from_pretrained(
+                draft_model_path,
+                config=config,
+                torch_dtype=dtype,
+            ).to(device)
         self.draft_model.eval()
 
         self.target_layer_ids: List[int] = getattr(
