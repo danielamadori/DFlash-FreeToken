@@ -32,8 +32,15 @@ def causal_conv1d_varlen(
             causal_conv1d_varlen as triton_causal_conv1d_varlen,
         )
 
+        # Pass the bounds the kernel needs from host-known shapes. Left to None, the Triton
+        # path derives max_seq_len with seq_lens.max().item(): a device-to-host sync that
+        # drains the stream, once per GDN layer -- 48 times per speculative verification
+        # forward, about 8 ms of a 57 ms transformer. total_tokens bounds every sequence, and
+        # the kernel masks loads and stores against each sequence's real length, so an
+        # oversized grid only covers a few extra fully-masked blocks.
         return triton_causal_conv1d_varlen(
-            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
+            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state,
+            max_seq_len=int(x.shape[1]), batch=int(cu_seqlens.shape[0]) - 1,
         )
 
     from sgl_kernel import causal_conv1d_fwd

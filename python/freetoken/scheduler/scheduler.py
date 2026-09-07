@@ -1039,6 +1039,9 @@ class Scheduler(SchedulerIOMixin):
             temperature=params.temperature,
             top_p=params.top_p,
             top_k=max(params.top_k, 0),
+            # So the runner can tell a new request from the next block of this one and drop
+            # the previous request's context keys instead of drafting against them.
+            request_uid=req.uid,
         )
 
         _spec_timing_mark(self, "draft", _t0)

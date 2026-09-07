@@ -354,6 +354,9 @@ class DFlashRunner:
         self._crop_to = _crop_to
         self._extract_context_feature = extract_context_feature
         self._draft_cache = None
+        # Which request the draft cache belongs to. The cache holds that request's context
+        # keys, built up block by block; it is meaningless for any other request.
+        self._cache_owner: int | None = None
         self._warned_sampling_selector = False
 
         logger.info_rank0(
@@ -375,6 +378,7 @@ class DFlashRunner:
         temperature: float = 0.0,
         top_p: float = 1.0,
         top_k: int = 0,
+        request_uid: int | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate candidate tokens block via diffusion forward.
@@ -384,8 +388,18 @@ class DFlashRunner:
             draft_probs: [1, K, vocab_size] probability distribution for rejection sampling
         """
         k = block_size or self.block_size
-        if self._draft_cache is None:
+        if self._draft_cache is None or request_uid != self._cache_owner:
+            # The draft's KV cache is this request's context, built up block by block. Kept
+            # across requests it is not empty for the next one -- it is the previous request's
+            # keys, cropped to the new request's position and used as its context. Every block
+            # after the first request then drafts against the wrong text. The target still
+            # verifies, so output stays correct; what drops is acceptance, silently: on the
+            # 27B this fork accepted 27.9% from the identical draft file llama.cpp accepts
+            # 35.4% from.
             self.reset_cache()
+            self._cache_owner = request_uid
+        cache = self._draft_cache
+        assert cache is not None  # reset_cache() just guaranteed it; this narrows the type
 
         if not target_hidden_states:
             raise RuntimeError(
@@ -422,12 +436,19 @@ class DFlashRunner:
             target_hidden=target_hidden,
             noise_embedding=noise_emb,
             position_ids=pos,
-            past_key_values=self._draft_cache,
+            past_key_values=cache,
             use_cache=True,
         )[:, 1 - k :, :]
         
-        self._crop_to(self._draft_cache, seq_len)
-        
+        # Drop exactly the k noise rows this block appended, not "crop to seq_len". The two
+        # agree only when the cache already held every position below seq_len. After a prefix
+        # cache hit or a chunked prefill it does not -- the draft was fed only the rows this
+        # prefill computed -- and cropping to seq_len then asks for a positive crop, which
+        # transformers treats as an absolute length: the mask-token keys stay in the cache and
+        # every later block attends to them. Dropping k is right in both cases; in the short one
+        # the draft simply has less context, all of it real, which is what llama.cpp does too.
+        self._crop_to(cache, cache.get_seq_length() - k)
+
         draft_logits = _target_output_logits(self._target, draft_hidden)
         draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
 
