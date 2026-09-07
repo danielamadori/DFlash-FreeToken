@@ -278,3 +278,50 @@ def test_rejection_sample_accepts_the_matching_prefix():
     accepted, next_token = rejection_sample(draft_tokens, target_probs, draft_probs, 0.0)
     assert accepted == 2
     assert int(next_token) == 5  # the target's own token at the first rejected position
+
+
+def test_qwen3_5_moe_capture_materialises_the_carried_residual() -> None:
+    """The MoE family is why FreeToken is used here at all: DFlash has to reach it too.
+
+    Same carried-residual contract as the dense Qwen3, so the same materialisation
+    applies -- the layer returns (mlp_out, residual) and the add lands in the next
+    layer's fused add+norm.
+    """
+    from types import SimpleNamespace
+    from freetoken.models.qwen3_5_moe.model import Qwen3_5Model
+
+    class _StubLayer:
+        def __init__(self, delta: float) -> None:
+            self._delta = delta
+
+        def forward(self, x, residual):  # noqa: ANN001 - test stub
+            new_residual = x if residual is None else residual + x
+            return torch.full_like(x, self._delta), new_residual
+
+    model = object.__new__(Qwen3_5Model)
+    model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.ones(len(ids), 4))
+    model.norm = SimpleNamespace(forward_add_residual=lambda x, residual: (residual + x, None))
+    model.layers = SimpleNamespace(op_list=[_StubLayer(2.0), _StubLayer(3.0)])
+
+    model.set_capture_layer_ids([-1, 0, 1])
+    model.forward(torch.tensor([5]))
+    captured = model._captured_hidden_states
+
+    assert len(captured) == 3
+    assert torch.equal(captured[0], torch.ones(1, 4))          # embeddings
+    assert torch.equal(captured[1], torch.full((1, 4), 3.0))   # 1 (residual) + 2 (mlp out)
+    assert torch.equal(captured[2], torch.full((1, 4), 6.0))   # 3 (residual) + 3 (mlp out)
+
+
+def test_every_family_with_capture_refuses_an_out_of_range_layer() -> None:
+    """The guard has to hold on each family, not just the first one it was written for."""
+    from types import SimpleNamespace
+    from freetoken.models.muse_glimmer.model import MuseGlimmerModel
+    from freetoken.models.qwen3.model import Qwen3Model
+    from freetoken.models.qwen3_5_moe.model import Qwen3_5Model
+
+    for cls in (MuseGlimmerModel, Qwen3Model, Qwen3_5Model):
+        model = object.__new__(cls)
+        model.layers = SimpleNamespace(op_list=[object(), object()])
+        with pytest.raises(ValueError, match="layer 5"):
+            model.set_capture_layer_ids([5])

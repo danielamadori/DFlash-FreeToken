@@ -16,6 +16,7 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+from freetoken.engine import spec_trace
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -960,6 +961,11 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
+        if spec_trace.enabled():
+            # complete_one() has already run, so device_len is one PAST the position these
+            # logits decide; the speculative path reports the decided position itself.
+            for row, req in enumerate(batch.reqs):
+                spec_trace.record("plain", req.uid, req.device_len - 1, batch_logits[row])
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()

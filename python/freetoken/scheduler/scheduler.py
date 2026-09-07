@@ -48,6 +48,7 @@ def _gib(n_bytes: int) -> str:
 
 
 # For overlap scheduling, we also need to cache some other data to avoid IMA
+from freetoken.engine import spec_trace
 from freetoken.engine.engine import ForwardOutput
 from freetoken.engine.draft_runner import _sampling_probs, rejection_sample
 from freetoken.engine.speculative import (
@@ -1012,6 +1013,11 @@ class Scheduler(SchedulerIOMixin):
         params = req.sampling_params
 
         logits = self.engine.forward_logits(batch)  # one row per drafted position + the bonus
+        if spec_trace.enabled():
+            # Row i decides the token at first_position + i, which is the same position the
+            # plain path reports as req.device_len when it predicts it.
+            for row in range(logits.shape[0]):
+                spec_trace.record("verify", req.uid, block.first_position + row, logits[row])
         target_probs = _sampling_probs(
             logits, params.temperature, params.top_p, max(params.top_k, 0)
         ).unsqueeze(0)
