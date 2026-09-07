@@ -231,11 +231,12 @@ def test_draft_embeds_through_a_target_whose_table_has_no_weight():
     table = torch.randn(10, 4)
 
     class PackedEmbedding:
-        """Stands in for GGUFEmbedding: embeds through __call__, exposes no `.weight`."""
+        """Stands in for GGUFEmbedding: a plain object with `forward`, no `.weight`, and --
+        this is the part that bit -- NOT callable, since FreeToken layers are not nn.Modules."""
 
         tp_size = 1
 
-        def __call__(self, ids: torch.Tensor) -> torch.Tensor:
+        def forward(self, ids: torch.Tensor) -> torch.Tensor:
             return table[ids]
 
     target = SimpleNamespace(model=SimpleNamespace(embed_tokens=PackedEmbedding()))

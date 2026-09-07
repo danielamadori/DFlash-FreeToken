@@ -93,8 +93,12 @@ def _embed_with_target(target: nn.Module, ids: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError(
             "DFlash drafting against a tensor-parallel sharded vocabulary is not supported"
         )
-    # A plain nn.Embedding, a VocabParallelEmbedding and a GGUFEmbedding all embed through
-    # __call__; only the first two also expose a usable `.weight`.
+    # FreeToken's layers are plain objects with a `forward` method, not nn.Modules, so they
+    # are NOT callable: GGUFEmbedding raises "object is not callable" under `embedding(ids)`.
+    # Transformers modules have both, and `forward` means the same thing on each.
+    forward = getattr(embedding, "forward", None)
+    if forward is not None:
+        return forward(ids)
     return embedding(ids)
 
 
