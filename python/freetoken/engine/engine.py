@@ -969,12 +969,18 @@ class Engine:
             req.complete_one()
 
         batch_logits = logits[: batch.size]
+        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         if spec_trace.enabled():
             # complete_one() has already run, so device_len is one PAST the position these
-            # logits decide; the speculative path reports the decided position itself.
+            # logits decide; the speculative path reports the decided position itself. The
+            # committed token is recorded too: at an exact tie topk's order and the
+            # sampler's argmax can disagree, and only the committed token says which way
+            # the run actually went.
+            chosen = next_tokens_gpu.tolist()
             for row, req in enumerate(batch.reqs):
-                spec_trace.record("plain", req.uid, req.device_len - 1, batch_logits[row])
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+                spec_trace.record(
+                    "plain", req.uid, req.device_len - 1, batch_logits[row], token=chosen[row]
+                )
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

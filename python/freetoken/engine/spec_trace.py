@@ -40,11 +40,21 @@ def _out() -> TextIO:
     return _handle
 
 
-def record(source: str, uid: int, position: int, logits_row: torch.Tensor) -> None:
+def record(
+    source: str,
+    uid: int,
+    position: int,
+    logits_row: torch.Tensor,
+    *,
+    valid: bool = True,
+    token: int | None = None,
+) -> None:
     """Write the top two candidates and their gap for one predicted position.
 
     ``logits_row`` is the [vocab] row that decides the token at ``position``; ``source``
     says which path produced it ("plain" or "verify") so the two runs stay comparable.
+    ``valid`` is False for a verification row whose context contains a rejected candidate:
+    it is recorded for completeness but describes a stream that was never committed.
     """
     if not _TRACE_PATH:
         return
@@ -62,6 +72,8 @@ def record(source: str, uid: int, position: int, logits_row: torch.Tensor) -> No
                 "logit1": values[0],
                 "logit2": values[1],
                 "margin": values[0] - values[1],
+                "valid": bool(valid),
+                "token": token,
             }
         )
         + "\n"

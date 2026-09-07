@@ -1074,11 +1074,6 @@ class Scheduler(SchedulerIOMixin):
         finally:
             ctx.gdn_rollback = None
         _spec_timing_mark(self, "verify", _t0)
-        if spec_trace.enabled():
-            # Row i decides the token at first_position + i, which is the same position the
-            # plain path reports as req.device_len when it predicts it.
-            for row in range(logits.shape[0]):
-                spec_trace.record("verify", req.uid, block.first_position + row, logits[row])
         target_probs = _sampling_probs(
             logits, params.temperature, params.top_p, max(params.top_k, 0)
         ).unsqueeze(0)
@@ -1086,6 +1081,20 @@ class Scheduler(SchedulerIOMixin):
             self._draft_tokens, target_probs, self._draft_probs, params.temperature
         )
         accepted = int(accepted_t)
+        if spec_trace.enabled():
+            # Row i decides the token at first_position + i, which is the same position the
+            # plain path reports as req.device_len when it predicts it. Its context is the
+            # pending token plus candidates 0..i-1, so the row speaks for the committed
+            # stream only when all of those were accepted (i <= accepted); rows past that
+            # point are conditioned on a rejected candidate and must not be compared with
+            # the plain run at the same position.
+            committed = self._draft_tokens[0, :accepted].tolist() + [int(bonus)]
+            for row in range(logits.shape[0]):
+                spec_trace.record(
+                    "verify", req.uid, block.first_position + row, logits[row],
+                    valid=row <= accepted,
+                    token=committed[row] if row <= accepted else None,
+                )
 
         # Before the KV rollback, so both caches leave this block agreeing on the same prefix.
         if rollback is not None:
