@@ -13,6 +13,11 @@
 
 Unlock datacenter-class intelligence on the hardware you already own — Run 290B+ frontier MoE models locally on your gaming PC at blistering interactive speeds.
 
+> **This is a fork.** It adds DFlash speculative decoding to FreeToken. The engine is
+> FlashML's (Apache 2.0); the method and the draft models are Z Lab's (MIT, vendored here
+> as the `dflash` submodule). What this fork adds, what has been measured and what is
+> **not** yet demonstrated: [`CREDITS.md`](CREDITS.md).
+
 ## About
 
 FreeToken is an edge-native Mixture-of-Experts (MoE) serving engine designed for running frontier-scale open-weight models on personal and consumer hardware. It treats heterogeneous edge resources—GPUs, CPUs, host memory, and interconnects—as a unified, elastic inference platform. Its core features include:  

@@ -13,20 +13,46 @@ logger = init_logger(__name__)
 
 
 def _ensure_dflash_importable() -> None:
-    """Ensure dflash package can be imported from Agents submodule if not in sys.path."""
-    try:
-        import dflash  # noqa: F401
-    except ImportError:
-        import os
-        from pathlib import Path
+    """Put the real dflash package on sys.path, whatever else answers to that name.
 
-        # Search sibling or parent directories for dflash submodule
-        current = Path(__file__).resolve()
-        for parent in current.parents:
-            candidate = parent / "dflash"
-            if candidate.is_dir() and (candidate / "dflash").is_dir():
-                sys.path.insert(0, str(candidate))
-                break
+    WHY NOT JUST `import dflash`. The checkout carries dflash as a submodule at its own
+    root, so a process started from the repository root has a bare `dflash/` directory
+    on its path -- and Python 3 imports a directory with no __init__.py as a NAMESPACE
+    package. `import dflash` therefore SUCCEEDS, binding the outer submodule directory
+    rather than the package inside it, and `dflash.model` is then missing. Probing for
+    the submodule that actually holds the model is what distinguishes the two.
+    """
+    from pathlib import Path
+
+    def _has_model() -> bool:
+        try:
+            import dflash.model  # noqa: F401
+        except Exception:
+            return False
+        return True
+
+    if _has_model():
+        return
+
+    # `dflash/dflash/model.py` is the layout of the z-lab checkout, whether it sits in
+    # this repository (as a submodule) or one level up in the workspace that vendors it.
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / "dflash"
+        if (candidate / "dflash" / "model.py").is_file():
+            path = str(candidate)
+            if path in sys.path:
+                sys.path.remove(path)
+            sys.path.insert(0, path)
+            # Drop the namespace-package binding the bare directory may have created,
+            # otherwise the stale entry keeps shadowing the real one.
+            sys.modules.pop("dflash", None)
+            if _has_model():
+                return
+    raise ImportError(
+        "cannot locate the dflash package: expected a dflash/dflash/model.py under this "
+        "repository (git submodule update --init dflash) or under the workspace above it"
+    )
 
 
 def _output_head(target: nn.Module) -> nn.Module:
