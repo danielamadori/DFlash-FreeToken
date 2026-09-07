@@ -184,19 +184,23 @@ def test_muse_glimmer_capture_uses_the_hf_layer_offset():
 def test_draft_runner_accessors_speak_both_module_protocols():
     """The draft reads the target through FreeToken's plain objects and HF modules alike."""
     from types import SimpleNamespace
-    from freetoken.engine.draft_runner import _target_embedding_weight, _target_output_logits
+    from freetoken.engine.draft_runner import _embed_with_target, _target_output_logits
 
     embed_weight = torch.randn(10, 4)
     head_weight = torch.randn(10, 4)
     hidden = torch.randn(1, 3, 4)
+    ids = torch.tensor([[1, 7, 3]])
 
     # FreeToken: plain objects, a non-callable head, no get_input_embeddings()
     ft_head = SimpleNamespace(weight=head_weight, bias=None, tied_embedding=None, tp_size=1)
+    ft_embed = torch.nn.Embedding(10, 4)
+    ft_embed.weight = torch.nn.Parameter(embed_weight)
+    ft_embed.tp_size = 1
     ft_target = SimpleNamespace(
-        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=embed_weight, tp_size=1)),
+        model=SimpleNamespace(embed_tokens=ft_embed),
         lm_head=ft_head,
     )
-    assert torch.equal(_target_embedding_weight(ft_target), embed_weight)
+    assert torch.equal(_embed_with_target(ft_target, ids), embed_weight[ids])
     assert torch.allclose(
         _target_output_logits(ft_target, hidden),
         torch.nn.functional.linear(hidden, head_weight),
@@ -208,7 +212,7 @@ def test_draft_runner_accessors_speak_both_module_protocols():
         get_input_embeddings=lambda: SimpleNamespace(weight=embed_weight),
         lm_head=hf_head,
     )
-    assert torch.equal(_target_embedding_weight(hf_target), embed_weight)
+    assert torch.equal(_embed_with_target(hf_target, ids), embed_weight[ids])
     assert torch.allclose(_target_output_logits(hf_target, hidden), hf_head(hidden))
 
     # a sharded vocabulary is refused, not silently drafted against a slice
@@ -216,7 +220,27 @@ def test_draft_runner_accessors_speak_both_module_protocols():
         model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=embed_weight, tp_size=2))
     )
     with pytest.raises(NotImplementedError, match="tensor-parallel"):
-        _target_embedding_weight(sharded)
+        _embed_with_target(sharded, ids)
+
+
+def test_draft_embeds_through_a_target_whose_table_has_no_weight():
+    """A GGUF target holds `qweight` and dequantizes per lookup; reaching for `.weight` fails."""
+    from types import SimpleNamespace
+    from freetoken.engine.draft_runner import _embed_with_target
+
+    table = torch.randn(10, 4)
+
+    class PackedEmbedding:
+        """Stands in for GGUFEmbedding: embeds through __call__, exposes no `.weight`."""
+
+        tp_size = 1
+
+        def __call__(self, ids: torch.Tensor) -> torch.Tensor:
+            return table[ids]
+
+    target = SimpleNamespace(model=SimpleNamespace(embed_tokens=PackedEmbedding()))
+    ids = torch.tensor([[2, 5]])
+    assert torch.equal(_embed_with_target(target, ids), table[ids])
 
 
 def test_qwen3_capture_materialises_the_carried_residual():

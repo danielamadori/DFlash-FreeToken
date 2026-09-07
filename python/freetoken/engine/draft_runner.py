@@ -66,8 +66,13 @@ def _output_head(target: nn.Module) -> nn.Module:
     return get_output_embeddings()
 
 
-def _target_embedding_weight(target: nn.Module) -> torch.Tensor:
-    """Raw, un-normalised input embedding matrix of the target model.
+def _embed_with_target(target: nn.Module, ids: torch.Tensor) -> torch.Tensor:
+    """Embed ``ids`` with the target's own input embedding.
+
+    Asking the module rather than taking a weight matrix off it: a GGUF checkpoint keeps the
+    table block-quantized and dequantizes only the rows a lookup touches, so it has ``qweight``
+    and no ``weight`` at all. Reaching for ``.weight`` worked on safetensors targets and broke
+    the moment the target was the GGUF this fork exists to serve.
 
     DFlash's own helper reaches it through `get_input_embeddings()`, which exists only on
     transformers modules. FreeToken models are plain objects holding a
@@ -76,7 +81,7 @@ def _target_embedding_weight(target: nn.Module) -> torch.Tensor:
     """
     get_input_embeddings = getattr(target, "get_input_embeddings", None)
     if get_input_embeddings is not None:
-        return get_input_embeddings().weight
+        return F.embedding(ids, get_input_embeddings().weight)
 
     embedding = getattr(getattr(target, "model", None), "embed_tokens", None)
     if embedding is None:
@@ -88,7 +93,9 @@ def _target_embedding_weight(target: nn.Module) -> torch.Tensor:
         raise NotImplementedError(
             "DFlash drafting against a tensor-parallel sharded vocabulary is not supported"
         )
-    return embedding.weight
+    # A plain nn.Embedding, a VocabParallelEmbedding and a GGUFEmbedding all embed through
+    # __call__; only the first two also expose a usable `.weight`.
+    return embedding(ids)
 
 
 def _target_output_logits(target: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -323,7 +330,7 @@ class DFlashRunner:
         block_output_ids[:, 0] = current_token_id.view(1)
 
         noise_emb = (
-            F.embedding(block_output_ids, _target_embedding_weight(self._target))
+            _embed_with_target(self._target, block_output_ids)
             * self.input_embedding_scale
         )
         
