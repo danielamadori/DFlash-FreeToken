@@ -40,6 +40,63 @@ class _GatedRMSNorm(BaseOP):
         )
 
 
+def rescan_prefix_fused(entries, *, live_slot: int, scratch_slot: int, committed: int) -> None:
+    """Walk every linear layer's state forward over a block's committed prefix, in one launch.
+
+    The layers are independent sequences over the same kernel, so they do not need 48 separate
+    calls: the state pool holds them in one ``[layers, slots, ...]`` tensor, and the chunk
+    kernel already accepts a batch of variable-length sequences with a state slot each. Viewing
+    the pool as ``[layers * slots, ...]`` turns the layer index into part of the slot index, and
+    the whole rewind becomes one call over ``layers x committed`` tokens.
+
+    Per-layer launches cost about 21 ms of a 88 ms speculative block on Qwen3.8-27B -- almost
+    all of it launch overhead, since the scan itself covers three tokens.
+    """
+    ctx = get_global_ctx()
+    pool = ctx.linear_state_pool
+    stashes = list(entries)
+    if not stashes:
+        return
+    n = len(stashes)
+    device = stashes[0].q.device
+
+    rec = pool.recurrent_states
+    assert rec.is_contiguous(), (
+        "the state pool must be contiguous to be viewed as [layers * slots, ...]; a reshape "
+        "here would copy, and the kernel's in-place write-back would land in the copy"
+    )
+    num_slots = rec.shape[1]
+    flat_state = rec.view(-1, *rec.shape[2:])
+    indices = torch.tensor(
+        [st.local_index * num_slots + live_slot for st in stashes],
+        dtype=torch.int32,
+        device=device,
+    )
+    cu_seqlens = torch.arange(
+        0, (n + 1) * committed, committed, dtype=torch.int64, device=device
+    )
+
+    def joined(name: str) -> torch.Tensor:
+        return torch.cat([getattr(st, name)[:, :committed] for st in stashes], dim=1)
+
+    gdn_prefill_chunk_fla(
+        joined("q"), joined("k"), joined("v"), joined("g"), joined("beta"),
+        state_source=flat_state, indices=indices,
+        cu_seqlens=cu_seqlens, scale=stashes[0].head_k_dim ** -0.5,
+    )
+
+    # The convolution state is a window over raw inputs, so it is rebuilt rather than rescanned:
+    # the restored pre-block window followed by the committed rows, keeping the tail.
+    cv = pool.conv_states
+    width = cv.shape[-1]
+    rows = torch.tensor([st.local_index for st in stashes], dtype=torch.long, device=device)
+    prefix = torch.stack(
+        [st.conv_in[:committed].transpose(0, 1).to(cv.dtype) for st in stashes], dim=0
+    )
+    window = torch.cat([cv[rows, scratch_slot], prefix], dim=-1)[..., -width:]
+    cv[rows, live_slot] = window
+
+
 class Qwen3_5GatedDeltaNet(BaseOP):
     """GatedDeltaNet op using the vendored flash-linear-attention triton kernels
     (``freetoken.kernel.fla``) for the recurrence and a per-request
@@ -255,7 +312,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             if rollback is not None and rollback.recording:
                 # Kept for a possible rewind: a rejected block needs these rows to walk the
                 # state forward again, and recomputing them would mean re-reading the weights.
-                rollback.stash(self.layer_id, self.rescan_prefix, q, k, v, g, beta, conv_in)
+                rollback.stash(
+                    self.layer_id, self.rescan_prefix, q, k, v, g, beta, conv_in,
+                    local_index=li, head_k_dim=self.head_k_dim,
+                    fused=rescan_prefix_fused,
+                )
             if track:
                 core_out, h = result
                 self._write_track_snapshot(pool, li, conv_in, h, fla)

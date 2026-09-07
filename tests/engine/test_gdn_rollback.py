@@ -55,6 +55,8 @@ def _stash_into(rb: GDNRollback, layer_id: int, n: int, calls: list) -> None:
         g=torch.zeros(1, n, 2),
         beta=torch.zeros(1, n, 2),
         conv_in=torch.zeros(n, 6),
+        local_index=layer_id,
+        head_k_dim=4,
     )
 
 
@@ -178,6 +180,7 @@ def test_a_failed_rescan_still_ends_the_block():
         0, boom,
         q=torch.zeros(1, 4, 2, 4), k=torch.zeros(1, 4, 2, 4), v=torch.zeros(1, 4, 2, 4),
         g=torch.zeros(1, 4, 2), beta=torch.zeros(1, 4, 2), conv_in=torch.zeros(4, 6),
+        local_index=0, head_k_dim=4,
     )
     try:
         rb.rewind(accepted=2)
@@ -219,6 +222,37 @@ def test_accepting_every_candidate_commits_the_whole_window():
     rb.rewind(accepted=4)
     assert calls == [], "the whole window is committed; there is nothing to walk back to"
     assert pool.copies == []
+
+
+def test_one_fused_call_replaces_the_per_layer_ones():
+    """48 per-layer launches for a three-token rescan were almost entirely launch overhead.
+
+    The layers are independent sequences over the same kernel, so the rewind issues one call
+    for all of them; the per-layer path stays for anything that does not supply a fused one.
+    """
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    per_layer: list = []
+    fused_calls: list = []
+
+    def fused(entries, *, live_slot, scratch_slot, committed):
+        fused_calls.append((len(list(entries)), live_slot, committed))
+
+    rb.open(live_slot=3)
+    for layer in range(4):
+        def rescan(*, live_slot, scratch_slot, committed, stash):
+            per_layer.append(1)
+
+        rb.stash(
+            layer, rescan,
+            q=torch.zeros(1, 5, 2, 4), k=torch.zeros(1, 5, 2, 4), v=torch.zeros(1, 5, 2, 4),
+            g=torch.zeros(1, 5, 2), beta=torch.zeros(1, 5, 2), conv_in=torch.zeros(5, 6),
+            local_index=layer, head_k_dim=4, fused=fused,
+        )
+    rb.rewind(accepted=2)
+
+    assert per_layer == [], "the per-layer path must not run when a fused one is supplied"
+    assert fused_calls == [(4, 3, 3)], "one call carrying every layer, committing accepted + 1"
 
 
 def test_opening_twice_is_refused():

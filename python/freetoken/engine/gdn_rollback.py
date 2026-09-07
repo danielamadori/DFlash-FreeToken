@@ -48,6 +48,8 @@ class LayerStash(NamedTuple):
     """
 
     rescan: Callable[..., None]
+    local_index: int       # this layer's row in the state pool
+    head_k_dim: int
     q: torch.Tensor        # [1, W, num_k_heads, head_k_dim]
     k: torch.Tensor        # [1, W, num_k_heads, head_k_dim]
     v: torch.Tensor        # [1, W, num_v_heads, head_v_dim]
@@ -74,6 +76,7 @@ class GDNRollback:
         self._live_slot: int | None = None
         self._scratch_slot: int | None = None
         self._open = False
+        self._fused: Callable[..., None] | None = None
 
     @property
     def recording(self) -> bool:
@@ -107,11 +110,17 @@ class GDNRollback:
         g: torch.Tensor,
         beta: torch.Tensor,
         conv_in: torch.Tensor,
+        local_index: int,
+        head_k_dim: int,
+        fused: Callable[..., None] | None = None,
     ) -> None:
         """Record one layer's recurrence inputs for this block. No-op unless recording."""
         if not self._open:
             return
-        self._stash[layer_id] = LayerStash(rescan, q, k, v, g, beta, conv_in)
+        self._fused = fused
+        self._stash[layer_id] = LayerStash(
+            rescan, local_index, head_k_dim, q, k, v, g, beta, conv_in
+        )
 
     def rewind(self, accepted: int) -> None:
         """Rewind every recorded layer's state to the tokens this block actually committed.
@@ -141,13 +150,23 @@ class GDNRollback:
                 return
             # Back to the pre-block state, then forward again over the prefix that survived.
             self._pool.copy_from(scratch, live)
-            for entry in self._stash.values():
-                entry.rescan(
+            if self._fused is not None:
+                # One launch for every layer: they are independent sequences over the same
+                # kernel, and per-layer calls were nearly all launch overhead.
+                self._fused(
+                    self._stash.values(),
                     live_slot=live,
                     scratch_slot=scratch,
                     committed=committed,
-                    stash=entry,
                 )
+            else:
+                for entry in self._stash.values():
+                    entry.rescan(
+                        live_slot=live,
+                        scratch_slot=scratch,
+                        committed=committed,
+                        stash=entry,
+                    )
         finally:
             self.close()
 
