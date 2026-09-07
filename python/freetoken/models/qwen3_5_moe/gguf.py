@@ -42,12 +42,15 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
 )
+from freetoken.layers.gguf import plan_merged_parts
 from freetoken.models.gguf.dequant import (
     GGML_UNQUANTIZED as GGML_UNQUANTIZED_SET,
+    GGML_BF16,
     GGML_IQ3_S,
     GGML_NAME,
     GGML_Q4_K,
     GGML_Q6_K,
+    GGML_Q8_0,
     dequantize,
     row_bytes,
 )
@@ -413,9 +416,31 @@ def _ungroup_packed_rows(packed: torch.Tensor, num_k_heads: int, num_v_per_k: in
     return _ungroup_v(packed, 0, num_k_heads, num_v_per_k, head_dim)
 
 
-def _to_bf16(t) -> torch.Tensor:
-    """A (1 + weight) norm: dequantize then add 1, matching weight.py's load-time shift."""
-    return _to_bf16(t) + 1.0
+def _dequant_q8_0(packed: torch.Tensor, in_features: int) -> torch.Tensor:
+    """Q8_0 -> bf16 on the CPU: one fp16 scale and 32 int8 values per 34-byte block."""
+    rows = packed.shape[0]
+    blocks = packed.reshape(rows, in_features // 32, 34)
+    d = blocks[:, :, :2].contiguous().view(torch.float16).float()  # [rows, nb, 1]
+    q = blocks[:, :, 2:].contiguous().view(torch.int8).float()  # [rows, nb, 32]
+    return (q * d).to(torch.bfloat16).reshape(rows, in_features)
+
+
+def _emit_merged(
+    name: str, parts: list[torch.Tensor], types: list[int], in_features: int
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield the packed groups a GGUFMergedLinear expects: consecutive same-type parts as one
+    row-concatenated tensor, a tiny Q8_0 group dequantized to bf16 (see plan_merged_parts)."""
+    sizes = [part.shape[0] for part in parts]
+    for g, part in enumerate(plan_merged_parts(sizes, types)):
+        w = (
+            torch.cat([parts[i] for i in part.members], dim=0)
+            if len(part.members) > 1
+            else parts[part.members[0]]
+        )
+        if part.quant_type != part.source_type:
+            assert part.source_type == GGML_Q8_0 and part.quant_type == GGML_BF16
+            w = _dequant_q8_0(w, in_features).view(torch.uint8)
+        yield f"{name}.qweight_{g}", w
 
 
 def _to_bf16(t) -> torch.Tensor:
@@ -478,6 +503,7 @@ def iter_gguf_weights(
 
     # Parse config to determine which layers are full-attention vs GDN.
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    H = config.hidden_size  # in_features of every merged projection
     full_layer_ids = {
         lid
         for lid in range(config.num_layers)
@@ -644,8 +670,9 @@ def iter_gguf_weights(
                             [d["gate"], d["up"]], dim=0
                         )
                     else:
-                        yield f"{base}.mlp.gate_up_proj.qweight_0", d["gate"]
-                        yield f"{base}.mlp.gate_up_proj.qweight_1", d["up"]
+                        yield from _emit_merged(
+                            f"{base}.mlp.gate_up_proj", [d["gate"], d["up"]], types, H
+                        )
                     del dense_mlp_buf[layer]
             continue
 
@@ -672,8 +699,9 @@ def iter_gguf_weights(
                         [gu["gate"], gu["up"]], dim=0
                     )
                 else:
-                    yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_0", gu["gate"]
-                    yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_1", gu["up"]
+                    yield from _emit_merged(
+                        f"{base}.mlp.shared_expert.gate_up_proj", [gu["gate"], gu["up"]], types, H
+                    )
                 del gate_up_buf[layer]
             continue
 
@@ -706,10 +734,13 @@ def iter_gguf_weights(
                         [slots["q"], slots["k"], slots["v"]], dim=0
                     )
                 else:
-                    # Mixed quant: emit GGUFMergedLinear format.
-                    yield f"{base}.self_attn.qkv_proj.qweight_0", slots["q"]
-                    yield f"{base}.self_attn.qkv_proj.qweight_1", slots["k"]
-                    yield f"{base}.self_attn.qkv_proj.qweight_2", slots["v"]
+                    # Mixed quant: GGUFMergedLinear format, regrouped like the module.
+                    yield from _emit_merged(
+                        f"{base}.self_attn.qkv_proj",
+                        [slots["q"], slots["k"], slots["v"]],
+                        types,
+                        H,
+                    )
                 del qkv_buf[layer]
 
         # GDN layers: in_proj from attn_qkv, attn_gate, ssm_beta, ssm_alpha
@@ -778,11 +809,14 @@ def iter_gguf_weights(
                         dim=0,
                     )
                 else:
-                    # Mixed quant: emit GGUFMergedLinear format.
-                    yield f"{base}.linear_attn.in_proj.qweight_0", slots["qkv"]
-                    yield f"{base}.linear_attn.in_proj.qweight_1", slots["gate"]
-                    yield f"{base}.linear_attn.in_proj.qweight_2", slots["beta"]
-                    yield f"{base}.linear_attn.in_proj.qweight_3", slots["alpha"]
+                    # Mixed quant: GGUFMergedLinear format, regrouped like the module (on the
+                    # 27B this turns the 48-row Q8_0 beta and alpha into one dense bf16 part).
+                    yield from _emit_merged(
+                        f"{base}.linear_attn.in_proj",
+                        [slots["qkv"], slots["gate"], slots["beta"], slots["alpha"]],
+                        types,
+                        H,
+                    )
                 del in_proj_buf[layer]
 
     # Verify no fusion buffers are incomplete.

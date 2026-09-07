@@ -45,11 +45,13 @@ from freetoken.models.gguf.dequant import (
     GGML_F16,
     GGML_F32,
     GGML_NAME,
+    GGML_Q8_0,
     GGML_UNQUANTIZED,
     MMQ_TYPES,
     MMVQ_TYPES,
     row_bytes,
 )
+from dataclasses import dataclass
 
 # ggml type -> the dtype its raw bytes represent. Only the unquantized types appear here;
 # everything else goes through a dequant kernel.
@@ -183,6 +185,39 @@ class GGUFLMHead(GGUFLinear):
         return super().forward(x)
 
 
+# How a merged projection's parts are regrouped for the forward. Consecutive parts of one quant
+# type share a launch (their packed rows concatenate, row_bytes being equal), and a tiny Q8_0
+# group is kept dense in bf16, where one cuBLAS call costs a few microseconds. On Qwen3.8-27B
+# the GDN in_proj's ssm_beta and ssm_alpha are 48-row Q8_0 tensors next to an IQ4_XS qkv and
+# gate: as two MMVQ launches they cost 2 x 24 us per layer, 2.3 ms per 8-row forward, for
+# 23 MB of weights (nsys, 2026-09-07). The loader applies the same plan when it packs the
+# parts, so the two sides agree by construction.
+_TINY_DENSE_ROWS = 256
+
+
+@dataclass(frozen=True)
+class MergedPart:
+    out_size: int
+    quant_type: int  # the type the forward computes with (BF16 for a densified tiny group)
+    source_type: int  # the type the members are stored as in the file
+    members: tuple[int, ...]  # indices into the original parts, in order
+
+
+def plan_merged_parts(output_sizes: list[int], quant_types: list[int]) -> list[MergedPart]:
+    groups: list[tuple[int, int, tuple[int, ...]]] = []
+    for i, (n, qt) in enumerate(zip(output_sizes, quant_types)):
+        if groups and groups[-1][1] == qt:
+            size, _, members = groups[-1]
+            groups[-1] = (size + n, qt, members + (i,))
+        else:
+            groups.append((n, qt, (i,)))
+    parts = []
+    for n, qt, members in groups:
+        compute = GGML_BF16 if (qt == GGML_Q8_0 and n <= _TINY_DENSE_ROWS) else qt
+        parts.append(MergedPart(n, compute, qt, members))
+    return parts
+
+
 class GGUFMergedLinear(BaseOP):
     """Merged linear projection with parts that have different quant types.
 
@@ -232,18 +267,22 @@ class GGUFMergedLinear(BaseOP):
         self.in_features = in_features
         self.output_sizes = output_sizes
         self.out_features = sum(output_sizes)
-        self._quant_types = quant_types
+        # The forward runs one launch per regrouped part, not per original part.
+        self.parts = plan_merged_parts(output_sizes, quant_types)
+        self._quant_types = [part.quant_type for part in self.parts]
         self.part_names = []
 
         # Allocate packed weight buffers: one named tensor per part (qweight_0, qweight_1, ...).
         # Named (not underscore-prefixed) so they are discovered by state_dict.
-        for i, (out_size, qt) in enumerate(zip(output_sizes, quant_types)):
+        for i, part in enumerate(self.parts):
             name = f"qweight_{i}"
             self.part_names.append(name)
             setattr(
                 self,
                 name,
-                torch.empty(out_size, row_bytes(in_features, qt), dtype=torch.uint8),
+                torch.empty(
+                    part.out_size, row_bytes(in_features, part.quant_type), dtype=torch.uint8
+                ),
             )
 
         self.bias = torch.empty(self.out_features) if has_bias else None

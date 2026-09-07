@@ -111,15 +111,14 @@ class TestMergedLinearConcatenatesOutputs:
         # Check total output width
         assert merged.out_features == sum(output_sizes) == 9216
 
-        # Verify each part's packed buffer has the correct row_bytes for its type
-        assert merged.qweight_0.shape == (8192, row_bytes(in_features, GGML_IQ3_S))
-        assert merged.qweight_0.shape == (8192, 880)  # IQ3_S: 2048 // 256 * 110
+        # q and k share a type, so they are one launch: their packed rows concatenate (same
+        # row_bytes); v keeps its own buffer.
+        assert merged.part_names == ["qweight_0", "qweight_1"]
+        assert merged.qweight_0.shape == (8192 + 512, row_bytes(in_features, GGML_IQ3_S))
+        assert merged.qweight_0.shape == (8704, 880)  # IQ3_S: 2048 // 256 * 110
 
-        assert merged.qweight_1.shape == (512, row_bytes(in_features, GGML_IQ3_S))
-        assert merged.qweight_1.shape == (512, 880)
-
-        assert merged.qweight_2.shape == (512, row_bytes(in_features, GGML_Q4_K))
-        assert merged.qweight_2.shape == (512, 1152)  # Q4_K: 2048 // 256 * 144
+        assert merged.qweight_1.shape == (512, row_bytes(in_features, GGML_Q4_K))
+        assert merged.qweight_1.shape == (512, 1152)  # Q4_K: 2048 // 256 * 144
 
         # Forward pass: batch size 1 (small batch, uses MMVQ)
         x = torch.randn(1, in_features, dtype=torch.bfloat16)
@@ -128,15 +127,13 @@ class TestMergedLinearConcatenatesOutputs:
         # Output shape should be [1, 9216]
         assert output.shape == (1, 9216)
 
-        # Kernel should have been called 3 times (once per part), all to MMVQ
-        assert len(mock_kernel_module["ggml_mul_mat_vec_a8"]) == 3
+        # Kernel should have been called once per regrouped part, all to MMVQ
+        assert len(mock_kernel_module["ggml_mul_mat_vec_a8"]) == 2
         assert len(mock_kernel_module["ggml_mul_mat_a8"]) == 0
 
-        # Verify each call received the correct qweight and out_features
         calls = mock_kernel_module["ggml_mul_mat_vec_a8"]
-        assert calls[0]["out_features"] == 8192
+        assert calls[0]["out_features"] == 8704
         assert calls[1]["out_features"] == 512
-        assert calls[2]["out_features"] == 512
 
 
 class TestMergedLinearRejectsLengthMismatch:
@@ -197,10 +194,77 @@ class TestGGUFMergedOrPlainDispatch:
         # Should return a GGUFMergedLinear
         assert isinstance(lin, GGUFMergedLinear)
         assert lin.out_features == 9216
-        # Should have separate qweight_0, qweight_1, qweight_2
+        # Two regrouped parts: q+k (IQ3_S) and v (Q4_K)
         assert hasattr(lin, "qweight_0")
         assert hasattr(lin, "qweight_1")
-        assert hasattr(lin, "qweight_2")
+        assert not hasattr(lin, "qweight_2")
+
+
+class TestMergedPartPlanning:
+    """plan_merged_parts: consecutive same-type parts share a launch; a tiny Q8_0 group is
+    kept dense in bf16. The loader packs with the same plan (_emit_merged), so both sides of
+    the state dict agree by construction."""
+
+    def test_consecutive_same_type_parts_merge(self):
+        from freetoken.layers.gguf import plan_merged_parts
+
+        parts = plan_merged_parts([8192, 512, 512], [GGML_IQ3_S, GGML_IQ3_S, GGML_Q4_K])
+        assert [(p.out_size, p.quant_type, p.members) for p in parts] == [
+            (8704, GGML_IQ3_S, (0, 1)),
+            (512, GGML_Q4_K, (2,)),
+        ]
+        # Non-adjacent equal types do not merge (the output order must be preserved).
+        parts = plan_merged_parts([10, 20, 30], [GGML_Q4_K, GGML_IQ3_S, GGML_Q4_K])
+        assert [p.members for p in parts] == [(0,), (1,), (2,)]
+
+    def test_tiny_q8_0_group_is_densified(self):
+        from freetoken.layers.gguf import _TINY_DENSE_ROWS, plan_merged_parts
+        from freetoken.models.gguf.dequant import GGML_BF16, GGML_IQ4_XS, GGML_Q8_0
+
+        # The 27B GDN in_proj: qkv | gate | beta | alpha with 48-row Q8_0 beta and alpha.
+        parts = plan_merged_parts(
+            [12288, 4096, 48, 48], [GGML_IQ4_XS, GGML_IQ4_XS, GGML_Q8_0, GGML_Q8_0]
+        )
+        assert len(parts) == 2
+        assert (parts[0].out_size, parts[0].quant_type) == (16384, GGML_IQ4_XS)
+        assert (parts[1].out_size, parts[1].quant_type, parts[1].source_type) == (
+            96,
+            GGML_BF16,
+            GGML_Q8_0,
+        )
+        # A large Q8_0 group stays quantized.
+        big = plan_merged_parts([_TINY_DENSE_ROWS + 1], [GGML_Q8_0])
+        assert big[0].quant_type == GGML_Q8_0
+        # The module allocates the dense part at bf16 width.
+        merged = GGUFMergedLinear(
+            5120, [12288, 4096, 48, 48], [GGML_IQ4_XS, GGML_IQ4_XS, GGML_Q8_0, GGML_Q8_0]
+        )
+        assert merged.qweight_1.shape == (96, 5120 * 2)
+
+    def test_loader_dequantizes_tiny_q8_0_exactly(self):
+        from freetoken.models.gguf.dequant import GGML_Q8_0
+        from freetoken.models.qwen3_5_moe.gguf import _dequant_q8_0, _emit_merged
+
+        in_features = 64  # two Q8_0 blocks per row
+        rows = 3
+        torch.manual_seed(0)
+        q = torch.randint(-127, 128, (rows, in_features), dtype=torch.int8)
+        d = torch.tensor([[0.5, 0.25]] * rows, dtype=torch.float16)  # one scale per block
+        blocks = torch.cat(
+            [d.view(rows, 2, 1).view(torch.uint8), q.view(rows, 2, 32).view(torch.uint8)],
+            dim=2,
+        )
+        packed = blocks.reshape(rows, 2 * 34)
+        expected = (q.float().view(rows, 2, 32) * d.float().view(rows, 2, 1)).reshape(rows, -1)
+        assert torch.equal(_dequant_q8_0(packed, in_features).float(), expected)
+        # Through the loader helper the group arrives as raw bf16 bytes under the plan's name.
+        out = dict(_emit_merged("x", [packed, packed], [GGML_Q8_0, GGML_Q8_0], in_features))
+        assert list(out) == ["x.qweight_0"]
+        assert out["x.qweight_0"].shape == (2 * rows, in_features * 2)
+        assert torch.equal(
+            out["x.qweight_0"].view(torch.bfloat16).float(),
+            torch.cat([expected, expected]).to(torch.bfloat16).float(),
+        )
 
 
 class TestGDNGeometry:
