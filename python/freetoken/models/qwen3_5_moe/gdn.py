@@ -15,6 +15,20 @@ from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 from .quant_linear import make_replicated_quant
 
 
+def v_grouped_to_tiled(
+    x: torch.Tensor, rows: int, num_k_heads: int, num_v_heads: int, head_v_dim: int
+) -> torch.Tensor:
+    """Reorder a V-axis activation from grouped [K, R, D] to llama.cpp's tiled [R, K, D].
+
+    The GGUF out_proj keeps the column order llama.cpp wrote (a column permutation cannot be
+    applied to packed blocks), so the activation moves instead. This is the activation-side
+    twin of gguf._ungroup_v on the weight: x_tiled @ W_tiled.T == x_grouped @ ungroup(W_tiled).T.
+    Returns a [rows, num_v_heads, head_v_dim]-shaped view; reshape(rows, -1) materialises it.
+    """
+    R = num_v_heads // num_k_heads
+    return x.reshape(rows, num_k_heads, R, head_v_dim).transpose(1, 2)
+
+
 class _DepthwiseConv1d(BaseOP):
     """Holds the depthwise conv weight ``[conv_dim, 1, K]`` (key ``conv1d.weight``)."""
 
@@ -129,6 +143,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.num_v_heads = num_v_heads
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
+        # Set by the GGUF converter when out_proj keeps llama.cpp's tiled V-head columns.
+        self.out_proj_v_tiled = False
         self.key_dim = num_k_heads * head_k_dim
         self.value_dim = num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
@@ -361,7 +377,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(-1, self.head_v_dim)
         if _t_proj0 is not None:
             _t_out0 = torch.cuda.Event(enable_timing=True); _t_out0.record()
-        out = self.norm.forward(core_out, z).reshape(total, -1)
+        out = self.norm.forward(core_out, z)
+        if self.out_proj_v_tiled:
+            out = v_grouped_to_tiled(out, total, self.num_k_heads, self.num_v_heads, self.head_v_dim)
+        out = out.reshape(total, -1)
         result_out = self.out_proj.forward(out)
         if _t_proj0 is not None:
             _t_out1 = torch.cuda.Event(enable_timing=True); _t_out1.record()

@@ -424,30 +424,6 @@ def _to_bf16(t) -> torch.Tensor:
     return flat.reshape(t.shape)
 
 
-def _dequant_any(t) -> torch.Tensor:
-    """Dequantize a GgufTensor of ANY ggml type to dense bf16, via the CUDA kernel.
-
-    The pure-torch ``dequantize`` in models/gguf/dequant.py implements only Q4_0 and Q6_K
-    (it is the reference/test path). ``ggml_dequantize`` covers all 19 quant types, so use
-    it for the one tensor that genuinely has to be materialized dense -- ssm_out, whose
-    columns need un-tiling. Round-trips through the GPU; the result is a CPU tensor so the
-    normal load path places it.
-    """
-    from freetoken.kernel.gguf import ggml_dequantize
-
-    if t.ggml_type in GGML_UNQUANTIZED_SET:
-        return _to_bf16(t)
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            f"{t.name}: needs dense dequantization of ggml type "
-            f"{GGML_NAME.get(t.ggml_type, t.ggml_type)}, which only the CUDA kernel "
-            f"implements, but no CUDA device is available"
-        )
-    out_f, in_f = t.shape[0], t.shape[1]
-    packed = t.packed().reshape(out_f, row_bytes(in_f, t.ggml_type)).cuda()
-    return ggml_dequantize(packed, t.ggml_type, out_f, in_f, torch.bfloat16).cpu()
-
-
 def _to_f32(t) -> torch.Tensor:
     """Dequantize a GgufTensor (F32/F16/Q*) to a dense float32 tensor of its torch shape."""
     flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.float32)
@@ -764,14 +740,13 @@ def iter_gguf_weights(
             elif suffix == "ssm_out.weight":
                 # out_proj consumes the V dimension along its COLUMNS, and llama.cpp tiled
                 # those columns. A column permutation cannot be done on packed data -- a
-                # 128-wide head straddles the 256-element quant blocks -- so this one tensor
-                # is dequantized to dense bf16. Cost: out*in*2 bytes per GDN layer
-                # (2048*4096*2 = 16 MiB, ~503 MiB over 30 layers). convert_qwen35_to_gguf
-                # therefore leaves linear_attn.out_proj as a dense Linear.
-                w = _dequant_any(t)
-                if _untile:
-                    w = _ungroup_v(w, 1, _vK, _vR, _vD)
-                yield f"{base}.linear_attn.out_proj.weight", w
+                # 128-wide head straddles the 256-element quant blocks -- so this tensor used
+                # to be dequantized to dense bf16. On Qwen3.8-27B that was 2.81 GiB read per
+                # forward instead of 0.86, about 2 ms on every step, decode included, and
+                # ~2 GB of VRAM. The columns now stay tiled and packed; the GDN op permutes
+                # its ACTIVATION into the tiled order before the projection instead (a swap
+                # of the two head axes on [rows, K, R, D], one small copy), see gdn.py.
+                yield f"{base}.linear_attn.out_proj.qweight", t.packed()
             else:
                 continue  # unmapped for GDN layers
 
@@ -934,10 +909,15 @@ def convert_qwen35_to_gguf(model, config: ModelConfig, *, model_path: str) -> No
                 ],
                 has_bias=False,
             )
-            # linear_attn.out_proj is deliberately NOT swapped: its columns index the
-            # V-head dimension, which llama.cpp tiled, and un-tiling columns needs dense
-            # values (a 128-wide head straddles the quant blocks). iter_gguf_weights yields
-            # it as dense bf16 ".weight", so the constructed Linear must stay dense.
+            # out_proj's columns index the V-head dimension, which llama.cpp tiled, and a
+            # column permutation cannot be applied to packed blocks (a 128-wide head straddles
+            # the 256-element quant blocks). So the packed weight keeps llama.cpp's column
+            # order and the GDN op permutes its activation to match, once per forward, on
+            # [rows, value_dim]. That is what lets this 2.81 GiB-per-forward dense matrix be
+            # served packed at 0.86 GiB like every other projection.
+            swap_linear(layer.linear_attn, "out_proj", qt(layer_idx, "ssm_out.weight"))
+            la = layer.linear_attn
+            la.out_proj_v_tiled = la.num_k_heads != la.num_v_heads
 
         if not config.moe_enabled:
             # Dense qwen35: one SwiGLU MLP per layer (Qwen3_5DenseMLP), no routed experts
