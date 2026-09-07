@@ -41,8 +41,10 @@ class FakePool:
 
 
 def _stash_into(rb: GDNRollback, layer_id: int, n: int, calls: list) -> None:
-    def rescan(*, live_slot, scratch_slot, accepted, stash):
-        calls.append((layer_id, live_slot, scratch_slot, accepted, int(stash.q.shape[1])))
+    """Record a layer whose verification window is ``n`` rows (pending token + candidates)."""
+
+    def rescan(*, live_slot, scratch_slot, committed, stash):
+        calls.append((layer_id, live_slot, scratch_slot, committed, int(stash.q.shape[1])))
 
     rb.stash(
         layer_id,
@@ -100,7 +102,10 @@ def test_stash_is_ignored_when_not_recording():
 
 
 def test_full_acceptance_does_no_rescan_and_no_restore():
-    """The whole point of the fast path: an accepted block leaves the live state alone."""
+    """The whole point of the fast path: an accepted block leaves the live state alone.
+
+    A window of 8 rows carries 7 candidates, so accepting all 7 commits all 8 rows.
+    """
     pool = FakePool()
     rb = GDNRollback(pool)
     calls: list = []
@@ -108,7 +113,7 @@ def test_full_acceptance_does_no_rescan_and_no_restore():
     for layer in (0, 1, 2):
         _stash_into(rb, layer, 8, calls)
     pool.copies.clear()
-    rb.rewind(accepted=8)
+    rb.rewind(accepted=7)
     assert calls == []
     assert pool.copies == []      # no restore
     assert pool.freed == [7]      # but the scratch slot still came back
@@ -127,12 +132,13 @@ def test_partial_acceptance_restores_then_rescans_every_layer():
     # Restored from the pre-block snapshot, once, before any layer walks forward again.
     assert pool.copies == [(scratch, 5)]
     assert [c[0] for c in calls] == [0, 1, 2]
-    for _, live, scr, accepted, drafted in calls:
-        assert (live, scr, accepted, drafted) == (5, scratch, 3, 8)
+    for _, live, scr, committed, window in calls:
+        # 3 accepted candidates commit 4 rows: them plus the token pending from the step before.
+        assert (live, scr, committed, window) == (5, scratch, 4, 8)
 
 
-def test_rejecting_everything_restores_and_rescans_nothing_forward():
-    """accepted == 0 is a real case: the state must go back to exactly the pre-block snapshot."""
+def test_rejecting_everything_still_commits_the_pending_token():
+    """accepted == 0 does not mean the state goes back to the pre-block snapshot untouched."""
     pool = FakePool()
     rb = GDNRollback(pool)
     calls: list = []
@@ -142,7 +148,8 @@ def test_rejecting_everything_restores_and_rescans_nothing_forward():
     pool.copies.clear()
     rb.rewind(accepted=0)
     assert pool.copies == [(scratch, 4)]
-    assert calls == [(0, 4, scratch, 0, 5)]
+    # Rejecting every candidate still commits one row: the token pending from the step before.
+    assert calls == [(0, 4, scratch, 1, 5)]
 
 
 def test_scratch_slot_is_returned_even_if_a_layer_rescan_raises():
@@ -150,7 +157,7 @@ def test_scratch_slot_is_returned_even_if_a_layer_rescan_raises():
     pool = FakePool()
     rb = GDNRollback(pool)
 
-    def boom(*, live_slot, scratch_slot, accepted, stash):
+    def boom(*, live_slot, scratch_slot, committed, stash):
         raise RuntimeError("kernel failed")
 
     rb.open(live_slot=1)
@@ -166,6 +173,40 @@ def test_scratch_slot_is_returned_even_if_a_layer_rescan_raises():
         pass
     assert pool.num_free == before + 1
     assert not rb.recording
+
+
+def test_the_window_carries_one_row_more_than_the_candidates():
+    """The off-by-one that corrupted real output: committing k candidates advances k + 1 rows.
+
+    A block of K candidates is verified over K + 1 positions -- the token sampled the step
+    before, whose KV this forward computes, then the candidates. Walking the state forward by
+    the number of ACCEPTED CANDIDATES leaves it one token behind the KV cache on every block,
+    and the sequence starts re-emitting text it has already produced. The first version of this
+    file asserted the wrong quantity here, which is why its tests passed while the 27B produced
+    "Qual e'Qual e'Qual e'Qual e'Qual e'".
+    """
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    calls: list = []
+    rb.open(live_slot=2)
+    _stash_into(rb, 0, 5, calls)  # window of 5 rows = 4 candidates
+    rb.rewind(accepted=2)
+    assert len(calls) == 1
+    committed = calls[0][3]
+    assert committed == 3, "2 accepted candidates commit 3 rows, not 2"
+
+
+def test_accepting_every_candidate_commits_the_whole_window():
+    """Boundary of the fast path: accepted == window - 1 means nothing needs rewinding."""
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    calls: list = []
+    rb.open(live_slot=2)
+    _stash_into(rb, 0, 5, calls)  # window of 5 rows = 4 candidates
+    pool.copies.clear()
+    rb.rewind(accepted=4)
+    assert calls == [], "the whole window is committed; there is nothing to walk back to"
+    assert pool.copies == []
 
 
 def test_opening_twice_is_refused():

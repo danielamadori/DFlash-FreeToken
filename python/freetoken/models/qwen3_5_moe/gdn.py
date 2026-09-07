@@ -144,8 +144,12 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
-    def rescan_prefix(self, *, live_slot: int, scratch_slot: int, accepted: int, stash) -> None:
-        """Re-run this layer's recurrence over the first ``accepted`` positions of a draft block.
+    def rescan_prefix(self, *, live_slot: int, scratch_slot: int, committed: int, stash) -> None:
+        """Re-run this layer's recurrence over the ``committed`` positions of a draft block.
+
+        ``committed`` counts rows of the verification window, which is the token pending from
+        the step before followed by the candidates -- so it is ``accepted + 1``, not the number
+        of accepted candidates. GDNRollback.rewind() owns that conversion.
 
         The caller has already restored ``live_slot`` from ``scratch_slot``, so the state here is
         the one from before the block; this walks it forward over the prefix the target kept.
@@ -160,11 +164,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         li = pool.local_index(self.layer_id)
         device = stash.q.device
         indices = torch.tensor([live_slot], dtype=torch.int32, device=device)
-        cu_seqlens = torch.tensor([0, accepted], dtype=torch.int64, device=device)
+        cu_seqlens = torch.tensor([0, committed], dtype=torch.int64, device=device)
 
         gdn_prefill_chunk_fla(
-            stash.q[:, :accepted], stash.k[:, :accepted], stash.v[:, :accepted],
-            stash.g[:, :accepted], stash.beta[:, :accepted],
+            stash.q[:, :committed], stash.k[:, :committed], stash.v[:, :committed],
+            stash.g[:, :committed], stash.beta[:, :committed],
             state_source=pool.recurrent_states[li], indices=indices,
             cu_seqlens=cu_seqlens, scale=self.head_k_dim ** -0.5,
         )
@@ -174,7 +178,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # followed by the accepted rows, keeping the tail.
         width = self.conv_kernel_size - 1
         cv = pool.conv_states[li]
-        prefix = stash.conv_in[:accepted].transpose(0, 1).to(cv.dtype)  # [conv_dim, accepted]
+        prefix = stash.conv_in[:committed].transpose(0, 1).to(cv.dtype)  # [conv_dim, committed]
         window = torch.cat([cv[scratch_slot], prefix], dim=-1)[:, -width:]
         cv[live_slot] = window
 
