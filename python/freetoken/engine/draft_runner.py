@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from freetoken.env import ENV
 from freetoken.models.gguf.reader import resolve_gguf_path
 from freetoken.utils import init_logger
 
@@ -286,6 +287,50 @@ def _draft_config_source(draft_model_path: str, gguf_weights: str) -> str:
     )
 
 
+def _draft_is_causal(draft_model: nn.Module) -> bool:
+    """The causality flag the model's own mask builder would use, read off the layers.
+
+    The model resolves `is_causal` per layer from the layer type when the config leaves it
+    unset (dflash/model.py:363-367), so the instantiated layers are the ground truth. Every
+    layer must agree: one cache mask serves all of them.
+    """
+    flags = {bool(layer.self_attn.is_causal) for layer in draft_model.layers}
+    if len(flags) != 1:
+        raise ValueError(
+            f"the draft's layers disagree on is_causal ({sorted(flags)}): one static mask "
+            "cannot serve them all"
+        )
+    return flags.pop()
+
+
+def _build_static_cache(
+    config: Any, draft_model: nn.Module, *, block: int, device: torch.device, dtype: torch.dtype
+) -> Any | None:
+    """The fixed-address ring cache of a windowed draft (DFlash 2), or None.
+
+    None keeps the DynamicCache path: a full-attention draft (DFlash 1) has no window, so
+    a ring holding one window of keys would silently drop everything older. The support
+    rule is the cache's own, so the runner and the cache can never disagree on it.
+    """
+    from freetoken.engine.draft_cache import StaticDraftCache, _static_cache_supported
+
+    if not _static_cache_supported(config):
+        return None
+    head_dim = getattr(config, "head_dim", None) or (
+        config.hidden_size // config.num_attention_heads
+    )
+    return StaticDraftCache(
+        num_layers=int(config.num_hidden_layers),
+        num_kv_heads=int(config.num_key_value_heads),
+        head_dim=int(head_dim),
+        window=int(config.sliding_window),
+        block=block,
+        causal=_draft_is_causal(draft_model),
+        device=device,
+        dtype=dtype,
+    )
+
+
 class DFlashRunner:
     """
     In-engine runner for DFlash and DFlash 2 block diffusion draft models.
@@ -353,19 +398,250 @@ class DFlashRunner:
         self._make_cache = _make_cache
         self._crop_to = _crop_to
         self._extract_context_feature = extract_context_feature
-        self._draft_cache = None
         # Which request the draft cache belongs to. The cache holds that request's context
         # keys, built up block by block; it is meaningless for any other request.
         self._cache_owner: int | None = None
         self._warned_sampling_selector = False
 
+        # A windowed draft (DFlash 2) keeps its keys in one ring allocated here and never
+        # replaced: a CUDA graph bakes the K/V addresses, and a second cache object for the
+        # eager blocks would leave the graph blocks drafting with no prompt context. The same
+        # object serves the eager path, so the two paths run the same math on the same rows.
+        self._static_cache = _build_static_cache(
+            config, self.draft_model, block=block_size, device=device, dtype=dtype
+        )
+        self._window: int | None = (
+            None if self._static_cache is None else int(self._static_cache.window)
+        )
+        self._draft_cache = self._static_cache
+        # Block geometry as device tensors, so a captured forward reads the block's positions
+        # from a buffer instead of baking them: row i of a block is seq_len - c + i.
+        self._seq_len_t = torch.zeros(1, dtype=torch.int64, device=device)
+        self._ar = torch.arange(
+            (self._window or 0) + 2 * block_size, dtype=torch.int64, device=device
+        )
+        # Set by the engine once the draft forward is captured (engine/draft_graph.py).
+        self.graph: Any | None = None
+        self._shadow_blocks = 0
+        self._shadow_mismatches = 0
+
         logger.info_rank0(
             f"DFlash draft model initialized: class={draft_class.__name__}, "
-            f"target_layers={self.target_layer_ids}, block_size={self.block_size}"
+            f"target_layers={self.target_layer_ids}, block_size={self.block_size}, "
+            f"cache={'static ring' if self._static_cache is not None else 'dynamic'}"
         )
 
     def reset_cache(self) -> None:
-        self._draft_cache = self._make_cache(self.draft_model.config)
+        if self._static_cache is not None:
+            # Same object, emptied in place: a graph replay reads the ring at the address it
+            # was captured with, and a fresh cache here would leave it reading a dead one.
+            self._static_cache.reset()
+            self._draft_cache = self._static_cache
+        else:
+            self._draft_cache = self._make_cache(self.draft_model.config)
+
+    def _select_tokens(
+        self,
+        draft_hidden: torch.Tensor,
+        draft_logits: torch.Tensor,
+        draft_probs: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        selector = getattr(self.draft_model, "candidate_selector", None)
+        if selector is not None and temperature <= 0:
+            # DFlash 2 does not pick each drafted token on its own. Its selector takes the
+            # top-k candidates per position and then walks the block in order, scoring each
+            # candidate against the token just chosen through the predecessor/successor
+            # codebooks. Choosing every position independently -- which is DFlash 1's rule --
+            # yields a block whose tokens do not follow one another, and the target rejects it:
+            # the cost shows up as a low acceptance rate, never as an error.
+            draft_tokens, _candidates, _q = selector.select(
+                draft_hidden, draft_logits, anchor_ids, temperature
+            )
+            return draft_tokens
+        if temperature <= 0:
+            return torch.argmax(draft_logits, dim=-1)
+        if selector is not None and not self._warned_sampling_selector:
+            # Not a silent fallback: the selector returns scores over its candidate set,
+            # and rejection sampling here wants a full-vocabulary distribution, so wiring
+            # the two together is a change to the sampler, not to this call.
+            logger.info_rank0(
+                "DFlash 2 selector is bypassed at temperature > 0: candidates are drawn "
+                "per position, which lowers acceptance. Greedy drafting uses the selector."
+            )
+            self._warned_sampling_selector = True
+        return _sample_probs(draft_probs)
+
+    def _run_block(
+        self,
+        th: torch.Tensor,
+        block_ids: torch.Tensor,
+        c: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One draft forward over the static ring: the body eager, warm-up, capture and
+        shadow all run, so a replay is op-for-op the eager block.
+
+        ``th`` is [1, c, features] context (a view of the graph's static buffer when
+        captured), ``block_ids`` [1, k] the anchor id followed by mask tokens, ``c`` a Python
+        int (each captured graph runs exactly its own row count, since MMVQ's summation order
+        and the hidden norm's reduction depend on it). Reads the block's start from
+        ``_seq_len_t`` so nothing host-side is baked. Returns (tokens, probs, logits).
+        """
+        cache = self._static_cache
+        assert cache is not None, "_run_block needs the static ring cache"
+        k = block_ids.shape[1]
+        # Positions seq_len - c .. seq_len + k - 1: the context rows, then the noise rows,
+        # which is the order the model concatenates K/V in (ctx first, model.py:388-391).
+        row_pos = self._seq_len_t - c + self._ar[: c + k]
+        cache.stage(row_pos)
+        attention_mask = cache.mask(row_pos[c:])
+        noise_emb = _embed_with_target(self._target, block_ids) * self.input_embedding_scale
+        draft_hidden = self.draft_model(
+            target_hidden=th,
+            noise_embedding=noise_emb,
+            position_ids=row_pos[None],
+            attention_mask=attention_mask,
+            past_key_values=cache,
+            use_cache=True,
+        )[:, 1 - k :, :]
+        # Drop exactly the k noise rows this block staged (the crop(-k) of the dynamic path):
+        # their keys stay in the ring but no later block may see them.
+        cache.retire()
+        draft_logits = _target_output_logits(self._target, draft_hidden)
+        draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
+        draft_tokens = self._select_tokens(
+            draft_hidden, draft_logits, draft_probs, block_ids[:, 0], temperature
+        )
+        return draft_tokens, draft_probs, draft_logits
+
+    def _block_ids(self, k: int, current_token_id: torch.Tensor) -> torch.Tensor:
+        block_output_ids = torch.full(
+            (1, k), self.mask_token_id, dtype=torch.long, device=self.device
+        )
+        block_output_ids[:, 0] = current_token_id.view(1)
+        return block_output_ids
+
+    def _draft_static(
+        self,
+        target_hidden: torch.Tensor,
+        current_token_id: torch.Tensor,
+        seq_len: int,
+        k: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if k != self.block_size:
+            # The ring retires exactly one block of noise rows per forward, and its size is
+            # fixed at construction; a different k would leave stale noise keys visible.
+            raise ValueError(
+                f"the static draft cache retires {self.block_size} noise rows per block, "
+                f"cannot draft a block of {k}"
+            )
+        assert self._window is not None
+        if target_hidden.shape[1] > self._window:
+            # First block after a long prefill. The dynamic cache kept only the last
+            # window - 1 keys and each row saw at most that many (model.py:157-171), so the
+            # rows beyond the window would be staged only to be masked, and the ring has no
+            # room for them (window + 2 blocks slots).
+            target_hidden = target_hidden[:, -self._window :]
+        c = target_hidden.shape[1]
+        self._seq_len_t.fill_(seq_len)
+        return self._run_block(
+            target_hidden, self._block_ids(k, current_token_id), c, temperature, top_p, top_k
+        )
+
+    def _draft_dynamic(
+        self,
+        cache: Any,
+        target_hidden: torch.Tensor,
+        current_token_id: torch.Tensor,
+        position_ids: torch.Tensor,
+        seq_len: int,
+        k: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        block_output_ids = self._block_ids(k, current_token_id)
+        noise_emb = (
+            _embed_with_target(self._target, block_output_ids)
+            * self.input_embedding_scale
+        )
+        
+        pos = position_ids[:, seq_len - target_hidden.shape[1] : seq_len + k]
+        draft_hidden = self.draft_model(
+            target_hidden=target_hidden,
+            noise_embedding=noise_emb,
+            position_ids=pos,
+            past_key_values=cache,
+            use_cache=True,
+        )[:, 1 - k :, :]
+        
+        # Drop exactly the k noise rows this block appended, not "crop to seq_len". The two
+        # agree only when the cache already held every position below seq_len. After a prefix
+        # cache hit or a chunked prefill it does not -- the draft was fed only the rows this
+        # prefill computed -- and cropping to seq_len then asks for a positive crop, which
+        # transformers treats as an absolute length: the mask-token keys stay in the cache and
+        # every later block attends to them. Dropping k is right in both cases; in the short one
+        # the draft simply has less context, all of it real, which is what llama.cpp does too.
+        self._crop_to(cache, cache.get_seq_length() - k)
+
+        draft_logits = _target_output_logits(self._target, draft_hidden)
+        draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
+        draft_tokens = self._select_tokens(
+            draft_hidden, draft_logits, draft_probs, block_output_ids[:, 0], temperature
+        )
+        return draft_tokens, draft_probs
+
+    def _shadow_draft(
+        self,
+        target_hidden_states: List[torch.Tensor],
+        current_token_id: torch.Tensor,
+        seq_len: int,
+        c: int,
+        k: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Replay, then draft the same block eagerly and compare the tokens.
+
+        A replay that reads a stale ring or hidden buffer produces plausible tokens the target
+        merely rejects more often; nothing raises. Both runs stage the same positions to the
+        same slots and retire the same noise rows, so running them back to back leaves the
+        ring as one run would. The eager pair is what gets returned. One host sync per block.
+        """
+        assert self.graph is not None
+        tokens_g, _probs_g = self.graph.replay(target_hidden_states, current_token_id, seq_len, c)
+        # The replay's outputs live in static buffers the next replay rewrites: keep a copy so
+        # a later warm-up or replay cannot alter what is compared here.
+        tokens_g = tokens_g.clone()
+        target_hidden = self._extract_context_feature(target_hidden_states, self.target_layer_ids)
+        tokens_e, probs_e, logits_e = self._draft_static(
+            target_hidden, current_token_id, seq_len, k, temperature, top_p, top_k
+        )
+        self._shadow_blocks += 1
+        mismatch = tokens_g[0] != tokens_e[0]
+        if bool(mismatch.any().item()):
+            self._shadow_mismatches += 1
+            first = int(mismatch.nonzero()[0].item())
+            top2 = logits_e[0, first].float().topk(2).values
+            logger.warning_rank0(
+                f"Draft graph shadow mismatch at block {self._shadow_blocks} "
+                f"(seq_len={seq_len}, c={c}): {int(mismatch.sum().item())} of {k - 1} tokens "
+                f"differ, first at position {first} (graph {int(tokens_g[0, first])} vs eager "
+                f"{int(tokens_e[0, first])}, eager top-2 logit margin "
+                f"{float(top2[0] - top2[1]):.4f}); {self._shadow_mismatches} mismatching "
+                f"blocks so far"
+            )
+        elif self._shadow_blocks == 1:
+            logger.info_rank0("Draft graph shadow mode: first replayed block matches eager")
+        return tokens_e, probs_e
 
     @torch.inference_mode()
     def draft(
@@ -382,6 +658,9 @@ class DFlashRunner:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate candidate tokens block via diffusion forward.
+
+        ``position_ids`` is read only by the dynamic-cache path; the static ring derives the
+        block's positions from ``seq_len`` on the device.
 
         Returns:
             draft_tokens: [1, K] candidate token IDs
@@ -419,62 +698,26 @@ class DFlashRunner:
                 "set of layers"
             )
 
+        # After the owner check: a new request's device reset is then stream-ordered before
+        # the replay that reads the ring, and a same-request block replays over its context.
+        graph = self.graph
+        if graph is not None:
+            c = graph.can_replay(target_hidden_states, k, temperature)
+            if c is not None:
+                if bool(getattr(ENV, "SPEC_DRAFT_GRAPH_SHADOW", False)):
+                    return self._shadow_draft(
+                        target_hidden_states, current_token_id, seq_len, c, k,
+                        temperature, top_p, top_k,
+                    )
+                return graph.replay(target_hidden_states, current_token_id, seq_len, c)
+
         target_hidden = self._extract_context_feature(target_hidden_states, self.target_layer_ids)
-        
-        block_output_ids = torch.full(
-            (1, k), self.mask_token_id, dtype=torch.long, device=self.device
-        )
-        block_output_ids[:, 0] = current_token_id.view(1)
-
-        noise_emb = (
-            _embed_with_target(self._target, block_output_ids)
-            * self.input_embedding_scale
-        )
-        
-        pos = position_ids[:, seq_len - target_hidden.shape[1] : seq_len + k]
-        draft_hidden = self.draft_model(
-            target_hidden=target_hidden,
-            noise_embedding=noise_emb,
-            position_ids=pos,
-            past_key_values=cache,
-            use_cache=True,
-        )[:, 1 - k :, :]
-        
-        # Drop exactly the k noise rows this block appended, not "crop to seq_len". The two
-        # agree only when the cache already held every position below seq_len. After a prefix
-        # cache hit or a chunked prefill it does not -- the draft was fed only the rows this
-        # prefill computed -- and cropping to seq_len then asks for a positive crop, which
-        # transformers treats as an absolute length: the mask-token keys stay in the cache and
-        # every later block attends to them. Dropping k is right in both cases; in the short one
-        # the draft simply has less context, all of it real, which is what llama.cpp does too.
-        self._crop_to(cache, cache.get_seq_length() - k)
-
-        draft_logits = _target_output_logits(self._target, draft_hidden)
-        draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
-
-        selector = getattr(self.draft_model, "candidate_selector", None)
-        if selector is not None and temperature <= 0:
-            # DFlash 2 does not pick each drafted token on its own. Its selector takes the
-            # top-k candidates per position and then walks the block in order, scoring each
-            # candidate against the token just chosen through the predecessor/successor
-            # codebooks. Choosing every position independently -- which is DFlash 1's rule --
-            # yields a block whose tokens do not follow one another, and the target rejects it:
-            # the cost shows up as a low acceptance rate, never as an error.
-            draft_tokens, _candidates, _q = selector.select(
-                draft_hidden, draft_logits, block_output_ids[:, 0], temperature
+        if self._static_cache is not None:
+            draft_tokens, draft_probs, _logits = self._draft_static(
+                target_hidden, current_token_id, seq_len, k, temperature, top_p, top_k
             )
-        elif temperature <= 0:
-            draft_tokens = torch.argmax(draft_logits, dim=-1)
-        else:
-            if selector is not None and not self._warned_sampling_selector:
-                # Not a silent fallback: the selector returns scores over its candidate set,
-                # and rejection sampling here wants a full-vocabulary distribution, so wiring
-                # the two together is a change to the sampler, not to this call.
-                logger.info_rank0(
-                    "DFlash 2 selector is bypassed at temperature > 0: candidates are drawn "
-                    "per position, which lowers acceptance. Greedy drafting uses the selector."
-                )
-                self._warned_sampling_selector = True
-            draft_tokens = _sample_probs(draft_probs)
-
-        return draft_tokens, draft_probs
+            return draft_tokens, draft_probs
+        return self._draft_dynamic(
+            cache, target_hidden, current_token_id, position_ids, seq_len, k,
+            temperature, top_p, top_k,
+        )

@@ -78,6 +78,13 @@ class EnvClassSingleton:
     # kernels one by one. Off until the replayed logits and rewound GDN state are shown to be
     # bitwise equal to the eager verify: a stale captured buffer reads as fluent text.
     SPEC_VERIFY_GRAPH = EnvBool(False)
+    # Replay the 8-row DFlash2 draft forward as one CUDA graph per context-row count. Off
+    # until the replayed draft tokens are shown bitwise equal to the eager static-cache
+    # draft: a graph baking a stale ring or hidden address only reads as lost acceptance.
+    SPEC_DRAFT_GRAPH = EnvBool(False)
+    # Also run the eager draft on every replayed block, log a token mismatch, return the
+    # eager pair. One host sync per block: the only way to see what rejection hides.
+    SPEC_DRAFT_GRAPH_SHADOW = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state

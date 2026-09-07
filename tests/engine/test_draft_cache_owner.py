@@ -20,6 +20,7 @@ from freetoken.engine.draft_runner import DFlashRunner
 def _runner_with_fake_cache():
     """A DFlashRunner shell: only the fields the ownership logic in draft() touches."""
     r = DFlashRunner.__new__(DFlashRunner)
+    r._static_cache = None  # a DynamicCache draft (DFlash 1): a new cache per request
     r._draft_cache = None
     r._cache_owner = None
     r.block_size = 4
@@ -133,3 +134,54 @@ def test_returning_to_an_earlier_uid_is_still_a_new_request():
     _open_block(r, request_uid=8)
     _open_block(r, request_uid=7)
     assert len(made) == 3
+
+
+class _Ring:
+    """A StaticDraftCache stand-in: emptied in place, never replaced."""
+
+    def __init__(self) -> None:
+        self.resets = 0
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+def _runner_with_static_cache():
+    """The DFlash 2 shell: the ring is allocated once in __init__ and is the draft cache."""
+    r = DFlashRunner.__new__(DFlashRunner)
+    r._static_cache = _Ring()
+    r._draft_cache = r._static_cache
+    r._cache_owner = None
+    r.block_size = 8
+
+    def make_cache(config):
+        raise AssertionError("a windowed draft never builds a DynamicCache")
+
+    r._make_cache = make_cache
+    r.draft_model = SimpleNamespace(config=None)
+    return r
+
+
+def test_static_reset_empties_the_same_object():
+    """A CUDA graph bakes the ring's K/V addresses: a new object would leave every replayed
+    block drafting against a cache nothing writes to."""
+    r = _runner_with_static_cache()
+    ring = r._static_cache
+    _open_block(r, request_uid=7)
+    assert r._draft_cache is ring
+    assert ring.resets == 1
+    assert r._cache_owner == 7
+
+
+def test_static_cache_identity_survives_a_uid_change():
+    """A new request still gets an empty cache -- the same one, reset on the device."""
+    r = _runner_with_static_cache()
+    ring = r._static_cache
+    _open_block(r, request_uid=7)
+    for _ in range(3):
+        _open_block(r, request_uid=7)
+    assert ring.resets == 1, "blocks of one request keep the context"
+    _open_block(r, request_uid=8)
+    assert ring.resets == 2, "request 8 must not see request 7's context keys"
+    assert r._draft_cache is ring, "reset in place: the graph replays against this address"
+    assert r._cache_owner == 8

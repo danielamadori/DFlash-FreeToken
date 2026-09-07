@@ -23,6 +23,7 @@ from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_fa
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
+from .draft_graph import DraftGraphRunner
 from .verify_graph import VerifyGraphRunner
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -468,6 +469,7 @@ class Engine:
         # After the decode graphs (it captures the same model with hidden-state capture on)
         # and after the draft runner (its target layers say which hidden rows to keep).
         self._build_verify_graph(aligned_max_seq_len)
+        self._build_draft_graph()
 
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -917,9 +919,12 @@ class Engine:
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
-        # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc). The verify
-        #    graph first: reset_capture drops its attention wrapper, and the GDN pool base
-        #    pointers its kernels baked in are about to be reallocated.
+        # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc). The draft
+        #    graph bakes nothing a rebuild reallocates, but its pool is memory the resized
+        #    caches want, and a recapture costs seconds. The verify graph next: reset_capture
+        #    drops its attention wrapper, and the GDN pool base pointers its kernels baked in
+        #    are about to be reallocated.
+        self._destroy_draft_graph()
         self._destroy_verify_graph()
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
@@ -967,6 +972,7 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
         )
         self._build_verify_graph(aligned_max_seq_len)
+        self._build_draft_graph()
 
     def _verify_graph_unsupported_reason(self) -> str | None:
         """Why the speculative verify has to stay eager here, or None if it can be replayed."""
@@ -1033,6 +1039,52 @@ class Engine:
         if self.verify_graph is not None:
             self.verify_graph.destroy()
             self.verify_graph = None
+
+    def _draft_graph_unsupported_reason(self) -> str | None:
+        """Why the speculative draft has to stay eager here, or None if it can be replayed."""
+        if not ENV.SPEC_DRAFT_GRAPH:
+            return "FREETOKEN_SPEC_DRAFT_GRAPH is off"
+        if self.draft_runner is None:
+            return "no draft model"
+        if self.draft_runner._static_cache is None:
+            # A DynamicCache does not fail under capture, it freezes at the capture-time
+            # length; only the fixed-address ring of a windowed draft (DFlash 2) can be replayed.
+            return "the draft has no sliding window, so it runs on a DynamicCache"
+        return None
+
+    def _build_draft_graph(self) -> None:
+        """Capture one draft graph per context-row count, or leave the draft eager.
+
+        Runs after the verify graph by convention only: the draft graph bakes the draft
+        weights, the runner's buffers and its K/V ring, none of which the verify capture
+        touches. A failed capture is logged and the draft stays eager, as for the verify.
+        """
+        self.draft_graph: DraftGraphRunner | None = None
+        reason = self._draft_graph_unsupported_reason()
+        if reason is not None:
+            if ENV.SPEC_DRAFT_GRAPH:
+                logger.info_rank0(f"Speculative draft stays eager: {reason}")
+            return
+        runner = DraftGraphRunner(stream=self.stream, device=self.device, runner=self.draft_runner)
+        try:
+            runner.capture()
+        except Exception as e:
+            logger.warning_rank0(
+                f"Draft graph capture failed, speculative draft stays eager: {e!r}",
+                exc_info=True,
+            )
+            runner.destroy()
+            return
+        self.draft_graph = runner
+        # The runner dispatches on this attribute; capture() does not wire it, so a capture
+        # that raised above can never leave a half-built graph reachable from draft().
+        self.draft_runner.graph = runner
+
+    def _destroy_draft_graph(self) -> None:
+        if self.draft_graph is not None:
+            # destroy() unwires draft_runner.graph itself: the next draft() runs eagerly.
+            self.draft_graph.destroy()
+            self.draft_graph = None
 
     def _forward_batch_standard(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -1149,6 +1201,7 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        self._destroy_draft_graph()
         self._destroy_verify_graph()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
