@@ -144,6 +144,40 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
 
+    def rescan_prefix(self, *, live_slot: int, scratch_slot: int, accepted: int, stash) -> None:
+        """Re-run this layer's recurrence over the first ``accepted`` positions of a draft block.
+
+        The caller has already restored ``live_slot`` from ``scratch_slot``, so the state here is
+        the one from before the block; this walks it forward over the prefix the target kept.
+        Only the scan runs -- q/k/v/g/beta come from the verification forward, so no projection
+        and no weight read is repeated.
+        """
+        from freetoken.engine.gdn_rollback import LayerStash
+
+        assert isinstance(stash, LayerStash)
+        ctx = get_global_ctx()
+        pool = ctx.linear_state_pool
+        li = pool.local_index(self.layer_id)
+        device = stash.q.device
+        indices = torch.tensor([live_slot], dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor([0, accepted], dtype=torch.int64, device=device)
+
+        gdn_prefill_chunk_fla(
+            stash.q[:, :accepted], stash.k[:, :accepted], stash.v[:, :accepted],
+            stash.g[:, :accepted], stash.beta[:, :accepted],
+            state_source=pool.recurrent_states[li], indices=indices,
+            cu_seqlens=cu_seqlens, scale=self.head_k_dim ** -0.5,
+        )
+
+        # The convolution state is the last (kernel-1) RAW inputs, so it is rebuilt rather than
+        # rescanned: the window ending at the accepted position is the restored pre-block window
+        # followed by the accepted rows, keeping the tail.
+        width = self.conv_kernel_size - 1
+        cv = pool.conv_states[li]
+        prefix = stash.conv_in[:accepted].transpose(0, 1).to(cv.dtype)  # [conv_dim, accepted]
+        window = torch.cat([cv[scratch_slot], prefix], dim=-1)[:, -width:]
+        cv[live_slot] = window
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -209,6 +243,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
                 return_h=track,
             )
+            rollback = ctx.gdn_rollback
+            if rollback is not None and rollback.recording:
+                # Kept for a possible rewind: a rejected block needs these rows to walk the
+                # state forward again, and recomputing them would mean re-reading the weights.
+                rollback.stash(self.layer_id, self.rescan_prefix, q, k, v, g, beta, conv_in)
             if track:
                 core_out, h = result
                 self._write_track_snapshot(pool, li, conv_in, h, fla)

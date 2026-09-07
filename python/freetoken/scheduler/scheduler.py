@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAl
 
 import torch
 from freetoken.attention.linear import build_fla_metadata
-from freetoken.core import Batch, Req
+from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
@@ -51,6 +51,7 @@ def _gib(n_bytes: int) -> str:
 from freetoken.engine import spec_trace
 from freetoken.engine.engine import ForwardOutput
 from freetoken.engine.draft_runner import _sampling_probs, rejection_sample
+from freetoken.engine.gdn_rollback import GDNRollback
 from freetoken.engine.speculative import (
     DraftBlock,
     commit_verified,
@@ -148,6 +149,18 @@ class Scheduler(SchedulerIOMixin):
         # window after a prefill chunk, 1 after a plain decode step, accepted + 1 after a
         # speculative one. The next draft is conditioned on exactly those rows.
         self._valid_hidden_rows = 0
+        # Rewinding the GDN state of a partly rejected block is implemented but not yet proven
+        # equal to a non-speculative run on real weights, and a wrong rewind produces fluent
+        # text with a healthy acceptance rate rather than an error. So it stays behind a switch
+        # until that comparison is done, and a hybrid model refuses by default as before.
+        self._gdn_rollback: GDNRollback | None = None
+        if (
+            ENV.SPEC_GDN_ROLLBACK
+            and self.engine.draft_runner is not None
+            and self.cache_manager.is_hybrid
+            and get_global_ctx().linear_state_pool is not None
+        ):
+            self._gdn_rollback = GDNRollback(get_global_ctx().linear_state_pool)
         if self.engine.draft_runner is not None:
             reason = unsupported_reason(
                 page_size=config.page_size,
@@ -155,6 +168,7 @@ class Scheduler(SchedulerIOMixin):
                 is_hybrid=self.cache_manager.is_hybrid,
                 tp_size=config.tp_info.size,
                 overlap_scheduling=not ENV.DISABLE_OVERLAP_SCHEDULING,
+                hybrid_rollback=self._gdn_rollback is not None,
             )
             if reason is not None:
                 raise RuntimeError(
@@ -1012,7 +1026,15 @@ class Scheduler(SchedulerIOMixin):
         req = batch.reqs[0]
         params = req.sampling_params
 
-        logits = self.engine.forward_logits(batch)  # one row per drafted position + the bonus
+        rollback = self._gdn_rollback
+        ctx = get_global_ctx()
+        if rollback is not None:
+            rollback.open(req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx)
+            ctx.gdn_rollback = rollback
+        try:
+            logits = self.engine.forward_logits(batch)  # one row per drafted position + bonus
+        finally:
+            ctx.gdn_rollback = None
         if spec_trace.enabled():
             # Row i decides the token at first_position + i, which is the same position the
             # plain path reports as req.device_len when it predicts it.
@@ -1025,6 +1047,10 @@ class Scheduler(SchedulerIOMixin):
             self._draft_tokens, target_probs, self._draft_probs, params.temperature
         )
         accepted = int(accepted_t)
+
+        # Before the KV rollback, so both caches leave this block agreeing on the same prefix.
+        if rollback is not None:
+            rollback.rewind(accepted)
 
         rejected = commit_verified(req, block, accepted)
         self.cache_manager.free_rejected_positions(req, rejected)

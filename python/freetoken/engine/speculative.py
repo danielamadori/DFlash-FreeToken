@@ -92,6 +92,7 @@ def unsupported_reason(
     is_hybrid: bool,
     tp_size: int,
     overlap_scheduling: bool,
+    hybrid_rollback: bool = False,
 ) -> str | None:
     """Why this configuration cannot run speculative decoding yet, or None if it can.
 
@@ -104,7 +105,7 @@ def unsupported_reason(
         return f"page_size={page_size}: rolling back a rejected candidate would free a page still holding accepted tokens"
     if is_swa:
         return "sliding-window KV: the swa pool slots of a rejected candidate need their own rollback"
-    if is_hybrid:
+    if is_hybrid and not hybrid_rollback:
         return "hybrid GDN state: the recurrent state advanced by a rejected candidate cannot be rewound"
     if tp_size != 1:
         return f"tensor parallel size {tp_size}: the draft runs against a sharded vocabulary"

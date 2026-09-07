@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from freetoken.attention import BaseAttnBackend, BaseAttnMetadata
     from freetoken.attention.linear import FLAMetadata
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
+    from freetoken.engine.gdn_rollback import GDNRollback
     from freetoken.kvcache.linear_state_pool import LinearStatePool
     from freetoken.moe import BaseMoeBackend
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -180,6 +181,10 @@ class Context:
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None
+    # Set only while a speculative block is being verified on a hybrid model: the linear layers
+    # stash their recurrence inputs into it so a partly-rejected block can be rewound to the
+    # accepted prefix. None everywhere else, including on models with no linear layers.
+    gdn_rollback: "GDNRollback | None" = None
     _batch: Batch | None = field(default=None, init=False)
 
     @property

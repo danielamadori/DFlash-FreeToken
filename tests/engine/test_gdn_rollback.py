@@ -1,0 +1,191 @@
+"""The bookkeeping of rewinding a linear-attention state to a draft block's accepted prefix.
+
+These cover the parts that do not need a GPU: that the pre-block snapshot is taken and given
+back, that a fully accepted block does no work, and that a partly rejected one restores the
+snapshot and rescans exactly the accepted rows. The numerical half -- that the rescanned state
+equals the state of a non-speculative run -- cannot be asserted here and is checked by
+comparing tokenised output against the baseline on a GPU.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from freetoken.engine.gdn_rollback import GDNRollback
+
+
+class FakePool:
+    """Enough LinearStatePool to exercise the slot lifecycle: a free list and slot copies."""
+
+    def __init__(self, num_slots: int = 8) -> None:
+        self._free = list(range(1, num_slots))
+        self.copies: list[tuple[int, int]] = []
+        self.freed: list[int] = []
+
+    def alloc(self, n: int = 1) -> list[int]:
+        if n > len(self._free):
+            raise RuntimeError("exhausted")
+        return [self._free.pop() for _ in range(n)]
+
+    def free(self, slots) -> None:
+        for s in slots:
+            self.freed.append(s)
+            self._free.append(s)
+
+    def copy_from(self, src: int, dst: int) -> None:
+        self.copies.append((src, dst))
+
+    @property
+    def num_free(self) -> int:
+        return len(self._free)
+
+
+def _stash_into(rb: GDNRollback, layer_id: int, n: int, calls: list) -> None:
+    def rescan(*, live_slot, scratch_slot, accepted, stash):
+        calls.append((layer_id, live_slot, scratch_slot, accepted, int(stash.q.shape[1])))
+
+    rb.stash(
+        layer_id,
+        rescan,
+        q=torch.zeros(1, n, 2, 4),
+        k=torch.zeros(1, n, 2, 4),
+        v=torch.zeros(1, n, 2, 4),
+        g=torch.zeros(1, n, 2),
+        beta=torch.zeros(1, n, 2),
+        conv_in=torch.zeros(n, 6),
+    )
+
+
+def test_open_snapshots_live_into_a_scratch_slot():
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    assert not rb.recording
+    rb.open(live_slot=3)
+    assert rb.recording
+    assert len(pool.copies) == 1
+    src, dst = pool.copies[0]
+    assert src == 3 and dst != 3
+    rb.close()
+
+
+def test_close_returns_the_scratch_slot():
+    pool = FakePool()
+    before = pool.num_free
+    rb = GDNRollback(pool)
+    rb.open(live_slot=3)
+    assert pool.num_free == before - 1
+    rb.close()
+    assert pool.num_free == before
+    assert not rb.recording
+
+
+def test_close_is_idempotent():
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    rb.open(live_slot=1)
+    rb.close()
+    rb.close()
+    assert len(pool.freed) == 1
+
+
+def test_stash_is_ignored_when_not_recording():
+    """A layer may run outside a speculative block; stashing then must not accumulate rows."""
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    calls: list = []
+    _stash_into(rb, 0, 8, calls)
+    rb.open(live_slot=2)
+    rb.rewind(accepted=0)
+    assert calls == []
+
+
+def test_full_acceptance_does_no_rescan_and_no_restore():
+    """The whole point of the fast path: an accepted block leaves the live state alone."""
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    calls: list = []
+    rb.open(live_slot=5)
+    for layer in (0, 1, 2):
+        _stash_into(rb, layer, 8, calls)
+    pool.copies.clear()
+    rb.rewind(accepted=8)
+    assert calls == []
+    assert pool.copies == []      # no restore
+    assert pool.freed == [7]      # but the scratch slot still came back
+
+
+def test_partial_acceptance_restores_then_rescans_every_layer():
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    calls: list = []
+    rb.open(live_slot=5)
+    scratch = pool.copies[0][1]
+    for layer in (0, 1, 2):
+        _stash_into(rb, layer, 8, calls)
+    pool.copies.clear()
+    rb.rewind(accepted=3)
+    # Restored from the pre-block snapshot, once, before any layer walks forward again.
+    assert pool.copies == [(scratch, 5)]
+    assert [c[0] for c in calls] == [0, 1, 2]
+    for _, live, scr, accepted, drafted in calls:
+        assert (live, scr, accepted, drafted) == (5, scratch, 3, 8)
+
+
+def test_rejecting_everything_restores_and_rescans_nothing_forward():
+    """accepted == 0 is a real case: the state must go back to exactly the pre-block snapshot."""
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    calls: list = []
+    rb.open(live_slot=4)
+    scratch = pool.copies[0][1]
+    _stash_into(rb, 0, 5, calls)
+    pool.copies.clear()
+    rb.rewind(accepted=0)
+    assert pool.copies == [(scratch, 4)]
+    assert calls == [(0, 4, scratch, 0, 5)]
+
+
+def test_scratch_slot_is_returned_even_if_a_layer_rescan_raises():
+    """A leaked slot would shrink the pool silently until it could not serve a request."""
+    pool = FakePool()
+    rb = GDNRollback(pool)
+
+    def boom(*, live_slot, scratch_slot, accepted, stash):
+        raise RuntimeError("kernel failed")
+
+    rb.open(live_slot=1)
+    rb.stash(
+        0, boom,
+        q=torch.zeros(1, 4, 2, 4), k=torch.zeros(1, 4, 2, 4), v=torch.zeros(1, 4, 2, 4),
+        g=torch.zeros(1, 4, 2), beta=torch.zeros(1, 4, 2), conv_in=torch.zeros(4, 6),
+    )
+    before = pool.num_free
+    try:
+        rb.rewind(accepted=2)
+    except RuntimeError:
+        pass
+    assert pool.num_free == before + 1
+    assert not rb.recording
+
+
+def test_opening_twice_is_refused():
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    rb.open(live_slot=1)
+    try:
+        rb.open(live_slot=2)
+    except RuntimeError as e:
+        assert "twice" in str(e)
+    else:
+        raise AssertionError("a second open must not be silently accepted")
+    rb.close()
+
+
+def test_rewind_without_open_is_refused():
+    rb = GDNRollback(FakePool())
+    try:
+        rb.rewind(accepted=1)
+    except RuntimeError as e:
+        assert "without an open block" in str(e)
+    else:
+        raise AssertionError("rewinding with no block must raise")
