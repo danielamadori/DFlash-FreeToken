@@ -15,6 +15,7 @@ from __future__ import annotations
 import functools
 import os
 import pathlib
+import re
 import shutil
 
 import torch
@@ -22,20 +23,50 @@ import torch
 _CSRC = pathlib.Path(__file__).parent / "csrc" / "gguf"
 
 
-def _host_compiler() -> str | None:
-    """A host compiler nvcc + libtorch headers accept.
+def _compiles_cxx(cxx: str) -> bool:
+    """True when ``cxx`` can actually compile a C++ translation unit.
 
-    The system default gcc can be too new for the torch headers (gcc 16 hard-errors),
-    and on this toolchain even nvcc+gcc-13 trips a non-conformant ``typename
-    decltype`` in ``List_inl.h`` once ``torch::Tensor`` is instantiated -- but nvcc
-    with ``clang++`` as host compiles it cleanly. So prefer clang++, then fall back
-    to an older gcc. Override with ``FREETOKEN_GGUF_HOST_CXX``.
+    Being on PATH is not the same as working. Ubuntu's clang++ 14 is installed here and
+    fails on ``#include <new>``: it looks for a libstdc++ toolchain it cannot find, so
+    every C++ header is missing. shutil.which reports it happily, nvcc is then pointed at
+    it, and the build dies deep inside CUDA's own headers with ``'new' file not found`` --
+    an error that names neither the compiler nor the reason.
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = pathlib.Path(tmp) / "probe.cpp"
+        src.write_text("#include <new>\nint main() { return 0; }\n", encoding="utf-8")
+        try:
+            done = subprocess.run(
+                [cxx, "-c", str(src), "-o", str(pathlib.Path(tmp) / "probe.o")],
+                capture_output=True, timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return done.returncode == 0
+
+
+@functools.cache
+def _host_compiler() -> str | None:
+    """A host compiler nvcc + libtorch headers accept, verified by compiling with it.
+
+    The system default gcc can be too new for the torch headers (gcc 16 hard-errors), and
+    on some toolchains nvcc+gcc-13 trips a non-conformant ``typename decltype`` in
+    ``List_inl.h`` once ``torch::Tensor`` is instantiated, where nvcc with clang++ compiles
+    cleanly. So clang++ stays the first preference -- but only if it works: each candidate
+    is probed with a real compile before being handed to nvcc, because a broken-but-present
+    compiler produced a build failure pointing at CUDA's headers instead of at itself.
+
+    Override with ``FREETOKEN_GGUF_HOST_CXX`` (taken as given, not probed).
     """
     override = os.environ.get("FREETOKEN_GGUF_HOST_CXX")
     if override:
         return override
-    for cxx in ("clang++", "g++-13", "g++-14", "g++-15"):
-        if shutil.which(cxx):
+    for cxx in ("clang++", "g++-13", "g++-14", "g++-15", "g++"):
+        path = shutil.which(cxx)
+        if path and _compiles_cxx(path):
             return cxx
     return None
 
@@ -47,11 +78,61 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+def _assert_nvcc_supports(major: int, minor: int) -> None:
+    """Fail with the actual problem when nvcc is too old for the card.
+
+    torch resolves CUDA_HOME to /usr when nothing else is set, and a distro nvcc there can
+    predate the GPU: CUDA 11.5 against an Ada card gives ``nvcc fatal: Unsupported gpu
+    architecture 'compute_89'``, which says nothing about WHICH nvcc or where a newer one
+    is. Ada (sm_89) needs CUDA >= 11.8, Blackwell (sm_100) >= 12.8.
+    """
+    import subprocess
+
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    nvcc = os.path.join(CUDA_HOME, "bin", "nvcc") if CUDA_HOME else shutil.which("nvcc")
+    if not nvcc or not os.path.exists(nvcc):
+        return
+    try:
+        out = subprocess.run([nvcc, "--version"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    match = re.search(r"release (\d+)\.(\d+)", out)
+    if not match:
+        return
+    version = (int(match.group(1)), int(match.group(2)))
+    needed = (12, 8) if major >= 10 else (11, 8) if (major, minor) >= (8, 9) else (11, 0)
+    if version < needed:
+        raise RuntimeError(
+            f"nvcc {version[0]}.{version[1]} at {nvcc} cannot target this GPU "
+            f"(sm_{major}{minor} needs CUDA >= {needed[0]}.{needed[1]}). Point CUDA_HOME at a "
+            f"newer toolkit, e.g. CUDA_HOME=/usr/local/cuda-12.9."
+        )
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
 
-    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
+    # Built for THIS card, at -O3, on both passes.
+    #
+    # Without an explicit target nvcc emits a fat binary for its default architecture
+    # list: longer builds, and no Ada-specific scheduling. Deriving the arch from the
+    # device present means the kernel is compiled for what will run it -- sm_89 here --
+    # and `code=sm_XX` emits real SASS rather than PTX the driver must JIT on first launch.
+    #
+    # Deliberately NOT --use_fast_math: it relaxes IEEE semantics, and this fork has just
+    # spent its time establishing that a one-ULP difference in a logit is the whole
+    # explanation for two engines disagreeing. Speed that changes numbers is not free
+    # here. FREETOKEN_GGUF_FAST_MATH=1 opts in for anyone who wants it.
+    extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr", "-DNDEBUG"]
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(0)
+        _assert_nvcc_supports(major, minor)
+        extra_cuda_cflags += [f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"]
+    if os.environ.get("FREETOKEN_GGUF_FAST_MATH", "").lower() in {"1", "true", "yes", "on"}:
+        extra_cuda_cflags += ["--use_fast_math"]
+    extra_cflags = ["-O3", "-DNDEBUG"]
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
@@ -68,6 +149,7 @@ def _module():
         name="freetoken_gguf_kernels",
         sources=[str(_CSRC / "gguf_kernel.cu")],
         extra_include_paths=[str(_CSRC)],
+        extra_cflags=extra_cflags,
         extra_cuda_cflags=extra_cuda_cflags,
         verbose=True,
     )
