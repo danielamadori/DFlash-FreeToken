@@ -19,6 +19,12 @@
 #include "moe_vec.cuh"
 // clang-format off
 
+// FreeToken: the mma int8 MMQ port (plan docs/plans/prefill-mmq-mma-plan.md, step S3). It lives
+// entirely under mma/ in `namespace ftmma`, includes NOTHING from the vendored headers above, and
+// is included AFTER them so that its guarded macro aliases (mma/common_shim.cuh) never win over a
+// vendored definition. Nothing above this line is affected by it.
+#include "mma/mmq_entry.cuh"
+
 // Q8 gemv
 template <typename scalar_t>
 static __global__ void
@@ -421,6 +427,41 @@ torch::Tensor ggml_mul_mat_a8(
                     "I-quants must route through ggml_dequantize)");
     }
   });
+  return Y;
+}
+
+// FreeToken addition (plan step S3): the mma int8 MMQ entry point. Same call shape as
+// ggml_mul_mat_a8 above -- W packed [row, ncols], X [batch, ncols], Y [batch, row] -- but the
+// activations are quantized to the MMQ block layout (mma/quantize_mmq.cuh) and the product runs
+// on mma.sync.m16n8k32.s8.s8.s32 instead of dp4a. Raises rather than silently falling back, so
+// the Python A/B can tell "not ported" from "wrong numbers"; the dispatch that chooses between
+// this and ggml_dequantize lives in layers/gguf.py and is S6's business, not this function's.
+torch::Tensor ggml_mul_mat_mma(
+    torch::Tensor W,  // quant weight
+    torch::Tensor X,  // input
+    int64_t type,
+    int64_t row) {
+  TORCH_CHECK(X.dim() == 2, "ggml_mul_mat_mma: X must be 2-D");
+  TORCH_CHECK(X.is_contiguous(), "ggml_mul_mat_mma: X must be contiguous");
+  TORCH_CHECK(W.is_contiguous(), "ggml_mul_mat_mma: W must be contiguous");
+  const int col = X.sizes()[1];
+  const int batch = X.sizes()[0];
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
+  auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({batch, row}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  bool ok = false;
+  DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_mul_mat_mma", [&] {
+    ok = ftmma::ftmma_mul_mat<scalar_t>(
+        (int)type, (const void*)W.data_ptr(), (const scalar_t*)X.data_ptr(), (scalar_t*)Y.data_ptr(),
+        col, (int)row, batch, stream);
+  });
+  TORCH_CHECK(ok,
+              "ggml_mul_mat_mma: unsupported request (GGUF quant type ", type,
+              ", in_features ", col, ", out_features ", row, ", rows ", batch,
+              "). The mma MMQ port needs a ported type, in_features % 256 == 0, "
+              "out_features % 128 == 0 and a Turing-or-newer GPU; the caller must fall back to "
+              "ggml_dequantize + a dense matmul.");
   return Y;
 }
 
@@ -946,6 +987,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_dequantize", &ggml_dequantize, "");
   m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "");
   m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "");
+  m.def("ggml_mul_mat_mma", &ggml_mul_mat_mma, "");
   m.def("ggml_moe_a8", &ggml_moe_a8, "");
   m.def("ggml_moe_a8_vec", &ggml_moe_a8_vec, "");
   m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size, "");
