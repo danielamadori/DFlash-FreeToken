@@ -22,7 +22,23 @@
 #include <torch/all.h>
 
 #include "mmq_core.cuh"
+
+// One per ported type (plan S4). mmq_q4_K.cuh comes first because it owns the copies of
+// get_int_b4 / unpack_scales_q45_K / ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma that mmq_q5_K.cuh
+// reuses; the rest are order-independent -- every symbol shared between two of them is either
+// in a per-type nested namespace (iq2_xs, iq2_s, iq4_xs) or behind an FTMMA_HAVE_* one-shot
+// guard, and the wiring step diffed every duplicated body to confirm they are identical.
 #include "mmq_q4_K.cuh"
+#include "mmq_iq2_s.cuh"
+#include "mmq_iq2_xs.cuh"
+#include "mmq_iq3_s.cuh"
+#include "mmq_iq3_xxs.cuh"
+#include "mmq_iq4_nl.cuh"
+#include "mmq_iq4_xs.cuh"
+#include "mmq_q3_K.cuh"
+#include "mmq_q5_K.cuh"
+#include "mmq_q6_K.cuh"
+#include "mmq_q8_0.cuh"
 
 namespace ftmma {
 
@@ -30,7 +46,17 @@ namespace ftmma {
 // one #include above; nothing else in mma/ changes.
 static inline bool ftmma_mul_mat_type_supported(const int type) {
     switch ((ftmma_type) type) {
+        case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
             return true;
         default:
             return false;
@@ -132,8 +158,38 @@ bool ftmma_mul_mat(
         /*ncols_max=*/ne1};
 
     switch (type_x) {
+        case GGML_TYPE_Q3_K:
+            mul_mat_q_case<GGML_TYPE_Q3_K, scalar_t>(args, stream);
+            break;
         case GGML_TYPE_Q4_K:
             mul_mat_q_case<GGML_TYPE_Q4_K, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            mul_mat_q_case<GGML_TYPE_Q5_K, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_q_case<GGML_TYPE_Q6_K, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            mul_mat_q_case<GGML_TYPE_Q8_0, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            mul_mat_q_case<GGML_TYPE_IQ2_XS, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_IQ2_S:
+            mul_mat_q_case<GGML_TYPE_IQ2_S, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            mul_mat_q_case<GGML_TYPE_IQ3_XXS, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            mul_mat_q_case<GGML_TYPE_IQ3_S, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            mul_mat_q_case<GGML_TYPE_IQ4_NL, scalar_t>(args, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            mul_mat_q_case<GGML_TYPE_IQ4_XS, scalar_t>(args, stream);
             break;
         default:
             // unreachable: ftmma_mul_mat_type_supported() gates this switch.

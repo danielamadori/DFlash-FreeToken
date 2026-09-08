@@ -109,3 +109,69 @@ void ftmma_selftest_launch(const int * xs, int * dst, const int stride, cudaStre
     ftmma_selftest_kernel<<<nsm, WARP_SIZE, 0, stream>>>(xs, dst, stride, fd);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// S4 ADDITION (wiring step): every ported type header, in one translation unit. This is the plan's
+// S4 CPU test. It fails at compile time if two per-type headers define the same helper at ftmma
+// scope without an FTMMA_HAVE_* guard -- get_int_b2 / get_int_b4 / unpack_ksigns / kvalues_iq4nl /
+// get_int_from_table_16 and the shared vec-dots ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma /
+// _q8_0_16_q8_1_mma / _q8_1_q8_1_mma -- or if a ported type has no mmq_type_traits specialisation.
+//
+// NOTE: the vendored ggml-common.h is deliberately NOT included here. It cannot be: it needs
+// c10::BFloat16 (ggml-common.h:966), so it only compiles inside the torch extension. The
+// coexistence check that matters -- the port's local constants next to the vendored QR/QI macros
+// in one TU -- is therefore the FULL build of gguf_kernel.cu, which includes ggml-common.h at :12
+// and mma/mmq_entry.cuh at :26. That build is clean, with no macro-redefinition diagnostic.
+// What this file adds on top is that the port's own constants are upstream's, not the vendored
+// ones, which is the half of the decode-safety gate a compiler can check.
+// ---------------------------------------------------------------------------------------------------------
+
+#include "mmq_core.cuh"
+#include "mmq_q4_K.cuh"
+#include "mmq_iq2_s.cuh"
+#include "mmq_iq2_xs.cuh"
+#include "mmq_iq3_s.cuh"
+#include "mmq_iq3_xxs.cuh"
+#include "mmq_iq4_nl.cuh"
+#include "mmq_iq4_xs.cuh"
+#include "mmq_q3_K.cuh"
+#include "mmq_q5_K.cuh"
+#include "mmq_q6_K.cuh"
+#include "mmq_q8_0.cuh"
+
+// The four constants the vendored ggml-common.h gets "wrong" for this port (it has 8 where
+// upstream has 2 or 4, because the vendored decode path walks the blocks differently). A port
+// that ever picked up the vendored value would mis-address nibbles SILENTLY, so pin them here.
+static_assert(ftmma::iq4_xs::FT_QR4_XS == 2, "IQ4_XS must use upstream's QR4_XS (vendored is 8)");
+static_assert(ftmma::iq2_xs::FT_QR2_XS == 4, "IQ2_XS must use upstream's QR2_XS (vendored is 8)");
+static_assert(ftmma::iq2_s::FT_QR2_S   == 4, "IQ2_S must use upstream's QR2_S (vendored is 8)");
+static_assert(ftmma::FT_QR3_XXS        == 4, "IQ3_XXS must use upstream's QR3_XXS (vendored is 8)");
+static_assert(ftmma::FT_QR3_S          == 4, "IQ3_S must use upstream's QR3_S (vendored has none)");
+// and the ones that do agree, pinned so a vendored change is caught too
+static_assert(ftmma::FT_QR3_K == 4 && ftmma::FT_QR4_K == 2 && ftmma::FT_QR5_K == 2, "");
+static_assert(ftmma::FT_QR6_K == 2 && ftmma::FT_QR8_0 == 1 && ftmma::FT_QR4_NL == 2, "");
+
+// Every ported type must actually have a traits specialisation: the primary template is declared
+// and not defined, so naming sram_layout on an unported type is a hard error rather than a
+// silently wrong kernel.
+template <ftmma::ggml_type t> struct ftmma_selftest_traits_present {
+    static constexpr int layout = (int) ftmma::mmq_type_traits<t>::sram_layout;
+};
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_Q3_K>::layout    >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_Q4_K>::layout    >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_Q5_K>::layout    >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_Q6_K>::layout    >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_Q8_0>::layout    >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_IQ2_XS>::layout  >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_IQ2_S>::layout   >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_IQ3_XXS>::layout >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_IQ3_S>::layout   >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_IQ4_NL>::layout  >= 0, "");
+static_assert(ftmma_selftest_traits_present<ftmma::GGML_TYPE_IQ4_XS>::layout  >= 0, "");
+
+// The shared-memory budget is NOT asserted here: mmq_get_nbytes_shared is a host function, and
+// making it constexpr would edit mmq_core.cuh. It was computed by hand at wiring time instead:
+// I*stride*4 + J*4 + PAD(J*144, 1024), I=128, stride 76 (Q8_0/Q8_1/Q6_K layouts) or 84 (Q3_K),
+// which is 40992..57856 B for the stride-76 types and 45088..61952 B for the stride-84 types
+// (Q3_K, IQ2_XS, IQ2_S) over J in {8,16,32,64,128} -- all well inside Ada's 101376 B opt-in, and
+// mul_mat_q_switch_J re-checks against the device's smpbo at runtime anyway.

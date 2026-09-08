@@ -46,6 +46,7 @@ def mock_kernel_module(monkeypatch):
         "ggml_mul_mat_vec_a8": None,
         "ggml_mul_mat_a8": None,
         "ggml_dequantize": None,
+        "ggml_mul_mat_mma": None,
     }
 
     def make_mmvq_kernel(call_log):
@@ -91,6 +92,17 @@ def mock_kernel_module(monkeypatch):
     mock_module.ggml_mul_mat_vec_a8 = make_mmvq_kernel(call_log)
     mock_module.ggml_mul_mat_a8 = make_mmq_kernel(call_log)
     mock_module.ggml_dequantize = make_dequant_kernel(call_log)
+
+    def mma_kernel(qweight, x, qweight_type, out_features):
+        call_log["ggml_mul_mat_mma"] = {
+            "qweight_shape": qweight.shape,
+            "x_shape": x.shape,
+            "qweight_type": qweight_type,
+            "out_features": out_features,
+        }
+        return torch.zeros(x.shape[0], out_features, dtype=x.dtype)
+
+    mock_module.ggml_mul_mat_mma = mma_kernel
 
     monkeypatch.setitem(sys.modules, "freetoken.kernel.gguf", mock_module)
 
@@ -205,7 +217,10 @@ class TestLargeBatchStandardQuants:
     ])
     def test_kquant_large_batch_takes_dequant(self, mock_kernel_module, qweight_type):
         """K-quants above the threshold dequantize and use a dense matmul."""
-        out_features = 4096
+        # 1024 output features: too narrow for the tensor-core MMQ (see _use_mma), so this
+        # stays the dense-path case it was written to be. It is the shape of this model's
+        # attention k/v projections.
+        out_features = 1024
         in_features = 4096
         batch_size = _MMVQ_SAFE + 1  # Large batch (above threshold)
 
@@ -264,7 +279,10 @@ class TestIQuantDispatch:
         that is 6.82 GiB per forward, and a speculative verification carries seven rows.
         MMVQ's kernel takes any row count, so it stays the choice for windows that small.
         """
-        out_features = 4096
+        # IQ2_S is a ported tensor-core MMQ type, so use the narrow shape this model has for
+        # k/v projections to keep the case about the GEVM-vs-dequantize choice it was written
+        # for; the MMQ routing has its own class below.
+        out_features = 1024
         in_features = 4096
         batch_size = _MMVQ_SAFE + 1  # a verification window, not a prefill
 
@@ -285,10 +303,11 @@ class TestIQuantDispatch:
     def test_iquant_real_batch_still_takes_dequant_path(self, mock_kernel_module, qweight_type):
         """Past the window size, dequantizing once and multiplying dense wins again.
 
-        A long prefill reuses the dequantized weight across hundreds of rows, which is the
-        case the dequant path exists for; still never MMQ, which cannot decode these types.
+        On a tensor too narrow for the tensor-core MMQ (1024 output features here): a long
+        prefill reuses the dequantized weight across hundreds of rows, which is the case the
+        dequant path exists for; still never MMQ, which cannot decode these types.
         """
-        out_features = 4096
+        out_features = 1024
         in_features = 4096
         batch_size = _MMVQ_NO_MMQ_LIMIT + 1
 
@@ -329,7 +348,7 @@ class TestMMVQThresholdTracking:
 
     def test_mmvq_threshold_boundary(self, mock_kernel_module):
         """At batch == _MMVQ_SAFE the GEVM is used; at +1 the dense (dequantized) path is."""
-        out_features = 4096
+        out_features = 1024
         in_features = 4096
         qweight_type = GGML_Q4_K
 
@@ -344,9 +363,65 @@ class TestMMVQThresholdTracking:
         mock_kernel_module["ggml_mul_mat_vec_a8"] = None
         mock_kernel_module["ggml_mul_mat_a8"] = None
 
-        # Test above threshold: should dequantize and multiply dense
+        # Test above threshold: should dequantize and multiply dense (this shape is too
+        # narrow for the tensor-core MMQ, which would otherwise take it -- see _use_mma)
         x_above_threshold = torch.randn(_MMVQ_SAFE + 1, in_features, dtype=torch.bfloat16)
         result = fused_mul_mat_gguf(x_above_threshold, qweight, qweight_type)
         assert mock_kernel_module["ggml_dequantize"] is not None
         assert mock_kernel_module["ggml_mul_mat_a8"] is None
         assert mock_kernel_module["ggml_mul_mat_vec_a8"] is None
+
+
+class TestTensorCoreMMQRouting:
+    """The tensor-core MMQ takes a request only where it was measured to win.
+
+    Two thresholds (see _use_mma): at least 24 activation rows, because below that the
+    quantized GEVM is faster and because 1 and 8 rows are the decode and speculative-verify
+    paths whose CUDA graphs are captured over the current kernels; and at least 32 output
+    tiles of 128 rows, because a 1024-row tensor fills 8 of the card's 128 multiprocessors
+    and loses until ~1500 activation rows.
+    """
+
+    def test_large_batch_big_tensor_takes_mma(self, mock_kernel_module):
+        in_features, out_features = 5120, 17408
+        x = torch.randn(24, in_features, dtype=torch.bfloat16)
+        qweight = make_qweight(out_features, in_features, GGML_Q4_K)
+
+        out = fused_mul_mat_gguf(x, qweight, GGML_Q4_K)
+
+        assert mock_kernel_module["ggml_mul_mat_mma"] is not None
+        assert mock_kernel_module["ggml_dequantize"] is None
+        assert mock_kernel_module["ggml_mul_mat_a8"] is None
+        assert out.shape == (24, out_features)
+
+    def test_below_the_row_threshold_stays_on_the_gevm(self, mock_kernel_module):
+        in_features, out_features = 5120, 17408
+        x = torch.randn(16, in_features, dtype=torch.bfloat16)
+        qweight = make_qweight(out_features, in_features, GGML_Q4_K)
+
+        fused_mul_mat_gguf(x, qweight, GGML_Q4_K)
+
+        assert mock_kernel_module["ggml_mul_mat_vec_a8"] is not None
+        assert mock_kernel_module["ggml_mul_mat_mma"] is None
+
+    def test_narrow_tensor_stays_on_the_dense_path(self, mock_kernel_module):
+        # 1024 output features = 8 tiles: the kernel would leave 120 of 128 SMs idle.
+        in_features, out_features = 5120, 1024
+        x = torch.randn(2048, in_features, dtype=torch.bfloat16)
+        qweight = make_qweight(out_features, in_features, GGML_Q4_K)
+
+        fused_mul_mat_gguf(x, qweight, GGML_Q4_K)
+
+        assert mock_kernel_module["ggml_dequantize"] is not None
+        assert mock_kernel_module["ggml_mul_mat_mma"] is None
+
+    def test_unported_type_stays_on_the_dense_path(self, mock_kernel_module):
+        in_features, out_features = 5120, 17408
+        x = torch.randn(64, in_features, dtype=torch.bfloat16)
+        qweight = make_qweight(out_features, in_features, GGML_Q2_K)
+
+        fused_mul_mat_gguf(x, qweight, GGML_Q2_K)
+
+        assert mock_kernel_module["ggml_dequantize"] is not None
+        assert mock_kernel_module["ggml_mul_mat_mma"] is None
+

@@ -179,6 +179,18 @@ def ggml_mul_mat_a8(
     return _module().ggml_mul_mat_a8(weight, x, quant_type, row)
 
 
+def ggml_mul_mat_mma(
+    weight: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+) -> torch.Tensor:
+    """Tensor-core MMQ (kernel/csrc/gguf/mma/): quantized matmul without dequantizing.
+
+    Raises rather than falling back when the type or the shape is outside what the port
+    covers, so a dispatch mistake is loud; ``layers.gguf`` checks the same conditions before
+    calling. ``row`` = output features.
+    """
+    return _module().ggml_mul_mat_mma(weight, x, quant_type, row)
+
+
 def ggml_moe_a8(
     x: torch.Tensor,
     weight: torch.Tensor,

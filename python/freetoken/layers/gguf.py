@@ -44,7 +44,17 @@ from freetoken.models.gguf.dequant import (
     GGML_BF16,
     GGML_F16,
     GGML_F32,
+    GGML_IQ2_S,
+    GGML_IQ2_XS,
+    GGML_IQ3_S,
+    GGML_IQ3_XXS,
+    GGML_IQ4_NL,
+    GGML_IQ4_XS,
     GGML_NAME,
+    GGML_Q3_K,
+    GGML_Q4_K,
+    GGML_Q5_K,
+    GGML_Q6_K,
     GGML_Q8_0,
     GGML_UNQUANTIZED,
     MMQ_TYPES,
@@ -83,13 +93,44 @@ _MMVQ_NO_MMQ_LIMIT = 72
 # replace it; it is simply not on this dispatch any more.
 
 
+# The types the tensor-core MMQ covers (kernel/csrc/gguf/mma/mmq_entry.cuh: keep the two lists
+# in step, the C++ side raises for anything else) and the conditions under which it was measured
+# to win. Two thresholds, both from the A/B on this model's tensors at 9, 16, 24, 32, 40, 64 and
+# 2048 rows (scripts/spec/ab_mma.py in the Agents repo):
+#   - rows: the crossover against the quantized GEVM is ~24 rows on every large tensor (IQ4_XS
+#     17408x5120 at 16 rows 0.080 vs 0.128 ms for the GEVM, at 24 rows 0.090 vs 0.164, at 64
+#     0.109 vs 0.421). Below that the GEVM stays, which also leaves the 1- and 8-row decode and
+#     speculative-verify paths (and the CUDA graphs captured over them) untouched.
+#   - out_features: the kernel tiles 128 output rows per block, so a 1024-row tensor gives 8
+#     blocks on 128 SMs and loses until ~1500 activation rows (0.096 vs 0.048 ms at 512 rows).
+#     Requiring 32 tiles keeps those four tensors on the dense path.
+# The kernel also needs whole tiles: out_features % 128 and in_features % 256.
+MMA_TYPES = frozenset(
+    {GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0,
+     GGML_IQ2_S, GGML_IQ2_XS, GGML_IQ3_S, GGML_IQ3_XXS, GGML_IQ4_NL, GGML_IQ4_XS}
+)
+_MMA_MIN_ROWS = 24
+_MMA_MIN_OUT_TILES = 32  # out_features >= 32 * 128
+
+
+def _use_mma(qweight_type: int, rows: int, out_features: int, in_features: int) -> bool:
+    return (
+        qweight_type in MMA_TYPES
+        and rows >= _MMA_MIN_ROWS
+        and out_features >= _MMA_MIN_OUT_TILES * 128
+        and out_features % 128 == 0
+        and in_features % 256 == 0
+    )
+
+
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
     """y = x @ dequant(qweight).T, dispatched by batch size and quant type.
 
     Dispatch order:
     1. Unquantized (F32/F16/BF16): plain torch matmul
-    2. Few rows (see _MMVQ_SAFE / _MMVQ_NO_MMQ_LIMIT), in MMVQ_TYPES: quantized GEVM kernel
-    3. More rows, in DEQUANT_TYPES: dequantize the weight once, then a dense tensor-core matmul
+    2. Enough rows, a ported type and a wide enough tensor (see _use_mma): the tensor-core MMQ
+    3. Few rows (see _MMVQ_SAFE / _MMVQ_NO_MMQ_LIMIT), in MMVQ_TYPES: quantized GEVM kernel
+    4. Otherwise, in DEQUANT_TYPES: dequantize the weight once, then a dense tensor-core matmul
     4. Otherwise MMQ, which today only a type outside DEQUANT_TYPES can reach
     """
     from freetoken.kernel.gguf import (
@@ -118,13 +159,20 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
         # so casting it is negligible, and computing in the stored precision is what
         # llama.cpp does for these tensors anyway.
         return (x.to(w.dtype) @ w.T).to(x.dtype)
+    block, type_size = BLOCK_SHAPE.get(qweight_type, (0, 0))
+    in_features = qweight.shape[1] // type_size * block if type_size else 0
+    if _use_mma(qweight_type, x.shape[0], out_features, in_features):
+        # Ahead of the GEVM branch on purpose: the crossover is ~24 rows, below the GEVM's own
+        # limit. Imported here, not with the others, because the kernel module is monkeypatched
+        # in the dispatch tests and only the tests exercising this branch need to provide it.
+        from freetoken.kernel.gguf import ggml_mul_mat_mma
+
+        return ggml_mul_mat_mma(qweight, x, qweight_type, out_features)
     if qweight_type in MMVQ_TYPES and x.shape[0] <= (
         _MMVQ_SAFE if qweight_type in MMQ_TYPES else _MMVQ_NO_MMQ_LIMIT
     ):
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in DEQUANT_TYPES:
-        block, type_size = BLOCK_SHAPE[qweight_type]
-        in_features = qweight.shape[1] // type_size * block
         weight = ggml_dequantize(qweight, qweight_type, out_features, in_features, x.dtype)
         return x @ weight.T
     if qweight_type in MMQ_TYPES:
