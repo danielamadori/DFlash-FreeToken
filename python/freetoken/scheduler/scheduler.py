@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import contextlib
 import time
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
@@ -85,6 +86,31 @@ def _spec_timing_mark(scheduler, phase: str, started) -> None:
 
     torch.cuda.synchronize()
     scheduler._spec_ms[phase] += (time.perf_counter() - started) * 1000.0
+
+
+_NVTX = ENV.SPEC_NVTX
+
+
+@contextlib.contextmanager
+def _step(name: str):
+    """Name one step of the speculative block for a profiler, without synchronising.
+
+    The phase timers above have to synchronise to attribute cost, which perturbs exactly the
+    thing being measured and can only report three coarse phases. These ranges cost nothing
+    when no profiler is attached and let `nsys -t cuda,nvtx` cut the timeline at the real
+    boundaries -- including the host-side steps between the forwards, which the phase timers
+    fold into whichever phase happens to wait for them.
+    """
+    if not _NVTX:
+        yield
+        return
+    import torch
+
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class ForwardInput(NamedTuple):
@@ -1031,18 +1057,19 @@ class Scheduler(SchedulerIOMixin):
             anchor_position + runner.block_size + 1, device=self.device, dtype=torch.int64
         ).unsqueeze(0)
         _t0 = _spec_timing_start()
-        draft_tokens, draft_probs = runner.draft(
-            target_hidden_states=visible,
-            current_token_id=self.token_pool[req.table_idx, anchor_position].view(1),
-            position_ids=positions,
-            seq_len=anchor_position,
-            temperature=params.temperature,
-            top_p=params.top_p,
-            top_k=max(params.top_k, 0),
-            # So the runner can tell a new request from the next block of this one and drop
-            # the previous request's context keys instead of drafting against them.
-            request_uid=req.uid,
-        )
+        with _step("draft"):
+            draft_tokens, draft_probs = runner.draft(
+                target_hidden_states=visible,
+                current_token_id=self.token_pool[req.table_idx, anchor_position].view(1),
+                position_ids=positions,
+                seq_len=anchor_position,
+                temperature=params.temperature,
+                top_p=params.top_p,
+                top_k=max(params.top_k, 0),
+                # So the runner can tell a new request from the next block of this one and drop
+                # the previous request's context keys instead of drafting against them.
+                request_uid=req.uid,
+            )
 
         _spec_timing_mark(self, "draft", _t0)
         block = open_draft_block(req, int(draft_tokens.shape[1]))
@@ -1070,17 +1097,19 @@ class Scheduler(SchedulerIOMixin):
             ctx.gdn_rollback = rollback
         _t0 = _spec_timing_start()
         try:
-            logits = self.engine.forward_logits(batch)  # one row per drafted position + bonus
+            with _step("verify"):
+                logits = self.engine.forward_logits(batch)  # one row per drafted position + bonus
         finally:
             ctx.gdn_rollback = None
         _spec_timing_mark(self, "verify", _t0)
-        target_probs = _sampling_probs(
-            logits, params.temperature, params.top_p, max(params.top_k, 0)
-        ).unsqueeze(0)
-        accepted_t, bonus = rejection_sample(
-            self._draft_tokens, target_probs, self._draft_probs, params.temperature
-        )
-        accepted = int(accepted_t)
+        with _step("sampling"):
+            target_probs = _sampling_probs(
+                logits, params.temperature, params.top_p, max(params.top_k, 0)
+            ).unsqueeze(0)
+            accepted_t, bonus = rejection_sample(
+                self._draft_tokens, target_probs, self._draft_probs, params.temperature
+            )
+            accepted = int(accepted_t)
         if spec_trace.enabled():
             # Row i decides the token at first_position + i, which is the same position the
             # plain path reports as req.device_len when it predicts it. Its context is the
@@ -1099,10 +1128,20 @@ class Scheduler(SchedulerIOMixin):
         # Before the KV rollback, so both caches leave this block agreeing on the same prefix.
         if rollback is not None:
             _t1 = _spec_timing_start()
-            rollback.rewind(accepted)
+            with _step("rewind"):
+                rollback.rewind(accepted)
             _spec_timing_mark(self, "rewind", _t1)
 
         rejected = commit_verified(req, block, accepted)
+        with _step("commit"):
+            return self._commit_verified_block(
+                forward_input, req, rejected, accepted, bonus, block
+            )
+
+    def _commit_verified_block(self, forward_input, req, rejected, accepted, bonus, block):
+        """Everything after the target has decided: free the rejected pages, advance the
+        caches, stage the bonus token and report. Split out so a profiler can name it (the
+        phase timers could only see the three GPU-bound phases)."""
         self.cache_manager.free_rejected_positions(req, rejected)
         self._valid_hidden_rows = accepted + 1
 
