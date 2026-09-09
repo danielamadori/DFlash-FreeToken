@@ -420,7 +420,7 @@ def _causal_conv1d_update_kernel(
 # Tuned entrypoints (mirror the vendored op's varlen / decode split)
 # ---------------------------------------------------------------------------
 def causal_conv1d_varlen(
-    x: torch.Tensor,            # [conv_dim, total_tokens]
+    x: torch.Tensor,            # [conv_dim, total_tokens], channel- or token-major
     weight: torch.Tensor,       # [conv_dim, kernel]
     conv_states: torch.Tensor,  # [num_slots, conv_dim, kernel-1] (in place)
     cu_seqlens: torch.Tensor,   # [batch+1] int32
@@ -431,14 +431,28 @@ def causal_conv1d_varlen(
     max_seq_len: Optional[int] = None,
     batch: Optional[int] = None,
 ) -> torch.Tensor:
-    if x.stride(-1) != 1:
+    # The kernel is strided in both directions -- stride_x_dim is a runtime argument and
+    # stride_x_token specializes -- so a TOKEN-MAJOR x also runs as it is: [conv_dim, total]
+    # with strides (1, conv_dim), i.e. the transpose of a contiguous [total, conv_dim]. The
+    # caller usually holds exactly that, and copying it into channel-major cost more than the
+    # convolution: 14.4 ms against 4.5 per 2129-token prefill of the 27B's GDN. Only a layout
+    # with no unit stride at all has to be materialised.
+    token_major = x.stride(-1) != 1
+    if token_major and x.stride(0) != 1:
         x = x.contiguous()
+        token_major = False
     cu_seqlens = cu_seqlens.to(torch.int32)
     cache_indices = cache_indices.to(torch.int32)
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
+    # The output keeps the input's layout, so the caller gets back what it gave and no one
+    # has to transpose either side.
+    out = (
+        torch.empty(x.shape[1], x.shape[0], dtype=x.dtype, device=x.device).transpose(0, 1)
+        if token_major
+        else torch.empty_like(x)
+    )
     dim, cu_seqlen = x.shape
     _, width = weight.shape
     # The tap chains below are unrolled for widths 2..4 only (wider taps would
