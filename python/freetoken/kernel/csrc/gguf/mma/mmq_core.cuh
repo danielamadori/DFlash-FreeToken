@@ -9,9 +9,10 @@
 //   mmq.cuh:278-373  the config accessors
 //   mmq.cuh:467-519  ggml_cuda_mmq_write_back_mma
 //   mmq.cuh:867-941  mul_mat_q_process_tile
-//   mmq.cuh:946-1054 mul_mat_q, NON-stream-k arm only
+//   mmq.cuh:946-1232 mul_mat_q, both arms
+//   mmq.cuh:1233-1330 mul_mat_q_stream_k_fixup
 //   mmq.cuh:1371-1385 struct mmq_args + mmq_get_nbytes_shared
-//   mmq.cuh:1387-1428 launch_mul_mat_q, non-stream-k arm only
+//   mmq.cuh:1387-1467 launch_mul_mat_q, both arms
 //   mmq.cuh:1469-1561 mul_mat_q_switch_J / mul_mat_q_case
 //
 // DIVERGENCES FROM UPSTREAM (each is also commented at its site):
@@ -20,12 +21,16 @@
 //     (vendored QR4_XS == 8, upstream == 2: a shared header would mis-address nibbles silently).
 //     Consequence: names that are MACROS in the vendored header (QK8_1, QI8_1, QR4_K, QK_K, ...)
 //     cannot be reused as C++ identifiers here. They are spelled FT_QI8_1 etc.
-//  2. NO STREAM-K. Plan S3: the kernel is shipped with stream_k = false in every config row, so
-//     mul_mat_q keeps only the (it = blockIdx.x, jt = blockIdx.y) tiling arm (mmq.cuh:986-1054)
-//     and mul_mat_q_stream_k_fixup / tmp_fixup / ggml_cuda_pool_alloc are not ported at all.
-//     Plan Q3 says this is the single most likely reason an R=3000 measurement could miss;
-//     the fix, if the S4 GB/s column shows >2 DRAM passes, is to swap blockIdx.x/y here or to
-//     port mmq.cuh:1233-1330 after all.
+//  2. STREAM-K IS NOW IN (it was not, and the measurement said to put it in). The kernel first
+//     shipped with stream_k = false in every config row, keeping only the
+//     (it = blockIdx.x, jt = blockIdx.y) tiling arm. The nsys profile of 2026-09-09 showed why
+//     that was wrong: with the tiling grid the block count is out_features/128 times
+//     ceil(rows/128), so a 137-row prefill of a 5120-wide projection launches 40 blocks on 128
+//     SMs -- 0.31 of a wave. Those launches (ffn_down, gdn.out_proj, attn.o_proj: 128 of them
+//     per forward) were 26.4 of the 66.8 ms of a short prefill, i.e. 40% of the time to first
+//     token running on a third of the GPU. mmq.cuh:1233-1330 is therefore ported after all.
+//     What still differs from upstream: no MoE arm (no ids_dst / expert_bounds) and the fixup
+//     scratch comes from the caching allocator (divergence 7).
 //  3. THE CONFIG TABLE IS TEMPLATED ON THE TYPE INSTEAD OF LISTING 11 x 5 ROWS. Every Ada row of
 //     mmq-config-ampere.cuh is identical for every type this checkpoint uses -- 256 threads,
 //     occupancy 1, I = 128, K_vram = MMQ_ITER_K -- and differs only in sram_layout, which is a
@@ -56,6 +61,8 @@
 
 #include <cuda_fp16.h>
 
+#include <torch/all.h>   // divergence 7: the fixup scratch comes from the caching
+                        // allocator, not from ggml_cuda_pool_alloc
 #include "common_shim.cuh"
 #include "mma_int.cuh"
 #include "quantize_mmq.cuh"
@@ -209,11 +216,11 @@ template <ggml_type type>
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_ada(int J, bool fallback) {
     constexpr ggml_cuda_mmq_sram_layout layout = mmq_type_traits<type>::sram_layout;
 
-    CASE(type, 256, 1, 128,   8, layout, MMQ_ITER_K, false, false);
-    CASE(type, 256, 1, 128,  16, layout, MMQ_ITER_K, false, false);
-    CASE(type, 256, 1, 128,  32, layout, MMQ_ITER_K, false, false);
-    CASE(type, 256, 1, 128,  64, layout, MMQ_ITER_K, false, false);
-    CASE(type, 256, 1, 128, 128, layout, MMQ_ITER_K, false, false);
+    CASE(type, 256, 1, 128,   8, layout, MMQ_ITER_K, true, false);
+    CASE(type, 256, 1, 128,  16, layout, MMQ_ITER_K, true, false);
+    CASE(type, 256, 1, 128,  32, layout, MMQ_ITER_K, true, false);
+    CASE(type, 256, 1, 128,  64, layout, MMQ_ITER_K, true, false);
+    CASE(type, 256, 1, 128, 128, layout, MMQ_ITER_K, true, false);
 
     return ggml_cuda_mmq_config(GGML_TYPE_COUNT, 256, 1, 128, 64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, 256, false, true);
 }
@@ -316,10 +323,10 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
 // (divergence 2); the Blackwell FP4 ne_block selection (mmq.cuh:887-892) is dropped too.
 // ---------------------------------------------------------------------------------------------
 
-template <ggml_type type, int J, bool fallback, typename dst_t>
+template <ggml_type type, int J, bool fallback, bool fixup, typename dst_t>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
-        const int * __restrict__ ids_dst, dst_t * __restrict__ dst,
+        const int * __restrict__ ids_dst, dst_t * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
 
@@ -376,8 +383,16 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         __syncthreads();
     }
 
-    ggml_cuda_mmq_write_back_mma<type, J, fallback, dst_t>(
-        sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    if constexpr (fixup) {
+        // The fixup buffer is one full I x J tile per CUDA block: always float, always
+        // contiguous with stride I, and never clipped -- upstream passes I and J, one past the
+        // last valid index, on purpose, because the buffer has no ragged edge.
+        ggml_cuda_mmq_write_back_mma<type, J, fallback, float>(
+            sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), I, I, J);
+    } else {
+        ggml_cuda_mmq_write_back_mma<type, J, fallback, dst_t>(
+            sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -388,12 +403,14 @@ template <ggml_type type, int J, bool fallback, typename dst_t>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads<type, J, fallback>(), ggml_cuda_mmq_get_occupancy<type, J, fallback>())
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, dst_t * __restrict__ dst,
+        float * __restrict__ tmp_fixup,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x,
         const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y,
-        const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+        const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+        const uint3 ntx) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config<type>(J, fallback).type == GGML_TYPE_COUNT) {
@@ -422,30 +439,251 @@ static __global__ void mul_mat_q(
     }
     __syncthreads();
 
-    const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
-    const int wt = tmp2.x;
+    if constexpr (!ggml_cuda_mmq_get_stream_k<type, J, fallback>()) {
+        const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
+        const int wt = tmp2.x;
+        const int zt = tmp2.y;
+        const int jt = blockIdx.y;
+        const int it = blockIdx.x;
+
+        // Defaults for regular matrix multiplication (upstream's `if (ids_dst)` MoE arm is dropped):
+        const int col_diff   = ncols_dst;
+        int offset_y   = wt*stride_sample_y   + zt*stride_channel_y;
+        int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+
+        offset_y   += (jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        offset_dst += it*I;
+
+        const int tile_x_max_i = nrows_x  - it*I - 1;
+        const int tile_y_max_j = col_diff - jt*J - 1;
+
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x
+                           + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+
+        mul_mat_q_process_tile<type, J, fallback, false, dst_t>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
+             stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+        return;
+    }
+
+    // ---- stream-k, upstream mmq.cuh:1056-1232 ------------------------------------------------
+    // One CUDA block per SM instead of one per output tile: the blocks walk a single continuous
+    // index over (sample, channel, column tile, row tile, k block) and each takes an equal slice
+    // of it. A block that lands mid-tile writes its partial sum to tmp_fixup, and the fixup
+    // kernel adds it to whatever the block that finished that tile already wrote to dst.
+    constexpr int qk              = ftmma_type_traits<type>::qk;
+    constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram<type, J, fallback>();
+    constexpr int blocks_per_iter = ITER_K / qk;
+
+    const uint32_t nty = (nrows_x + I - 1) / I;
+
+    // kbc == k block continuous, the current index in that continuous space.
+    int kbc      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    int kbc_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+
+    kbc      -= fastmodulo(kbc,      blocks_per_ne00) % blocks_per_iter;
+    kbc_stop -= fastmodulo(kbc_stop, blocks_per_ne00) % blocks_per_iter;
+
+    // kb0 == the k index within the output tile being multiplied.
+    int kb0_start = fastmodulo(kbc, blocks_per_ne00);
+    int kb0_stop  = min(blocks_per_ne00.z, uint32_t(kb0_start + kbc_stop - kbc));
+    while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
+        int tmp = fastdiv(kbc, blocks_per_ne00);
+        uint2 tmp2 = fast_div_modulo(tmp, ntx);
+        const int jt = tmp2.y;
+        tmp = tmp2.x;
+        tmp2 = fast_div_modulo(tmp, nchannels_y);
+        const int zt = tmp2.y;
+        tmp = tmp2.x;
+        tmp2 = fast_div_modulo(tmp, nsamples_y);
+        const int wt = tmp2.y;
+        const int it = tmp2.x;
+
+        const int col_diff = ncols_dst;
+        int offset_y   = wt*stride_sample_y   + zt*stride_channel_y;
+        int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+
+        offset_y   += (jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        offset_dst += it*I;
+
+        const int tile_x_max_i = nrows_x  - it*I - 1;
+        const int tile_y_max_j = col_diff - jt*J - 1;
+
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x
+                           + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+
+        // This tile runs to its end, so it goes straight to dst; only the last, partial one
+        // can race another block.
+        mul_mat_q_process_tile<type, J, fallback, false, dst_t>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
+             stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+
+        kbc += blocks_per_ne00.z;
+        kbc -= fastmodulo(kbc, blocks_per_ne00);
+
+        kb0_start = 0;
+        kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
+    }
+
+    if (kbc >= kbc_stop) {
+        return;
+    }
+
+    {
+        int tmp = fastdiv(kbc, blocks_per_ne00);
+        uint2 tmp2 = fast_div_modulo(tmp, ntx);
+        const int jt = tmp2.y;
+        tmp = tmp2.x;
+        tmp2 = fast_div_modulo(tmp, nchannels_y);
+        const int zt = tmp2.y;
+        tmp = tmp2.x;
+        tmp2 = fast_div_modulo(tmp, nsamples_y);
+        const int wt = tmp2.y;
+        const int it = tmp2.x;
+
+        const int col_diff = ncols_dst;
+        int offset_y   = wt*stride_sample_y   + zt*stride_channel_y;
+        int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+
+        offset_y   += (jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+        offset_dst += it*I;
+
+        const int tile_x_max_i = nrows_x  - it*I - 1;
+        const int tile_y_max_j = col_diff - jt*J - 1;
+
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x
+                           + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+
+        // Last index: to the fixup buffer, so it cannot race the block that owns this tile.
+        mul_mat_q_process_tile<type, J, fallback, true, dst_t>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup,
+             stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// upstream mmq.cuh:1233-1330 -- the fixup kernel. It runs after mul_mat_q, in the same stream,
+// so it cannot race it. Each CUDA block looks BACKWARDS at the blocks before it: if one of them
+// ended inside this block's first tile, its partial sum is in tmp_fixup and gets added here.
+// The MoE arm (upstream :1338-1385, `if (ids_dst)`) is dropped with the rest of MoE.
+//
+// Precision: dst is dst_t (bf16 on this path), so a split tile is rounded once when the owning
+// block stores it and once more here, against one rounding for a whole tile. The partial sums
+// themselves are accumulated in float. This is the only numerical difference stream-k makes,
+// and it is bounded by one bf16 ulp of the output.
+// ---------------------------------------------------------------------------------------------
+
+template <ggml_type type, int J, bool fallback, typename dst_t>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads<type, J, fallback>()/2, 1)
+static __global__ void mul_mat_q_stream_k_fixup(
+        dst_t * __restrict__ dst, const float * __restrict__ tmp_last_tile,
+        const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
+        const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst,
+        const uint3 nsamples_y, const int stride_sample_dst, const uint3 ntx) {
+
+    if (ggml_cuda_mmq_get_config<type>(J, fallback).type == GGML_TYPE_COUNT) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int warp_size       = FTMMA_WARP_SIZE;
+    constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads<type, J, fallback>() / 2) / warp_size;
+    constexpr int I               = ggml_cuda_mmq_get_I<type, J, fallback>();
+    constexpr int qk              = ftmma_type_traits<type>::qk;
+    constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram<type, J, fallback>();
+    constexpr int blocks_per_iter = ITER_K / qk;
+
+    float sum[J / nwarps] = {0.0f};
+    const int i = blockIdx.y*warp_size + threadIdx.x;
+
+    const uint32_t nty = (nrows_x + I - 1) / I;
+
+    const int bidx0 = blockIdx.x;
+
+    int kbc0      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    int kbc0_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+
+    kbc0      -= fastmodulo(kbc0,      blocks_per_ne00) % blocks_per_iter;
+    kbc0_stop -= fastmodulo(kbc0_stop, blocks_per_ne00) % blocks_per_iter;
+
+    const bool did_not_have_any_data   = kbc0 == kbc0_stop;
+    const bool wrote_beginning_of_tile = fastmodulo(kbc0, blocks_per_ne00) == 0;
+    const bool did_not_write_last      = fastdiv(kbc0, blocks_per_ne00) == fastdiv(kbc0_stop, blocks_per_ne00)
+                                      && fastmodulo(kbc0_stop, blocks_per_ne00) != 0;
+    if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
+        return;
+    }
+
+    bool any_fixup = false;
+
+    // Walk backwards over the previous blocks and sum the partials they left behind.
+    int bidx = bidx0 - 1;
+    int kbc_stop = kbc0;
+    while (true) {
+        int kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+        kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
+
+        if (kbc == kbc_stop) {  // that block had no data at all
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+
+        any_fixup = true;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+
+            sum[j0/nwarps] += tmp_last_tile[bidx*(J*I) + j*I + i];
+        }
+
+        // If that block started in an earlier tile, there is nothing more to combine.
+        if (fastmodulo(kbc, blocks_per_ne00) == 0 || fastdiv(kbc, blocks_per_ne00) < fastdiv(kbc0, blocks_per_ne00)) {
+            break;
+        }
+        bidx--;
+        kbc_stop = kbc;
+    }
+
+    if (!any_fixup) {
+        return;
+    }
+
+    int tmp = fastdiv(kbc0, blocks_per_ne00);
+    uint2 tmp2 = fast_div_modulo(tmp, ntx);
+    const int jt = tmp2.y;
+    tmp = tmp2.x;
+    tmp2 = fast_div_modulo(tmp, nchannels_y);
     const int zt = tmp2.y;
-    const int jt = blockIdx.y;
-    const int it = blockIdx.x;
+    tmp = tmp2.x;
+    tmp2 = fast_div_modulo(tmp, nsamples_y);
+    const int wt = tmp2.y;
+    const int it = tmp2.x;
 
-    // Defaults for regular matrix multiplication (upstream's `if (ids_dst)` MoE arm is dropped):
-    const int col_diff   = ncols_dst;
-    int offset_y   = wt*stride_sample_y   + zt*stride_channel_y;
-    int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst;
+    const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst + it*I;
+    dst += offset_dst;
 
-    offset_y   += (jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
-    offset_dst += it*I;
+    const int i_max = nrows_x   - it*I - 1;
+    const int j_max = ncols_dst - jt*J - 1;
+    if (fallback && i > i_max) {
+        return;
+    }
 
-    const int tile_x_max_i = nrows_x  - it*I - 1;
-    const int tile_y_max_j = col_diff - jt*J - 1;
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += nwarps) {
+        const int j = j0 + threadIdx.y;
 
-    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x
-                       + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+        if (j > j_max) {
+            return;
+        }
 
-    mul_mat_q_process_tile<type, J, fallback, dst_t>
-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst,
-         stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+        // dst_t is bf16 here: read, add in float, store back rounded once.
+        dst[j*stride_col_dst + i] = (dst_t) (((float) dst[j*stride_col_dst + i]) + sum[j0/nwarps]);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -500,19 +738,67 @@ static void launch_mul_mat_q(const mmq_args<dst_t> & args, cudaStream_t stream) 
     const int sample_ratio  = args.nsamples_y  / args.nsamples_x;
 
     const uint3 blocks_per_ne00_fd = init_fastdiv_values(args.ncols_x / ftmma_type_traits<type>::qk);
+    const uint3 ntx_fd             = init_fastdiv_values(ntx);
     const uint3 nchannels_y_fd     = init_fastdiv_values(args.nchannels_y);
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    static_assert(!ggml_cuda_mmq_get_stream_k<type, J, fallback>(),
-                  "this port ships the non-stream-k arm only (divergence 2)");
+    if constexpr (!ggml_cuda_mmq_get_stream_k<type, J, fallback>()) {
+        mul_mat_q<type, J, fallback, dst_t><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+            (args.x, args.y, args.dst, nullptr,
+             blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+             channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+             sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+             ntx_fd);
+        return;
+    }
 
-    mul_mat_q<type, J, fallback, dst_t><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.dst,
+    // ---- stream-k, upstream mmq.cuh:1431-1467 ------------------------------------------------
+    // With one block per tile the fixup kernel is not needed at all, so it is worth using the
+    // tiled grid when the tiles already fill the machine (>= 90% of the last wave). Otherwise
+    // one block per SM, which is the whole point: a 5120-wide projection has 40 tiles and would
+    // otherwise leave 88 of 128 SMs idle.
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    const int ntiles_dst = ntx * nty * ntzw;
+    const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
+    const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
+    const dim3 block_nums_stream_k(tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+
+    GGML_ASSERT((int64_t) ntiles_dst * blocks_per_ne00_fd.z < (1 << 30));  // kbc must not overflow
+
+    const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+
+    // divergence 7: upstream takes this from the backend's ggml_cuda_pool; here it comes from
+    // the caching allocator, which is what the rest of this extension uses.
+    at::Tensor tmp_fixup;
+    float *    tmp_fixup_ptr = nullptr;
+    if (fixup_needed) {
+        tmp_fixup = torch::empty(
+            {(int64_t) block_nums_stream_k.x * config.J * config.I},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, id));
+        tmp_fixup_ptr = tmp_fixup.data_ptr<float>();
+    }
+
+    mul_mat_q<type, J, fallback, dst_t><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+        (args.x, args.y, args.dst, tmp_fixup_ptr,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
-         sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst);
+         sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+         ntx_fd);
+
+    if (!fixup_needed) {
+        return;
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+
+    const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
+    const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
+    mul_mat_q_stream_k_fixup<type, J, fallback, dst_t><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
+        (args.dst, tmp_fixup_ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+         args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+         ntx_fd);
 }
 
 // ---------------------------------------------------------------------------------------------
