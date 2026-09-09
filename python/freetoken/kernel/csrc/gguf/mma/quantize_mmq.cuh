@@ -184,9 +184,30 @@ struct alignas(4 * sizeof(scalar_t)) ftmma_vec4 {
     scalar_t v[4];
 };
 
-template <typename scalar_t, mmq_q8_1_ds_layout ds_layout>
+// silu(gate) * up, computed EXACTLY as the triton act_and_mul kernel computes it
+// (kernel/triton/activation.py): the same ex2.approx.f32 instruction on the same operand, and
+// then a round to scalar_t, because that kernel stores its bf16 result before this one reads
+// it. Folding the two together must not change a bit of what the model sees.
+static __device__ __forceinline__ float ftmma_ex2_approx(const float v) {
+    float r;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(r) : "f"(v));
+    return r;
+}
+
+template <typename scalar_t>
+static __device__ __forceinline__ float ftmma_swiglu(const float gate, const float up) {
+    constexpr float log2e = 1.4426950408889634f;   // triton's _LOG2E
+    const float act = gate / (1.0f + ftmma_ex2_approx(-gate * log2e));
+    return static_cast<float>(static_cast<scalar_t>(act * up));
+}
+
+// ``up`` non-null folds silu(x) * up into the quantization: the SwiGLU's output is consumed by
+// exactly one matmul, and writing it out in bf16 only for this kernel to read it back cost a
+// 74 MB round trip per layer.
+template <typename scalar_t, mmq_q8_1_ds_layout ds_layout, bool fuse_swiglu>
 static __global__ void quantize_mmq_q8_1(
-        const scalar_t * __restrict__ x, void * __restrict__ vy,
+        const scalar_t * __restrict__ x, const scalar_t * __restrict__ up,
+        void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2) {
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
@@ -216,10 +237,19 @@ static __global__ void quantize_mmq_q8_1(
     float x0 = 0.0f, x1 = 0.0f, x2 = 0.0f, x3 = 0.0f;
     if (i0 < ne00) {
         const ftmma_vec4<scalar_t> xi = *((const ftmma_vec4<scalar_t> *) (x + (base_idx + i00)));
-        x0 = static_cast<float>(xi.v[0]);
-        x1 = static_cast<float>(xi.v[1]);
-        x2 = static_cast<float>(xi.v[2]);
-        x3 = static_cast<float>(xi.v[3]);
+        if (fuse_swiglu) {
+            const ftmma_vec4<scalar_t> ui =
+                *((const ftmma_vec4<scalar_t> *) (up + (base_idx + i00)));
+            x0 = ftmma_swiglu<scalar_t>((float) xi.v[0], (float) ui.v[0]);
+            x1 = ftmma_swiglu<scalar_t>((float) xi.v[1], (float) ui.v[1]);
+            x2 = ftmma_swiglu<scalar_t>((float) xi.v[2], (float) ui.v[2]);
+            x3 = ftmma_swiglu<scalar_t>((float) xi.v[3], (float) ui.v[3]);
+        } else {
+            x0 = static_cast<float>(xi.v[0]);
+            x1 = static_cast<float>(xi.v[1]);
+            x2 = static_cast<float>(xi.v[2]);
+            x3 = static_cast<float>(xi.v[3]);
+        }
     }
     float amax = fabsf(x0);
     amax = fmaxf(amax, fabsf(x1));
@@ -310,7 +340,7 @@ static void quantize_mmq_q8_1_cuda(
         const scalar_t * x, void * vy, const ftmma_type type_x,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
-        cudaStream_t stream) {
+        cudaStream_t stream, const scalar_t * up = nullptr) {
     FTMMA_ASSERT(ne00 % 4 == 0);
     FTMMA_ASSERT(s01 % 4 == 0);  // the 4-wide vector load needs 4*sizeof(scalar_t) alignment
     FTMMA_ASSERT(ne0 % QK8_1_MMQ == 0);
@@ -325,12 +355,26 @@ static void quantize_mmq_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_x)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<scalar_t, MMQ_Q8_1_DS_LAYOUT_D4><<<num_blocks, block_size, 0, stream>>>(
-                x, vy, ne00, s01, s02, s03, ne0, (int) ne1, (int) ne2);
+            if (up) {
+                quantize_mmq_q8_1<scalar_t, MMQ_Q8_1_DS_LAYOUT_D4, true>
+                    <<<num_blocks, block_size, 0, stream>>>(
+                        x, up, vy, ne00, s01, s02, s03, ne0, (int) ne1, (int) ne2);
+            } else {
+                quantize_mmq_q8_1<scalar_t, MMQ_Q8_1_DS_LAYOUT_D4, false>
+                    <<<num_blocks, block_size, 0, stream>>>(
+                        x, nullptr, vy, ne00, s01, s02, s03, ne0, (int) ne1, (int) ne2);
+            }
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<scalar_t, MMQ_Q8_1_DS_LAYOUT_DS4><<<num_blocks, block_size, 0, stream>>>(
-                x, vy, ne00, s01, s02, s03, ne0, (int) ne1, (int) ne2);
+            if (up) {
+                quantize_mmq_q8_1<scalar_t, MMQ_Q8_1_DS_LAYOUT_DS4, true>
+                    <<<num_blocks, block_size, 0, stream>>>(
+                        x, up, vy, ne00, s01, s02, s03, ne0, (int) ne1, (int) ne2);
+            } else {
+                quantize_mmq_q8_1<scalar_t, MMQ_Q8_1_DS_LAYOUT_DS4, false>
+                    <<<num_blocks, block_size, 0, stream>>>(
+                        x, nullptr, vy, ne00, s01, s02, s03, ne0, (int) ne1, (int) ne2);
+            }
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             // DIVERGENCE 5: not instantiated -- Q2_K only, and this checkpoint has no Q2_K.

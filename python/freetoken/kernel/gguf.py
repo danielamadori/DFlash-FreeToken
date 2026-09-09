@@ -191,6 +191,15 @@ def ggml_mul_mat_mma(
     return _module().ggml_mul_mat_mma(weight, x, quant_type, row)
 
 
+def ggml_mul_mat_mma_swiglu(
+    weight: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, quant_type: int, row: int
+) -> torch.Tensor:
+    """``ggml_mul_mat_mma`` over ``silu(gate) * up``, with the activation folded into the
+    quantization the MMQ has to do anyway. Same conditions as ``ggml_mul_mat_mma``; raises
+    rather than falling back. ``row`` = output features."""
+    return _module().ggml_mul_mat_mma_swiglu(weight, gate, up, quant_type, row)
+
+
 def ggml_moe_a8(
     x: torch.Tensor,
     weight: torch.Tensor,

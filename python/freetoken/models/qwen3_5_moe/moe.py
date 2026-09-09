@@ -55,8 +55,20 @@ class _SharedExpert(BaseOP):
             and proj.parts[0].out_size == proj.parts[1].out_size
         ):
             gate, up = parts_fn(x)
+            return self._down(gate, up)
+        fused = proj.forward(x)
+        d = fused.shape[-1] // 2
+        return self._down(fused[..., :d], fused[..., d:])
+
+    def _down(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """silu(gate) * up, then down_proj -- fused into one kernel where the weight type
+        allows it, so the activation is never written out just to be read back."""
+        fuse = getattr(self.down_proj, "forward_swiglu", None)
+        if fuse is not None:
+            return fuse(gate, up)
+        if gate.is_contiguous() and up.is_contiguous():
             return self.down_proj.forward(silu_and_mul_pair(gate, up))
-        return self.down_proj.forward(silu_and_mul(proj.forward(x)))
+        return self.down_proj.forward(silu_and_mul(torch.cat([gate, up], dim=-1)))
 
 
 class Qwen3_5DenseMLP(_SharedExpert):

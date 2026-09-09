@@ -465,6 +465,47 @@ torch::Tensor ggml_mul_mat_mma(
   return Y;
 }
 
+torch::Tensor ggml_mul_mat_mma_swiglu(
+    torch::Tensor W,     // quant weight
+    torch::Tensor GATE,  // gate half of the SwiGLU
+    torch::Tensor UP,    // up half
+    int64_t type,
+    int64_t row) {
+  // Same matmul as ggml_mul_mat_mma, with the activation being silu(GATE) * UP. The MMQ has to
+  // quantize its activation to q8_1 anyway, so it does the SwiGLU while it is there instead of
+  // reading back a bf16 tensor another kernel just wrote: 74 MB per layer, each way.
+  TORCH_CHECK(GATE.dim() == 2 && UP.dim() == 2, "ggml_mul_mat_mma_swiglu: inputs must be 2-D");
+  TORCH_CHECK(GATE.sizes() == UP.sizes(), "ggml_mul_mat_mma_swiglu: gate and up must match");
+  TORCH_CHECK(GATE.scalar_type() == UP.scalar_type(),
+              "ggml_mul_mat_mma_swiglu: gate and up must have the same dtype");
+  // Rows need not be packed -- the common case is gate and up being the two halves of one
+  // [rows, 2d] tensor -- but the elements of a row must be, and both sides need the same pitch.
+  TORCH_CHECK(GATE.stride(1) == 1 && UP.stride(1) == 1,
+              "ggml_mul_mat_mma_swiglu: gate and up rows must be contiguous");
+  TORCH_CHECK(GATE.stride(0) == UP.stride(0),
+              "ggml_mul_mat_mma_swiglu: gate and up must share a row stride");
+  TORCH_CHECK(W.is_contiguous(), "ggml_mul_mat_mma_swiglu: W must be contiguous");
+  const int col = GATE.sizes()[1];
+  const int batch = GATE.sizes()[0];
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(GATE));
+  auto options = torch::TensorOptions().dtype(GATE.dtype()).device(W.device());
+  at::Tensor Y = torch::empty({batch, row}, options);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+  bool ok = false;
+  DISPATCH_FLOAT_TYPES(GATE.scalar_type(), "ggml_mul_mat_mma_swiglu", [&] {
+    ok = ftmma::ftmma_mul_mat<scalar_t>(
+        (int)type, (const void*)W.data_ptr(), (const scalar_t*)GATE.data_ptr(),
+        (scalar_t*)Y.data_ptr(), col, (int)row, batch, stream, (const scalar_t*)UP.data_ptr(),
+        GATE.stride(0));
+  });
+  TORCH_CHECK(ok,
+              "ggml_mul_mat_mma_swiglu: unsupported request (GGUF quant type ", type,
+              ", in_features ", col, ", out_features ", row, ", rows ", batch,
+              "). Same conditions as ggml_mul_mat_mma; the caller must fall back to a separate "
+              "silu_and_mul followed by an ordinary matmul.");
+  return Y;
+}
+
 torch::Tensor ggml_moe_a8(
     torch::Tensor X,  // input
     torch::Tensor W,  // expert weights
@@ -988,6 +1029,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_mul_mat_vec_a8", &ggml_mul_mat_vec_a8, "");
   m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8, "");
   m.def("ggml_mul_mat_mma", &ggml_mul_mat_mma, "");
+  m.def("ggml_mul_mat_mma_swiglu", &ggml_mul_mat_mma_swiglu, "");
   m.def("ggml_moe_a8", &ggml_moe_a8, "");
   m.def("ggml_moe_a8_vec", &ggml_moe_a8_vec, "");
   m.def("ggml_moe_get_block_size", &ggml_moe_get_block_size, "");

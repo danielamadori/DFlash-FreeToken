@@ -111,7 +111,8 @@ static inline bool ftmma_mul_mat_shape_supported(
 template <typename scalar_t>
 bool ftmma_mul_mat(
         const int type, const void * vx, const scalar_t * x, scalar_t * dst,
-        const int ncols, const int nrows, const int nvecs, cudaStream_t stream) {
+        const int ncols, const int nrows, const int nvecs, cudaStream_t stream,
+        const scalar_t * up = nullptr, const int64_t x_stride_row = -1) {
 
     if (!ftmma_mul_mat_shape_supported(type, ncols, nrows, nvecs)) {
         return false;
@@ -131,10 +132,16 @@ bool ftmma_mul_mat(
                           .device(torch::kCUDA, ggml_cuda_get_device());
     at::Tensor y_q8_1 = torch::empty({(int64_t) (nbytes_y / sizeof(int))}, opts);
 
+    // ``up`` non-null: the activation is silu(x) * up, folded into this quantization instead
+    // of being written out in bf16 by a separate kernel and read straight back.
+    // x_stride_row < 0 means "rows are packed", the ordinary case. A fused SwiGLU whose gate
+    // and up are the two halves of one tensor passes 2*ncols instead: same rows, twice the
+    // pitch, and the two pointers ncols apart.
+    const int64_t s01 = x_stride_row < 0 ? ne00 : x_stride_row;
     quantize_mmq_q8_1_cuda<scalar_t>(
         x, y_q8_1.data_ptr(), type_x,
-        /*ne00=*/ne00, /*s01=*/ne00, /*s02=*/ne00*ne1, /*s03=*/ne00*ne1,
-        /*ne0=*/ne0, /*ne1=*/ne1, /*ne2=*/1, /*ne3=*/1, stream);
+        /*ne00=*/ne00, /*s01=*/s01, /*s02=*/s01*ne1, /*s03=*/s01*ne1,
+        /*ne0=*/ne0, /*ne1=*/ne1, /*ne2=*/1, /*ne3=*/1, stream, up);
     CUDA_CHECK(cudaGetLastError());
 
     // ---- mmq_args, upstream mmq.cu:162-174 --------------------------------------------------

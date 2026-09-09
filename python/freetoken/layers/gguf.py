@@ -202,6 +202,32 @@ class GGUFLinear(BaseOP):
             out = out + self.bias
         return out
 
+    def forward_swiglu(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        """``forward(silu(gate) * up)`` with the activation folded into the matmul.
+
+        The tensor-core MMQ quantizes its activation to q8_1 before multiplying, so it can do
+        the SwiGLU while it is there. Written out separately, that activation is 74 MB per
+        layer of the 27B, written by one kernel and read straight back by the next.
+
+        Only the MMQ path can fuse; every other branch of the dispatch falls back to the
+        two-step form, which is what the caller would have done anyway.
+        """
+        block, type_size = BLOCK_SHAPE.get(self._quant_type, (0, 0))
+        in_features = self.qweight.shape[1] // type_size * block if type_size else 0
+        if self.bias is None and gate.stride(-1) == 1 and up.stride(-1) == 1 and _use_mma(
+            self._quant_type, gate.shape[0], self.out_features, in_features
+        ):
+            from freetoken.kernel.gguf import ggml_mul_mat_mma_swiglu
+
+            return ggml_mul_mat_mma_swiglu(
+                self.qweight, gate, up, self._quant_type, self.out_features
+            )
+        from freetoken.layers.activation import silu_and_mul_pair
+
+        # The two-step form needs packed rows; on this path (few rows, or a type the MMQ does
+        # not carry) the tensors are small and the copy is not what the time goes on.
+        return self.forward(silu_and_mul_pair(gate.contiguous(), up.contiguous()))
+
 
 class GGUFLMHead(GGUFLinear):
     """LM head over a native GGUF ``output.weight`` (untied embeddings).
