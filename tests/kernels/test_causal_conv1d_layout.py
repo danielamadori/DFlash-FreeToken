@@ -56,3 +56,38 @@ def test_the_view_really_is_a_view():
     property the change is about: a token-major input is not materialised."""
     x = torch.randn(64, CONV_DIM, dtype=torch.bfloat16, device="cuda").transpose(0, 1)
     assert x.stride(-1) != 1 and x.stride(0) == 1, "this is the layout the GDN hands over"
+
+
+@pytest.mark.parametrize("lengths", [(127,), (2129,), (8, 40, 79)])
+def test_per_channel_split_matches_one_call(lengths):
+    """The GDN runs the convolution once per q/k/v slice so each output is contiguous. The
+    convolution is depthwise, so this must be exactly the same answer as one call over all the
+    channels -- both for the output and for the conv-state tail written back per slot."""
+    total = sum(lengths)
+    widths = (2048, 2048, 6144)          # the 27B's key_dim, key_dim, value_dim
+    assert sum(widths) == CONV_DIM
+    torch.manual_seed(11)
+    src = torch.randn(total, CONV_DIM, dtype=torch.bfloat16, device="cuda") * 0.2
+    weight = torch.randn(CONV_DIM, WIDTH, dtype=torch.bfloat16, device="cuda") * 0.3
+    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda")
+    idx = torch.arange(len(lengths), dtype=torch.int32, device="cuda")
+    has_init = torch.ones(len(lengths), dtype=torch.bool, device="cuda")
+    states0 = torch.randn(len(lengths), CONV_DIM, WIDTH - 1, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    st_whole = states0.clone()
+    whole = _run(src.transpose(0, 1), weight, st_whole, cu, idx, has_init).transpose(0, 1)
+
+    st_split = states0.clone()
+    outs, start = [], 0
+    for w in widths:
+        stop = start + w
+        outs.append(
+            _run(src[:, start:stop].transpose(0, 1), weight[start:stop],
+                 st_split[:, start:stop], cu, idx, has_init).transpose(0, 1)
+        )
+        start = stop
+
+    for o in outs:
+        assert o.is_contiguous(), "the whole point is that each slice comes out contiguous"
+    assert torch.equal(torch.cat(outs, dim=-1), whole)
+    assert torch.equal(st_split, st_whole)

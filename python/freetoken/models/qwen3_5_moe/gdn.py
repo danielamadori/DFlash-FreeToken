@@ -198,17 +198,34 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def _conv_weight(self) -> torch.Tensor:
         return self.conv1d.weight.squeeze(1)  # [conv_dim, kernel] for the fused kernel
 
-    def _conv_prefill(self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state) -> torch.Tensor:
-        """Varlen causal conv (fused sgl_kernel) with silu; reads/updates each request's
-        conv state in place by ``cache_indices`` slot. ``conv_in`` [total, conv_dim].
-        ``cu_seqlens`` / ``cache_indices`` / ``has_initial_state`` come from FLAMetadata."""
+    def _conv_prefill_split(
+        self, conv_in, pool, cu_seqlens, cache_indices, has_initial_state
+    ) -> list[torch.Tensor]:
+        """The same convolution, written straight into three contiguous buffers: q, k and v.
+
+        The convolution is depthwise, so cutting it by channel changes no arithmetic -- every
+        output element depends on its own channel and nothing else. What it buys is the layout.
+        With one wide output, q/k/v are column slices of it, and the fla chunk kernels make
+        every argument contiguous (``kernel/fla/utils.py`` ``input_guard``), so each slice is
+        copied: 9.95 ms per 2129-token prefill. Three outputs are contiguous already.
+        """
         li = pool.local_index(self.layer_id)
-        # A VIEW, not a copy: the conv kernel reads either layout, and materialising this one
-        # cost 14.4 ms per 2129-token prefill -- three times the convolution itself.
-        x = conv_in.transpose(0, 1)  # [conv_dim, total]
-        out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
-                                   cu_seqlens, cache_indices, has_initial_state)
-        return out.transpose(0, 1)  # [total, conv_dim]
+        weight = self._conv_weight()
+        states = pool.conv_states[li]
+        outs = []
+        start = 0
+        for width in (self.key_dim, self.key_dim, self.value_dim):
+            stop = start + width
+            outs.append(
+                causal_conv1d_varlen(
+                    conv_in[:, start:stop].transpose(0, 1),  # a view: token-major, no copy
+                    weight[start:stop],
+                    states[:, start:stop],
+                    cu_seqlens, cache_indices, has_initial_state,
+                ).transpose(0, 1)  # [total, width], contiguous
+            )
+            start = stop
+        return outs
 
     def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:
         """Single-token causal conv update (fused sgl_kernel) by ``table_idx`` slot;
@@ -331,12 +348,13 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 from .model import _PENDING_EVENTS
                 ev = lambda: (lambda e: (e.record(), e)[1])(torch.cuda.Event(enable_timing=True))
                 t_conv0 = ev()
-            mixed = self._conv_prefill(
+            qf, kf, vf = self._conv_prefill_split(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
             if timing:
                 t_conv1 = ev()
             # fla chunk handles GQA in-kernel: q/k stay at num_k_heads, v at num_v_heads.
-            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            # Each of the three is contiguous, so these reshapes are views and the chunk
+            # kernels' input_guard has nothing left to copy.
             q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
