@@ -90,6 +90,10 @@ class EnvClassSingleton:
     # default because the ranges are only useful under a profiler; they never synchronise, so
     # unlike the phase timers they do not change what they measure.
     SPEC_NVTX = EnvBool(False)
+
+    # Scompone il tempo al primo token nei suoi confini (invio, tokenizzazione, primo ack dal
+    # motore, primo evento formattato) e logga una riga per richiesta. Spento per default.
+    TTFT_MARKS = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state

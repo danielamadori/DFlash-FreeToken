@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import contextvars
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -22,8 +23,12 @@ from typing import Any
 
 from . import request_ring
 from freetoken.core import SamplingParams
+from freetoken.env import ENV
+from freetoken.utils import init_logger
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
+
+logger = init_logger(__name__)
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -258,9 +263,50 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
+# Marche per scomporre il tempo al primo token. Il ring registra gia' ttft_ms, ma un numero solo
+# non dice dove va: la misura del 2026-09-09 ha trovato ~62 ms fuori dal motore contro 54 di
+# prefill, e senza queste non si sa se sono la tokenizzazione, i salti fra processi o la
+# formattazione. Costano una lettura di orologio per confine e sono spente per default.
+_TTFT_MARKS: contextvars.ContextVar = contextvars.ContextVar("freetoken_ttft_marks", default=None)
+
+
+def _ttft_begin(start: float) -> dict | None:
+    """Apre il dizionario delle marche nel contesto del task. Lo crea chi arriva per primo
+    (submit_generation), e il generatore di eventi lo ritrova: se lo ricreasse perderebbe
+    tutto quello che succede prima del primo evento."""
+    if not ENV.TTFT_MARKS:
+        return None
+    marks = _TTFT_MARKS.get()
+    if marks is None:
+        marks = {"start": start}
+        _TTFT_MARKS.set(marks)
+    return marks
+
+
+def _mark(name: str) -> None:
+    marks = _TTFT_MARKS.get()
+    if marks is not None and name not in marks:
+        marks[name] = time.monotonic()
+
+
+def _mark_ack(ack: Any) -> None:
+    """Le prime tre conferme del motore, con quello che portano. Un solo numero per il primo
+    token non distingue "il motore ha preso in carico" da "il prefill e' finito": il conteggio
+    dei token di prompt e la lunghezza del testo, messi nel nome della marca, lo dicono."""
+    marks = _TTFT_MARKS.get()
+    if marks is None:
+        return
+    n = marks.get("_n", 0) + 1
+    marks["_n"] = n
+    if n <= 3:
+        testo = len(getattr(ack, "incremental_output", "") or "")
+        marks[f"ack{n}[{getattr(ack, 'prompt_tokens_delta', 0)}p,{testo}c]"] = time.monotonic()
+
+
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    _ttft_begin(time.monotonic())
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -271,6 +317,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             tools=spec.template_tools,
         )
     )
+    _mark("sent")
     return uid
 
 
@@ -497,6 +544,7 @@ async def generate_events(
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
     if the drop lands before `GenDone`, the only event carrying the totals."""
     start = time.monotonic()
+    marks = _ttft_begin(start)
     prompt_tokens = 0
     completion_tokens = 0
     first_token_at: float | None = None
@@ -508,11 +556,23 @@ async def generate_events(
                 completion_tokens = ev.completion_tokens
             elif first_token_at is None:
                 first_token_at = time.monotonic()
+                _mark("first_event")
             yield ev
     except GenerationError as exc:
         error = str(exc)
         raise
     finally:
+        if marks is not None and len(marks) > 1:
+            have = sorted(((n, t) for n, t in marks.items() if not n.startswith("_")),
+                          key=lambda nt: nt[1])
+            segs = " ".join(
+                f"{a}->{b}={(marks[b] - marks[a]) * 1000:.1f}"
+                for (a, _), (b, _) in zip(have, have[1:])
+            )
+            logger.info(
+                "marche ttft (ms): %s | totale=%.1f | t_start=%.3f", segs,
+                (have[-1][1] - marks["start"]) * 1000, marks["start"],
+            )
         _record_generation(
             source=source, stream=True, start=start,
             prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, error=error,
@@ -648,6 +708,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
+        _mark_ack(ack)
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
         prompt_tokens += ack.prompt_tokens_delta
@@ -748,6 +809,7 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
+        _mark_ack(ack)
         if getattr(ack, "error", None):
             raise GenerationError(ack.error, getattr(ack, "error_code", None))
         prompt_tokens += ack.prompt_tokens_delta

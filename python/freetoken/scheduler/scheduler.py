@@ -358,7 +358,32 @@ class Scheduler(SchedulerIOMixin):
         self._flush_abort_acks()
         return ongoing_data
 
+    def _traccia_avvio(self, forward_input, t_inizio: float, t_dopo_sched: float) -> None:
+        """Le prime passate dopo un prefill: quante ne servono al primo token e quanto costa
+        ciascuna. La conferma "prompt ammesso" parte prima del forward, quindi dal lato client
+        prefill e prima decodifica finiscono nello stesso intervallo e non si distinguono.
+        Solo con FREETOKEN_TTFT_MARKS=1."""
+        batch = forward_input.batch
+        if batch.phase == "prefill":
+            self._passi_avvio = 0
+        elif getattr(self, "_passi_avvio", None) is None:
+            return
+        n = self._passi_avvio
+        if n > 6:
+            return
+        self._passi_avvio = n + 1
+        ora = time.monotonic()
+        logger.info(
+            "traccia avvio: passo=%d fase=%s richieste=%d token=%d schedule=%.1f "
+            "forward+post=%.1f totale=%.1f ms",
+            n, batch.phase, len(batch.reqs), int(batch.input_ids.numel()),
+            (t_dopo_sched - t_inizio) * 1000, (ora - t_dopo_sched) * 1000,
+            (ora - t_inizio) * 1000,
+        )
+
     def normal_loop(self) -> None:
+        traccia = ENV.TTFT_MARKS
+        t_inizio = time.monotonic() if traccia else 0.0
         blocking = not (
             self.prefill_manager.runnable
             or self.decode_manager.runnable
@@ -375,15 +400,23 @@ class Scheduler(SchedulerIOMixin):
         ):
             self._execute_pending_rebuild()
 
-        forward_input = self._schedule_next_batch()
+        with _step("schedule"):
+            forward_input = self._schedule_next_batch()
+        t_dopo_sched = time.monotonic() if traccia else 0.0
         ongoing_data = None
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
-            self._restore_linear_states(forward_input.batch)
-            ongoing_data = (forward_input, self._forward(forward_input))
+            phase = "decode" if forward_input.batch.is_decode else "prefill"
+            with _step(f"restore:{phase}"):
+                self._restore_linear_states(forward_input.batch)
+            with _step(phase):
+                ongoing_data = (forward_input, self._forward(forward_input))
 
-        self._process_last_data(ongoing_data)
-        self._flush_abort_acks()
+        with _step("post"):
+            self._process_last_data(ongoing_data)
+            self._flush_abort_acks()
+        if traccia and forward_input is not None:
+            self._traccia_avvio(forward_input, t_inizio, t_dopo_sched)
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -970,17 +1003,20 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        with _step("sched:pick"):
+            batch = (
+                self.prefill_manager.schedule_next_batch(self.prefill_budget)
+                or self.decode_manager.schedule_next_batch()
+            )
         if batch is None:
             return None
         # getattr: the scheduler unit tests call this on instances built without __init__.
         if getattr(self, "_speculative_enabled", False):
             self._maybe_draft(batch)
-        forward_input = self._prepare_batch(batch)
-        self._report_prompt_admissions(batch)
+        with _step("sched:prepare"):
+            forward_input = self._prepare_batch(batch)
+        with _step("sched:report"):
+            self._report_prompt_admissions(batch)
         return forward_input
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
