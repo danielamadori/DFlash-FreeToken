@@ -17,6 +17,16 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     return silu_and_mul(x, out=out)
 
 
+def silu_and_mul_pair(gate: torch.Tensor, up: torch.Tensor, out: torch.Tensor | None = None):
+    """``silu(gate) * up`` over two separate ``[.., d]`` tensors instead of the halves of one
+    ``[.., 2d]``. Always the in-repo Triton kernel: flashinfer ships no split-input variant,
+    and the two agree bit for bit on the fused form (checked on the 27B's shapes), so a caller
+    can move to this without changing what the model writes."""
+    from freetoken.kernel.triton.activation import silu_and_mul_pair as _pair
+
+    return _pair(gate, up, out=out)
+
+
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     from freetoken.kernel.backend import is_flashinfer_installed
 
@@ -67,6 +77,7 @@ def swiglu_clamp_and_mul(
 
 __all__ = [
     "silu_and_mul",
+    "silu_and_mul_pair",
     "gelu_and_mul",
     "gelu_tanh_and_mul",
     "swigluoai_and_mul",

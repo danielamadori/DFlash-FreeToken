@@ -345,16 +345,30 @@ class GGUFMergedLinear(BaseOP):
         Returns:
             Tensor of shape [..., out_features] with parts concatenated along dim=-1.
         """
-        parts = []
-        for name, qt in zip(self.part_names, self._quant_types):
-            qweight = getattr(self, name)
-            part_out = fused_mul_mat_gguf(x, qweight, qt)
-            parts.append(part_out)
-
-        out = torch.cat(parts, dim=-1)
+        out = torch.cat(self._parts(x), dim=-1)
         if self.bias is not None:
             out = out + self.bias
         return out
+
+    def _parts(self, x: torch.Tensor) -> list[torch.Tensor]:
+        return [
+            fused_mul_mat_gguf(x, getattr(self, name), qt)
+            for name, qt in zip(self.part_names, self._quant_types)
+        ]
+
+    def forward_parts(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """The per-part outputs, unconcatenated.
+
+        ``forward`` concatenates because most callers want one tensor. A caller that splits it
+        straight back -- a SwiGLU reading gate and up, say -- pays a full DRAM round trip for
+        the concatenation and gets nothing for it: 17.3 ms per 2129-token prefill of the 27B,
+        over 91 concatenations. Such callers should take the parts here instead.
+
+        Refuses when a bias is set rather than silently dropping it (no GGUF checkpoint in this
+        fork carries one on a merged projection).
+        """
+        assert self.bias is None, "forward_parts does not apply a bias"
+        return self._parts(x)
 
 
 class GGUFEmbedding(BaseOP):

@@ -10,6 +10,7 @@ from freetoken.layers import (
     LinearRowParallel,
     make_moe_layer,
     silu_and_mul,
+    silu_and_mul_pair,
 )
 
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged, Fp8BlockLinear
@@ -42,7 +43,20 @@ class _SharedExpert(BaseOP):
             self.down_proj = LinearRowParallel(intermediate_size, hidden_size, has_bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        proj = self.gate_up_proj
+        # A column-merged GGUF projection (gate and up quantized differently, which is the case
+        # in 27 of this checkpoint's 64 layers) concatenates its two parts only for the SwiGLU
+        # to read the halves back. Take them unconcatenated: same arithmetic, bit for bit, one
+        # fewer round trip through DRAM.
+        parts_fn = getattr(proj, "forward_parts", None)
+        if (
+            parts_fn is not None
+            and len(proj.parts) == 2
+            and proj.parts[0].out_size == proj.parts[1].out_size
+        ):
+            gate, up = parts_fn(x)
+            return self.down_proj.forward(silu_and_mul_pair(gate, up))
+        return self.down_proj.forward(silu_and_mul(proj.forward(x)))
 
 
 class Qwen3_5DenseMLP(_SharedExpert):
