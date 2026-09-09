@@ -263,17 +263,17 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
-# Marche per scomporre il tempo al primo token. Il ring registra gia' ttft_ms, ma un numero solo
-# non dice dove va: la misura del 2026-09-09 ha trovato ~62 ms fuori dal motore contro 54 di
-# prefill, e senza queste non si sa se sono la tokenizzazione, i salti fra processi o la
-# formattazione. Costano una lettura di orologio per confine e sono spente per default.
+# Marks that decompose the time to first token. The ring already records ttft_ms, but one
+# number does not say where it went: without these, the milliseconds before the engine answers
+# could be tokenization, the hops between processes, or the formatting, and there is no way to
+# tell. They cost one clock read per boundary and are off by default.
 _TTFT_MARKS: contextvars.ContextVar = contextvars.ContextVar("freetoken_ttft_marks", default=None)
 
 
 def _ttft_begin(start: float) -> dict | None:
-    """Apre il dizionario delle marche nel contesto del task. Lo crea chi arriva per primo
-    (submit_generation), e il generatore di eventi lo ritrova: se lo ricreasse perderebbe
-    tutto quello che succede prima del primo evento."""
+    """Open the marks dict in the task context. Whoever arrives first creates it
+    (submit_generation) and the event generator finds it again: were the generator to create
+    its own, every leg before the first event would be lost."""
     if not ENV.TTFT_MARKS:
         return None
     marks = _TTFT_MARKS.get()
@@ -290,17 +290,17 @@ def _mark(name: str) -> None:
 
 
 def _mark_ack(ack: Any) -> None:
-    """Le prime tre conferme del motore, con quello che portano. Un solo numero per il primo
-    token non distingue "il motore ha preso in carico" da "il prefill e' finito": il conteggio
-    dei token di prompt e la lunghezza del testo, messi nel nome della marca, lo dicono."""
+    """The engine's first three acks, with what they carry. One timestamp cannot tell
+    "the engine took the request" from "the prefill is done": the prompt-token count and the
+    text length, carried in the mark's own name, can."""
     marks = _TTFT_MARKS.get()
     if marks is None:
         return
     n = marks.get("_n", 0) + 1
     marks["_n"] = n
     if n <= 3:
-        testo = len(getattr(ack, "incremental_output", "") or "")
-        marks[f"ack{n}[{getattr(ack, 'prompt_tokens_delta', 0)}p,{testo}c]"] = time.monotonic()
+        text_len = len(getattr(ack, "incremental_output", "") or "")
+        marks[f"ack{n}[{getattr(ack, 'prompt_tokens_delta', 0)}p,{text_len}c]"] = time.monotonic()
 
 
 async def submit_generation(spec: GenSpec, state: Any) -> int:
@@ -570,7 +570,7 @@ async def generate_events(
                 for (a, _), (b, _) in zip(have, have[1:])
             )
             logger.info(
-                "marche ttft (ms): %s | totale=%.1f | t_start=%.3f", segs,
+                "ttft marks (ms): %s | total=%.1f | t_start=%.3f", segs,
                 (have[-1][1] - marks["start"]) * 1000, marks["start"],
             )
         _record_generation(

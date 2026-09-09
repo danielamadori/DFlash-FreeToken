@@ -160,7 +160,7 @@ def tokenize_worker(
     try:
         while True:
             pending_msg = _unwrap_msg(recv_listener.get())
-            t_ricevuto = time.monotonic() if ENV.TTFT_MARKS else 0.0
+            t_received = time.monotonic() if ENV.TTFT_MARKS else 0.0
             while len(pending_msg) < local_bs and not recv_listener.empty():
                 pending_msg.extend(_unwrap_msg(recv_listener.get()))
 
@@ -248,19 +248,20 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                t_prima = time.monotonic() if ENV.TTFT_MARKS else 0.0
+                t_before = time.monotonic() if ENV.TTFT_MARKS else 0.0
                 ok_msgs, ok_tensors, errors = _tokenize_requests(
                     tokenize_manager, tokenize_msg, logger
                 )
                 if ENV.TTFT_MARKS:
-                    # Il modello di chat e la tokenizzazione stanno sul cammino critico del
-                    # primo token: senza questo numero non si sa se i millisecondi prima che
-                    # lo scheduler veda la richiesta sono qui o nel trasporto.
+                    # The chat template and the tokenizer sit on the critical path of the
+                    # first token: without this number there is no telling whether the
+                    # milliseconds before the scheduler sees the request are spent here or
+                    # in transport.
                     logger.info(
-                        "traccia tokenizzazione: %d messaggi, attesa+smistamento=%.1f ms, "
-                        "tokenizzazione=%.1f ms, t_uscita=%.3f",
-                        len(tokenize_msg), (t_prima - t_ricevuto) * 1000,
-                        (time.monotonic() - t_prima) * 1000, time.monotonic(),
+                        "tokenize trace: %d messages, wait+sort=%.1f ms, tokenize=%.1f ms, "
+                        "t_out=%.3f",
+                        len(tokenize_msg), (t_before - t_received) * 1000,
+                        (time.monotonic() - t_before) * 1000, time.monotonic(),
                     )
                 if errors:
                     send_frontend.put(

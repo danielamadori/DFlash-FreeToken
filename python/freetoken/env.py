@@ -91,8 +91,8 @@ class EnvClassSingleton:
     # unlike the phase timers they do not change what they measure.
     SPEC_NVTX = EnvBool(False)
 
-    # Scompone il tempo al primo token nei suoi confini (invio, tokenizzazione, primo ack dal
-    # motore, primo evento formattato) e logga una riga per richiesta. Spento per default.
+    # Decompose the time to first token at its boundaries (sent, tokenization, the engine's
+    # first acks, the first formatted event) and log one line per request. Off by default.
     TTFT_MARKS = EnvBool(False)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
     # GatedDeltaNet recurrent (SSM) state dtype: float32 (default) | bfloat16 | float16.

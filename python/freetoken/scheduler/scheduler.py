@@ -358,32 +358,32 @@ class Scheduler(SchedulerIOMixin):
         self._flush_abort_acks()
         return ongoing_data
 
-    def _traccia_avvio(self, forward_input, t_inizio: float, t_dopo_sched: float) -> None:
-        """Le prime passate dopo un prefill: quante ne servono al primo token e quanto costa
-        ciascuna. La conferma "prompt ammesso" parte prima del forward, quindi dal lato client
-        prefill e prima decodifica finiscono nello stesso intervallo e non si distinguono.
-        Solo con FREETOKEN_TTFT_MARKS=1."""
+    def _trace_first_passes(self, forward_input, t_start: float, t_scheduled: float) -> None:
+        """The first passes after a prefill: how many the first token needs and what each
+        costs. The "prompt admitted" ack leaves before the forward, so from the client the
+        prefill and the first decode fall inside one interval and cannot be told apart.
+        Only under FREETOKEN_TTFT_MARKS=1."""
         batch = forward_input.batch
         if batch.phase == "prefill":
-            self._passi_avvio = 0
-        elif getattr(self, "_passi_avvio", None) is None:
+            self._first_pass = 0
+        elif getattr(self, "_first_pass", None) is None:
             return
-        n = self._passi_avvio
+        n = self._first_pass
         if n > 6:
             return
-        self._passi_avvio = n + 1
-        ora = time.monotonic()
+        self._first_pass = n + 1
+        now = time.monotonic()
         logger.info(
-            "traccia avvio: passo=%d fase=%s richieste=%d token=%d schedule=%.1f "
-            "forward+post=%.1f totale=%.1f ms",
+            "startup pass %d: phase=%s reqs=%d tokens=%d schedule=%.1f "
+            "forward+post=%.1f total=%.1f ms",
             n, batch.phase, len(batch.reqs), int(batch.input_ids.numel()),
-            (t_dopo_sched - t_inizio) * 1000, (ora - t_dopo_sched) * 1000,
-            (ora - t_inizio) * 1000,
+            (t_scheduled - t_start) * 1000, (now - t_scheduled) * 1000,
+            (now - t_start) * 1000,
         )
 
     def normal_loop(self) -> None:
-        traccia = ENV.TTFT_MARKS
-        t_inizio = time.monotonic() if traccia else 0.0
+        tracing = ENV.TTFT_MARKS
+        t_start = time.monotonic() if tracing else 0.0
         blocking = not (
             self.prefill_manager.runnable
             or self.decode_manager.runnable
@@ -402,7 +402,7 @@ class Scheduler(SchedulerIOMixin):
 
         with _step("schedule"):
             forward_input = self._schedule_next_batch()
-        t_dopo_sched = time.monotonic() if traccia else 0.0
+        t_scheduled = time.monotonic() if tracing else 0.0
         ongoing_data = None
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
@@ -415,8 +415,8 @@ class Scheduler(SchedulerIOMixin):
         with _step("post"):
             self._process_last_data(ongoing_data)
             self._flush_abort_acks()
-        if traccia and forward_input is not None:
-            self._traccia_avvio(forward_input, t_inizio, t_dopo_sched)
+        if tracing and forward_input is not None:
+            self._trace_first_passes(forward_input, t_start, t_scheduled)
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
