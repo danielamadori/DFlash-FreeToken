@@ -815,11 +815,22 @@ static void mul_mat_q_switch_J(const mmq_args<dst_t> & args, cudaStream_t stream
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    // FREETOKEN_MMQ_J pins the column tile width, to measure the selection rule instead of
+    // arguing about it. The rule below picks the J with the fewest column tiles, which is not
+    // obviously right: a prompt of 134 rows takes two tiles of 128 and does 256 columns of
+    // work for 134 real ones. Whether three tiles of 64 (192 columns, but three passes over
+    // the weight) is faster is a question for a measurement, not for a comment. Unset or 0
+    // means the ordinary rule. Read once: getenv on every matmul would show up in a profile.
+    static const int J_forced = [] {
+        const char * e = getenv("FREETOKEN_MMQ_J");
+        return e ? atoi(e) : 0;
+    }();
+
     // upstream steps J by 8 over its full table; this port has five J values, so the loop is
     // written over them explicitly. The selection rule (smallest number of column tiles, stop as
     // soon as one tile suffices) is upstream's, unchanged.
     constexpr int J_values[] = {8, 16, 32, 64, 128};
-    for (int idx = 0; idx < 5 && ntiles_J_best > 1; ++idx) {
+    for (int idx = 0; idx < 5 && (J_forced || ntiles_J_best > 1); ++idx) {
         const int J = J_values[idx];
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config<type>(J, fallback);
         if (config.type == GGML_TYPE_COUNT) {
@@ -831,6 +842,14 @@ static void mul_mat_q_switch_J(const mmq_args<dst_t> & args, cudaStream_t stream
         }
 
         const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+
+        if (J_forced) {
+            if (J == J_forced) {
+                J_best = J;
+                ntiles_J_best = ntiles_x;
+            }
+            continue;
+        }
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
