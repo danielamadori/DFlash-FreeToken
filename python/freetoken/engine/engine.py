@@ -26,7 +26,7 @@ from .sample import BatchSamplingArgs, Sampler
 from .draft_graph import DraftGraphRunner
 from .verify_graph import VerifyGraphRunner
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
-from freetoken.kvcache.base import CacheRebuildRejected
+from freetoken.kvcache.base import CacheRebuildRejected, kv_cache_dtype
 from freetoken.kvcache.cache_status import _supports_swa_ratio
 from freetoken.kvcache.linear_state_pool import (
     _linear_pool_min_slots, _linear_pool_num_slots, state_pool_bytes,
@@ -360,6 +360,15 @@ class Engine:
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
+        # The page budget is the answer to "how much context fits", and it was not logged: the
+        # startup lines said how much memory was free before and after, never what that bought.
+        # It is also the number that moves when the KV dtype changes, so it belongs next to it.
+        _kv_dtype = kv_cache_dtype(self.dtype)
+        logger.info_rank0(
+            f"KV budget: {self.num_pages} pages = {num_tokens} tokens, "
+            f"dtype {str(_kv_dtype).removeprefix('torch.')} "
+            f"({_kv_dtype.itemsize} B/elem), {mem_GB(available_memory)} available"
+        )
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
