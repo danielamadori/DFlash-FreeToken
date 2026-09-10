@@ -104,9 +104,14 @@ class EnvClassSingleton:
     # NOT have to match the model: 16 full-attention layers x 2 slabs x 4 kv heads x 256 dims
     # is 64 KiB per token on this 27B, so 2 slots of 65536 tokens cost 8 GiB in bf16 and 4 in
     # fp8 -- on a 24 GB card that is the difference between fitting production's context and
-    # not (llama.cpp serves the same shape at q4_0, 2.25 GiB). e4m3 keeps 4 mantissa bits and
-    # saturates at 448; e5m2 trades a mantissa bit for range. Correctness is not assumed here:
-    # see docs/measurements for the needle probe that has to pass before this is used.
+    # not (llama.cpp serves the same shape at q4_0, 2.25 GiB).
+    #
+    # USE e5m2. Measured 2026-09-10 against a bf16 control in the same window, needle probe,
+    # nine recalls in haystacks of 1153-4353 tokens: bfloat16 18234 tokens 9/9, float8_e5m2
+    # 35626 tokens 9/9 (1.99x the context per GiB, no loss the probe can see), float8_e4m3fn
+    # 8/9 -- missing the SAME recall in three separate runs. Not the expected order: e4m3 keeps
+    # one more mantissa bit, but it saturates at 448, and attention leans on the outliers that
+    # clips. Default stays auto because this is a deliberate trade, not a free win.
     KV_CACHE_DTYPE = EnvStr("auto")
 
     def __new__(cls):
