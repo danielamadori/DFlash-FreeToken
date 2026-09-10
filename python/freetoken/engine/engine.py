@@ -363,6 +363,9 @@ class Engine:
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
+        # The pool may now be a different dtype from the model (fp8 KV): record what the model
+        # computes in, so the attention backend can plan q and kv separately.
+        self.ctx.compute_dtype = self.dtype
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()

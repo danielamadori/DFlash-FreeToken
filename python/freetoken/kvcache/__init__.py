@@ -80,6 +80,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     """Build the engine's KV pool for ``num_pages`` USABLE pages (the dummy page and every
     secondary tier -- window pool, index slab, state rings -- are derived here or inside
     the pool). Single factory entry for all pool families, DSV4 included."""
+    from .base import kv_cache_dtype
     from .dsv4_cost_model import _dsv4_pool_sizes
     from .hybrid_swa_pool import _naive_swa_num_tokens, _swa_paged_num_tokens
     from .dsv4_paged_pool import DSV4PagedKVCache
@@ -109,13 +110,17 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             if config.cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
+    # The KV slabs carry kv_cache_dtype(dtype), not the model dtype: FREETOKEN_KV_CACHE_DTYPE
+    # can store them in fp8 and halve the largest allocation in the engine. Same resolver the
+    # page budget uses (spec_kv_bytes_per_token), so the pool cannot be sized for one dtype and
+    # allocated in another. DSV4 above keeps the model dtype: that family asserts bf16.
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
         page_size=config.page_size,
         num_swa_tokens=num_swa_tokens,
         device=device,
-        dtype=dtype,
+        dtype=kv_cache_dtype(dtype),
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
     )
 

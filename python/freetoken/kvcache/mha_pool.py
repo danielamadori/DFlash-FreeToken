@@ -127,6 +127,13 @@ class MHAKVCache(BaseKVCachePool):
         from freetoken.kernel import store_cache
 
         dense = self._dense(layer_id)
+        # store.cu copies BYTES (warp::copy<kElementSize>), it does not convert: source and
+        # destination must already share an element size. When the cache is fp8 and the model
+        # produces bf16, the cast belongs here -- and it is cheap, because it touches only the
+        # tokens being written this step, never the cache itself.
+        if k.dtype != self._kv_buffer.dtype:
+            k = k.to(self._kv_buffer.dtype)
+            v = v.to(self._kv_buffer.dtype)
         store_cache(
             k_cache=self._k_buffer[dense].view(self._storage_shape),
             v_cache=self._v_buffer[dense].view(self._storage_shape),

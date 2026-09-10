@@ -99,6 +99,15 @@ class EnvClassSingleton:
     # fp32 matches the Qwen3.x configs (mamba_ssm_dtype); fp16/bf16 halves the GDN state
     # pool at some precision cost on the long recurrence (mirrors SGLang's mamba_ssm_dtype).
     MAMBA_SSM_DTYPE = EnvStr("float32")
+    # Paged KV cache dtype: auto (default, = the model dtype) | bfloat16 | float8_e4m3fn |
+    # float8_e5m2. The KV cache is the largest single allocation at long context and it does
+    # NOT have to match the model: 16 full-attention layers x 2 slabs x 4 kv heads x 256 dims
+    # is 64 KiB per token on this 27B, so 2 slots of 65536 tokens cost 8 GiB in bf16 and 4 in
+    # fp8 -- on a 24 GB card that is the difference between fitting production's context and
+    # not (llama.cpp serves the same shape at q4_0, 2.25 GiB). e4m3 keeps 4 mantissa bits and
+    # saturates at 448; e5m2 trades a mantissa bit for range. Correctness is not assumed here:
+    # see docs/measurements for the needle probe that has to pass before this is used.
+    KV_CACHE_DTYPE = EnvStr("auto")
 
     def __new__(cls):
         # single instance

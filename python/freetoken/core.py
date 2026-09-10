@@ -178,6 +178,11 @@ class Context:
     moe_backend: BaseMoeBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
+    # The dtype the model computes in. Distinct from kv_cache.dtype since the KV slabs can be
+    # stored in fp8 (FREETOKEN_KV_CACHE_DTYPE) while queries stay bf16: FlashInfer takes the
+    # two separately (q_data_type / kv_data_type), and reading the query dtype off the KV pool
+    # -- which is what the backend did while they were always equal -- would plan fp8 queries.
+    compute_dtype: torch.dtype | None = None
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
     linear_state_pool: LinearStatePool | None = None

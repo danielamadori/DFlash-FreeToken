@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, NamedTuple
 
 import torch
+from freetoken.env import ENV
 from freetoken.utils import div_even, init_logger, mem_GB
 
 logger = init_logger(__name__)
@@ -14,6 +15,35 @@ class CacheRebuildRejected(Exception):
     """A runtime cache rebuild was rejected BEFORE any destructive free (e.g. the
     requested geometry does not fit). The old caches are intact and serving continues --
     this is recoverable, unlike a failure after the free."""
+
+
+_KV_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
+}
+
+
+def kv_cache_dtype(model_dtype: torch.dtype) -> torch.dtype:
+    """Paged KV storage dtype, from FREETOKEN_KV_CACHE_DTYPE ("auto" = the model dtype).
+
+    The KV cache does not have to carry the model's dtype, and at long context it is the
+    allocation that decides whether a configuration fits: on this 27B it is 64 KiB per token,
+    so a 131072-token budget is 8 GiB in bf16 and 4 GiB in fp8. Resolved in one place so the
+    pool that allocates it and the cost model that budgets pages for it cannot disagree --
+    they did not have to agree before, because both simply read config.dtype.
+    """
+    name = str(ENV.KV_CACHE_DTYPE).lower()
+    if name in ("auto", "", "model"):
+        return model_dtype
+    try:
+        return _KV_DTYPES[name]
+    except KeyError:
+        raise ValueError(
+            f"FREETOKEN_KV_CACHE_DTYPE={name!r} is not one of "
+            f"{'auto'!r}, {', '.join(map(repr, _KV_DTYPES))}"
+        ) from None
 
 
 def spec_kv_bytes_per_token(spec, config) -> int:
@@ -29,7 +59,7 @@ def spec_kv_bytes_per_token(spec, config) -> int:
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * kv_cache_dtype(config.dtype).itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
