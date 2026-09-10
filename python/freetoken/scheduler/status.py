@@ -16,12 +16,48 @@ class SchedulerStatusReporter:
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
     _decode_generated_tokens: int = field(default=0, init=False)
+    # Contatori della speculazione. Non esistevano, e senza non si puo' dire se un cambiamento
+    # alla speculazione migliori o peggiori: llama.cpp riporta "draft acceptance = 0.375
+    # (90 accepted / 240 generated), mean len = 3.43" per slot, noi non riportavamo niente e il
+    # confronto del 2026-09-10 ha dovuto DEDURRE il nostro valore dal throughput -- ottenendo un
+    # numero che non tornava con l'aritmetica della banda.
+    _spec_drafted: int = field(default=0, init=False)     # candidati proposti
+    _spec_accepted: int = field(default=0, init=False)    # candidati sopravvissuti alla verifica
+    _spec_blocks: int = field(default=0, init=False)      # blocchi verificati
+    _spec_drafted_tot: int = field(default=0, init=False)  # cumulativi, per la vita del processo
+    _spec_accepted_tot: int = field(default=0, init=False)
+    _spec_blocks_tot: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
         self._last_prefill_time = now
         self._last_decode_time = now
         self.decode_log_interval = max(1, self.decode_log_interval)
+
+    def record_speculation(self, drafted: int, accepted: int) -> None:
+        """Un blocco verificato: quanti candidati proposti e quanti accettati.
+
+        Il blocco commette ``accepted + 1`` token -- gli accettati piu' il token bonus che il
+        target produce comunque -- ed e' quel +1 che rende la lunghezza media confrontabile con
+        il "mean len" di llama.cpp.
+        """
+        self._spec_drafted += drafted
+        self._spec_accepted += accepted
+        self._spec_blocks += 1
+        self._spec_drafted_tot += drafted
+        self._spec_accepted_tot += accepted
+        self._spec_blocks_tot += 1
+
+    def speculation_totals(self) -> dict:
+        """I cumulativi, per chi li vuole leggere da fuori invece che dal log."""
+        b = self._spec_blocks_tot
+        return {
+            "drafted": self._spec_drafted_tot,
+            "accepted": self._spec_accepted_tot,
+            "blocks": b,
+            "acceptance": self._spec_accepted_tot / self._spec_drafted_tot if self._spec_drafted_tot else 0.0,
+            "mean_len": (self._spec_accepted_tot + b) / b if b else 0.0,
+        }
 
     def report_batch(
         self,
@@ -121,7 +157,21 @@ class SchedulerStatusReporter:
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
+            f"{self._spec_msg()}"
         )
+
+    def _spec_msg(self) -> str:
+        """L'accettazione dall'ultima riga, azzerata dopo. Stessa forma di llama.cpp, cosi' i
+        due motori si leggono con lo stesso metro invece che a occhio."""
+        if not self._spec_blocks:
+            return ""
+        acc = self._spec_accepted / self._spec_drafted if self._spec_drafted else 0.0
+        # +1: ogni blocco commette anche il token bonus, come nel conteggio di llama.cpp
+        mean_len = (self._spec_accepted + self._spec_blocks) / self._spec_blocks
+        msg = (f", draft acceptance: {acc:.3f} ({self._spec_accepted} accepted / "
+               f"{self._spec_drafted} drafted), mean len: {mean_len:.2f}")
+        self._spec_drafted = self._spec_accepted = self._spec_blocks = 0
+        return msg
 
 
 def _usage_ratio(used: int, total: int) -> float:

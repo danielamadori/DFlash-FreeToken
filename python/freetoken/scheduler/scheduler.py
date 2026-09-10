@@ -1168,6 +1168,9 @@ class Scheduler(SchedulerIOMixin):
                 rollback.rewind(accepted)
             _spec_timing_mark(self, "rewind", _t1)
 
+        # Registra l'esito del blocco PRIMA di committarlo: e' l'unico punto in cui si sanno
+        # insieme quanti candidati erano stati proposti e quanti sono sopravvissuti.
+        self.status_reporter.record_speculation(block.size, accepted)
         rejected = commit_verified(req, block, accepted)
         with _step("commit"):
             return self._commit_verified_block(
