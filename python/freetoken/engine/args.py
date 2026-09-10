@@ -77,6 +77,35 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
+
+def _redacted_args(args) -> str:
+    """``args`` as text, with every secret-looking field replaced by its length and a hash.
+
+    The parsed arguments are logged at startup, and ``api_key`` is one of them: the key that
+    authenticates every request to this server was landing in the log FILE in cleartext. Passing
+    it by environment instead of on the command line -- which this project does specifically to
+    keep it out of a world-readable /proc/<pid>/cmdline -- buys nothing if the process then
+    prints it. On a shared machine with other accounts and a log directory anyone can enter,
+    that is the same leak through a different door.
+
+    The value is not simply dropped: an operator still has to be able to tell WHICH key is
+    loaded when a client gets 401, so this prints a short SHA-256 prefix, which identifies it
+    without handing it over.
+    """
+    import hashlib
+    import re as _re
+
+    text = str(args)
+
+    def hide(match):
+        field, value = match.group(1), match.group(2)
+        if not value:
+            return f"{field}=''"
+        digest = hashlib.sha256(value.encode()).hexdigest()[:12]
+        return f"{field}='<redacted: {len(value)} chars, sha256 {digest}>'"
+
+    return _re.sub(r"\b(api_key|token|password|secret)='([^']*)'", hide, text)
+
 def parse_args(
     args: List[str],
     run_shell: bool = False,
@@ -739,5 +768,5 @@ def parse_args(
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
-    logger.info(f"Parsed arguments:\n{result}")
+    logger.info("Parsed arguments:\n%s", _redacted_args(result))
     return result, run_shell
