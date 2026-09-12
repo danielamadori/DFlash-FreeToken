@@ -632,8 +632,13 @@ class Engine:
             if split_residency:
                 from freetoken.moe.host_banks import HostResidency
 
+                cpu_residency = (
+                    HostResidency.PAGEABLE.value
+                    if os.environ.get("FREETOKEN_HOST_BANK_DIR") or os.environ.get("FREETOKEN_UNPINNED_RESIDENCY") == "pageable"
+                    else HostResidency.LOCKED.value
+                )
                 requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
+                    cpu_residency if i in cpu_layer_ids
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]

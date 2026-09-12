@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import Iterator
 
+import torch
+
 try:
     from flashlib.kernels.slot_cache import N_STATS, Stat
 except ImportError:

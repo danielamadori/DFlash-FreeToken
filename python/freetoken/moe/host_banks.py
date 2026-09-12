@@ -79,7 +79,7 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_backing")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
@@ -88,7 +88,8 @@ class HostBank:
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
             born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
-        assert backing in ("mmap", "cuda"), backing
+        assert backing in ("mmap", "cuda", "disk"), backing
+        self._backing = backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
@@ -104,6 +105,21 @@ class HostBank:
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+        elif backing == "disk":
+            nvme_dir = os.environ.get("FREETOKEN_HOST_BANK_DIR", "/media/DATA2/danielamadori/Agents/.nvme_cache/banks")
+            os.makedirs(nvme_dir, exist_ok=True)
+            import tempfile
+            tf = tempfile.NamedTemporaryFile(dir=nvme_dir, prefix="host_bank_", suffix=".bin", delete=False)
+            tf.truncate(asize)
+            fd = tf.fileno()
+            try:
+                os.unlink(tf.name)
+            except OSError:
+                pass
+            self._buf = mmap.mmap(fd, asize)
+            _LIVE_BUFFERS.append(self._buf)
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            self._pinned = False
         else:
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
@@ -127,7 +143,7 @@ class HostBank:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
 
         ``FREETOKEN_SKIP_BANK_PIN=1`` makes this a no-op for CPU-only tooling (the FTW converter); never set it when serving, the GPU paths need registered banks."""
-        if self._pinned:
+        if self._pinned or getattr(self, "_backing", "") == "disk":
             return
         if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
             return
@@ -153,7 +169,7 @@ class HostBank:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
 
         Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
-        if self._locked or self._pinned:  # cudaHostRegister already page-locks
+        if self._locked or self._pinned or getattr(self, "_backing", "") == "disk":  # cudaHostRegister already page-locks
             return
         global _os_lock_failed
         if _os_lock_failed:
@@ -208,10 +224,17 @@ def alloc_layer_banks(
     """Allocate per-layer host banks: ``{name: ([num_experts, ...] row shape, dtype)}``
     -> one independently allocated (page-aligned, independently pin/lock-able)
     ``HostBank`` per layer per name."""
-    return {
-        name: [HostBank(shape, dtype) for _ in range(num_layers)]
-        for name, (shape, dtype) in specs.items()
-    }
+    plan = _requested_residency
+    result: dict[str, list[HostBank]] = {name: [] for name in specs}
+    for layer_id in range(num_layers):
+        residency = (
+            HostResidency.PINNED.value if plan is None
+            else plan.residency_for(layer_id)
+        )
+        backing = "disk" if (residency == HostResidency.PAGEABLE.value and os.environ.get("FREETOKEN_HOST_BANK_DIR")) else None
+        for name, (shape, dtype) in specs.items():
+            result[name].append(HostBank(shape, dtype, backing=backing))
+    return result
 
 
 class _ResidencyPlan:
