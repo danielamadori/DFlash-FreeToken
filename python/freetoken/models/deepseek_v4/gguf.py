@@ -96,7 +96,15 @@ def _args_from_gguf(shim: "GgufConfigShim") -> DeepseekV4Args:
         dtype="bf16",
         scale_fmt=None,
         expert_dtype=None,
-        vocab_size=int(_kv(shim, "vocab_size")),
+        # shim.vocab_size, non _kv(shim, "vocab_size"): il primo e' il valore che il
+        # caricatore ha gia' ricavato dalla forma di token_embd.weight (o, per un GGUF di soli
+        # metadati, dalla lunghezza di tokenizer.ggml.tokens); il secondo pretende la chiave
+        # ridondante `deepseek4.vocab_size`, che i GGUF di unsloth non scrivono -- e non
+        # devono, visto che llama.cpp la ricava allo stesso modo. Il risultato era che
+        # DeepSeek-V4-Flash-0731-GGUF moriva in avvio con "this file does not carry the config
+        # this adapter needs" su un file che il config ce l'ha tutto. qwen3_5_moe/gguf.py usa
+        # gia' shim.vocab_size: questa riga era l'eccezione, non la regola.
+        vocab_size=shim.vocab_size,
         dim=int(_kv(shim, "embedding_length")),
         moe_inter_dim=int(_kv(shim, "expert_feed_forward_length")),
         n_layers=int(_kv(shim, "block_count")),
@@ -178,11 +186,20 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     #
     # compress_ratios is the authority: it carries one entry per served layer plus the MTP
     # layers, so the served count falls out of it and is then cross-checked below.
-    served_layers = len(args.compress_ratios) - args.n_mtp_layers
+    # Meno anche gli hash layer, non solo gli MTP. Su DeepSeek-V4-Flash-0731-GGUF (unsloth)
+    # compress_ratios ha 46 voci, block_count dice 43 e hash_layer_count dice 3: 43 + 3 = 46
+    # esatto. La verifica non e' aritmetica ma sulla tabella dei tensori, che porta blk.0..
+    # blk.42 e NESSUN tensore di hash layer -- gli hash layer non hanno blocchi propri,
+    # esattamente come il layer MTP descritto sopra, quindi compressi_ratios li elenca e i
+    # pesi no. Senza questa sottrazione il caricamento moriva con "refusing to guess which is
+    # right" su un file in cui i due numeri sono entrambi corretti e solo la formula era
+    # incompleta.
+    served_layers = len(args.compress_ratios) - args.n_mtp_layers - args.n_hash_layers
     if served_layers != args.n_layers:
         raise ValueError(
             f"deepseek4 GGUF: compress_ratios implies {served_layers} served layers "
-            f"({len(args.compress_ratios)} entries minus {args.n_mtp_layers} MTP) but "
+            f"({len(args.compress_ratios)} entries minus {args.n_mtp_layers} MTP "
+            f"and {args.n_hash_layers} hash) but "
             f"block_count is {args.n_layers}; refusing to guess which is right"
         )
     args.n_layers = served_layers
