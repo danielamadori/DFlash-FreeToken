@@ -137,7 +137,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         else:
             p_h0 = h0 + bos * HV * V * K
         p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+        b_h += tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
     for i_t in range(0, T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
@@ -340,7 +340,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
 
     p_h0 = h0 + state_idx * stride_init_state_token
     p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-    b_h = tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    b_h = tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
     p_mixed = mixed_qkv + i_n * stride_mixed_qkv_tok
     q_off = i_h * K + o_k

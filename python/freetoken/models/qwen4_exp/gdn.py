@@ -10,6 +10,7 @@ from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 from freetoken.models.quant_linear import make_replicated_quant
+from freetoken.kvcache.linear_state_pool import copy_state_rows, zero_state_rows
 
 
 _GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
@@ -147,7 +148,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
         Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
         rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        copy_state_rows(rec, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
         cv = pool.conv_states[li]
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
@@ -210,7 +211,7 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:
-                pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
+                zero_state_rows(pool.recurrent_states[li], fla.fresh_state_indices)
             track = fla.track_dst is not None
             result = gdn_prefill_chunk_fla(
                 q, k, v, g, beta,

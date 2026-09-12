@@ -109,7 +109,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 + o_v[None, :] * K
                 + o_k[:, None]
             )
-            b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+            b_h += tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
     # Preload tree attention data if needed
     if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
@@ -147,7 +147,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                     + o_v[None, :] * K
                     + o_k[:, None]
                 )
-                b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
+                b_h = tl.load(cache_ptr, mask=mask_h, other=0.0).to(tl.float32)
 
         # Load inputs
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)

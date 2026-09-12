@@ -30,6 +30,7 @@ from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated
 from freetoken.utils import nvtx_annotate
+from freetoken.kvcache.linear_state_pool import copy_state_rows, zero_state_rows
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
@@ -122,7 +123,7 @@ class Glm5NextKDA(BaseOP):
         qwen3_5_moe/gdn.py). h rows are the kernel's per-chunk [V, K] states --
         a direct copy into the pool's [K, V] slots (D_k == D_v)."""
         rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        copy_state_rows(rec, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
         cv = pool.conv_states[li]
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()
         cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
@@ -192,7 +193,7 @@ class Glm5NextKDA(BaseOP):
             # initial state (the chunk kernel takes it dense, [N, H, D, D]).
             rec = pool.recurrent_states[li]
             if fla.fresh_state_indices is not None:
-                rec.index_fill_(0, fla.fresh_state_indices, 0.0)
+                zero_state_rows(rec, fla.fresh_state_indices)
             slot_ids = fla.cache_indices.long()
             initial = rec.index_select(0, slot_ids)
 
@@ -219,7 +220,7 @@ class Glm5NextKDA(BaseOP):
                 self._write_track_snapshot(pool, li, conv_in, chunk_h, fla)
             else:
                 core_out, final_state = result
-            rec.index_copy_(0, slot_ids, final_state.to(rec.dtype))
+            copy_state_rows(rec, slot_ids, final_state.to(rec.dtype))
 
         core_out = core_out.reshape(-1, d)
         out = self.o_norm.forward(core_out, g2.reshape(-1, d)).reshape(total, -1)

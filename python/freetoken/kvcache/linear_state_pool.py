@@ -12,12 +12,57 @@ _SSM_DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
+    # fp8 is allocatable, and the kernels compute in fp32 and cast on the store, so the pool's
+    # dtype is free to differ from the arithmetic -- the decode kernel needed only its masked
+    # state load fixed from `other=0` to `other=0.0`, since Triton has no int32->fp8 cast and
+    # died on the integer literal. What fp8 does NOT survive is that the recurrence reads and
+    # rewrites this tensor once per
+    # token, so the storage dtype IS the precision of the recurrence. Measured against the
+    # checkpoint's own gates, the error on a layer's output is exactly the lost mantissa:
+    # 0.33% at bfloat16, 5.3% at e4m3, 10.6% at e5m2, and on the 9% of heads whose state
+    # half-life exceeds 4096 tokens it saturates at 2.2% / 29% / 50%. Kept selectable so the
+    # claim stays falsifiable; not a default.
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
 }
 
 
 def ssm_state_dtype() -> torch.dtype:
     """Recurrent (SSM) state dtype, from FREETOKEN_MAMBA_SSM_DTYPE (default fp32)."""
     return _SSM_DTYPES.get(str(ENV.MAMBA_SSM_DTYPE).lower(), torch.float32)
+
+
+def zero_state_rows(state: torch.Tensor, rows: torch.Tensor) -> None:
+    """Zero whole slot rows of a state tensor, for any dtype the pool is allowed to hold.
+
+    ``index_fill_`` has no float8 CUDA kernel, and the recurrent pool is float8-selectable, so
+    a fresh sequence starting from a stale slot is the first thing that breaks -- silently, as
+    a wrong answer rather than an error, since the chunk kernel reads the slot before writing
+    it. Both float8 formats encode zero as the all-zero byte and are one byte wide, so the
+    byte view fills identically and keeps the single-kernel shape of the original.
+    """
+    if state.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        state.view(torch.uint8).index_fill_(0, rows, 0)
+    else:
+        state.index_fill_(0, rows, 0.0)
+
+
+def copy_state_rows(state: torch.Tensor, rows: torch.Tensor, src: torch.Tensor) -> None:
+    """``state[rows] = src``, for any dtype the pool is allowed to hold.
+
+    ``index_copy_`` joins ``index_fill_``, ``index_add_``, ``masked_fill_`` and ``roll`` in
+    having no float8 CUDA kernel. Measured on this box: 19 of 24 tensor operations work on
+    float8 and those five are the ones that do not, so they are the whole list to route
+    around -- not a defect to be discovered one crash at a time, which is how the first two
+    were found. The byte view is exact (float8 is one byte wide, so dim 0 keeps its meaning)
+    and keeps this one kernel, which matters: this is a per-forward path, not a setup step.
+
+    ``src`` is expected in ``state``'s dtype already; the callers cast at the call site.
+    """
+    if state.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        state.view(torch.uint8).index_copy_(0, rows, src.contiguous().view(torch.uint8))
+    else:
+        state.index_copy_(0, rows, src)
 
 
 def _linear_local_dims(
