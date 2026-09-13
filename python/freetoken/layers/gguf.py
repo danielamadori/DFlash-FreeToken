@@ -109,14 +109,30 @@ MMA_TYPES = frozenset(
     {GGML_Q3_K, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0,
      GGML_IQ2_S, GGML_IQ2_XS, GGML_IQ3_S, GGML_IQ3_XXS, GGML_IQ4_NL, GGML_IQ4_XS}
 )
+# Il pareggio contro la GEVM non e' uno: dipende da quanti tile di uscita il tensore offre.
+# La MMA legge i pesi una volta sola (17408x5120 Q4_K: 0,086 ms a 8 righe, 0,098 a 32), la GEVM
+# li rilegge per gruppi di righe (0,063 a 8, 0,294 a 32), quindi piu' e' largo il tensore --
+# piu' tile, piu' SM occupati -- prima la MMA recupera il suo costo fisso. Misurato
+# (docs/plans/scripts/spec/window_mma_righe_basse.sh, Q4_K sulle forme di questo modello):
+#
+#     out x in        8 righe   9 righe   12    16    24    32
+#     17408 x 5120      0,73x     1,08x  1,35  1,63  2,30  3,01
+#      5120 x 17408     0,55x     0,75x  0,92  1,16  1,71  2,22
+#      1024 x 5120      0,38x     0,46x  0,49  0,42  0,50  0,57
+#
+# Una soglia sola a 24 righe lasciava il tensore largo sulla GEVM proprio alle 9 righe del
+# verify speculativo, dove la MMA gia' vinceva. Ora sono due, e la seconda resta dov'era
+# perche' sotto le 16 righe il tensore stretto la MMA la perde davvero.
 _MMA_MIN_ROWS = 24
+_MMA_MIN_ROWS_WIDE = 9        # out_features >= _MMA_WIDE_OUT
+_MMA_WIDE_OUT = 16384
 _MMA_MIN_OUT_TILES = 32  # out_features >= 32 * 128
 
 
 def _use_mma(qweight_type: int, rows: int, out_features: int, in_features: int) -> bool:
     return (
         qweight_type in MMA_TYPES
-        and rows >= _MMA_MIN_ROWS
+        and rows >= (_MMA_MIN_ROWS_WIDE if out_features >= _MMA_WIDE_OUT else _MMA_MIN_ROWS)
         and out_features >= _MMA_MIN_OUT_TILES * 128
         and out_features % 128 == 0
         and in_features % 256 == 0

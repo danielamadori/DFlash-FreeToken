@@ -394,8 +394,41 @@ class TestTensorCoreMMQRouting:
         assert mock_kernel_module["ggml_mul_mat_a8"] is None
         assert out.shape == (24, out_features)
 
-    def test_below_the_row_threshold_stays_on_the_gevm(self, mock_kernel_module):
+    def test_a_wide_tensor_reaches_the_mma_at_the_speculative_verify_width(
+        self, mock_kernel_module
+    ):
+        """17408 output features: nine rows is enough, and nine rows is what verify runs.
+
+        The MMA reads the weight once, so its cost barely moves with rows (0.086 ms at 8,
+        0.098 at 32 on this tensor); the GEVM re-reads per group and climbs (0.063 to 0.294).
+        The wider the tensor the more tiles it offers, and the sooner the MMA earns back its
+        fixed cost -- here by nine rows, which is exactly block_size + 1.
+        """
         in_features, out_features = 5120, 17408
+        x = torch.randn(9, in_features, dtype=torch.bfloat16)
+        qweight = make_qweight(out_features, in_features, GGML_Q4_K)
+
+        fused_mul_mat_gguf(x, qweight, GGML_Q4_K)
+
+        assert mock_kernel_module["ggml_mul_mat_mma"] is not None
+        assert mock_kernel_module["ggml_mul_mat_vec_a8"] is None
+
+    def test_a_wide_tensor_below_that_width_still_stays_on_the_gevm(self, mock_kernel_module):
+        """Eight rows, where the GEVM still wins on the same tensor (0.063 against 0.086)."""
+        in_features, out_features = 5120, 17408
+        x = torch.randn(8, in_features, dtype=torch.bfloat16)
+        qweight = make_qweight(out_features, in_features, GGML_Q4_K)
+
+        fused_mul_mat_gguf(x, qweight, GGML_Q4_K)
+
+        assert mock_kernel_module["ggml_mul_mat_vec_a8"] is not None
+        assert mock_kernel_module["ggml_mul_mat_mma"] is None
+
+    def test_a_narrower_tensor_keeps_the_old_threshold(self, mock_kernel_module):
+        """5120 output features at 16 rows: measured 1.16x for the MMA, but the tier below
+        16 is where it loses (0.75x at 9), and the threshold that covers it is still 24.
+        Lowering this one too would have taken the loss to buy the other one's win."""
+        in_features, out_features = 17408, 5120
         x = torch.randn(16, in_features, dtype=torch.bfloat16)
         qweight = make_qweight(out_features, in_features, GGML_Q4_K)
 
