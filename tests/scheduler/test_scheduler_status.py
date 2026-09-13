@@ -159,3 +159,46 @@ def test_usage_ratio_guard():
     assert _usage_ratio(0, 0) == 0.0
     assert _usage_ratio(5, 0) == 0.0
     assert _usage_ratio(5, 10) == 0.5
+
+
+def test_per_position_curve_says_where_the_draft_gives_up():
+    """The per-position line is the tail of the accepted-count histogram.
+
+    A block that kept ``a`` candidates is one where positions ``0..a-1`` survived, so the
+    share for position ``i`` is the fraction of blocks with ``accepted > i``. The curve is
+    monotone by construction, and its shape is the whole point: the same 26% acceptance
+    means a draft that misses immediately (first value already low) or one that runs out of
+    steam along the block (first value high, slow decline), and those are repaired in
+    different places. Without it the totals cannot tell the two apart.
+    """
+    rep, _, _ = _reporter()
+    for accepted in (0, 8, 4, 4):
+        rep.record_speculation(drafted=8, accepted=accepted)
+    msg = rep._spec_msg()
+    assert ", per-pos: " in msg
+    quote = [float(x) for x in msg.split("per-pos: ")[1].split()]
+    # positions 0..3 survived in 3 blocks of 4; positions 4..7 only in the fully accepted one
+    assert quote == [0.75, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.25]
+
+
+def test_the_curve_resets_with_its_window():
+    """``_spec_msg`` zeroes its counters and the histogram goes with them.
+
+    A curve that kept accumulating would describe the whole run while the acceptance printed
+    beside it describes the last window, and the two would disagree without saying so.
+    """
+    rep, _, _ = _reporter()
+    rep.record_speculation(drafted=8, accepted=8)
+    rep._spec_msg()
+    assert rep._spec_hist == []
+    assert rep._spec_msg() == ""
+
+
+def test_a_block_that_accepts_nothing_still_lands_in_the_curve():
+    """Total rejection is the case the curve most needs to show, and an empty histogram slot
+    is easy to skip by accident: every position must read 0.00, not vanish."""
+    rep, _, _ = _reporter()
+    for _ in range(5):
+        rep.record_speculation(drafted=8, accepted=0)
+    msg = rep._spec_msg()
+    assert ", per-pos: 0.00" in msg

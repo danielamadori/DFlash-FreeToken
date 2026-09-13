@@ -27,6 +27,13 @@ class SchedulerStatusReporter:
     _spec_drafted_tot: int = field(default=0, init=False)  # cumulativi, per la vita del processo
     _spec_accepted_tot: int = field(default=0, init=False)
     _spec_blocks_tot: int = field(default=0, init=False)
+    # Quanti blocchi hanno fermato l'accettazione a ciascun conteggio: l'indice e' il numero di
+    # candidati sopravvissuti, il valore quanti blocchi si sono fermati li'. Da qui si ricava
+    # la curva per posizione (la posizione i sopravvive nei blocchi con accepted > i), che e'
+    # il "n_acc_tokens_per_pos" di llama.cpp. Il totale non basta: 26% di accettazione vuol
+    # dire una cosa se il primo candidato passa quasi sempre e il blocco si esaurisce dopo, e
+    # un'altra se e' il primo a cadere -- e i due casi si riparano in posti diversi.
+    _spec_hist: list[int] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -44,6 +51,12 @@ class SchedulerStatusReporter:
         self._spec_drafted += drafted
         self._spec_accepted += accepted
         self._spec_blocks += 1
+        # Dimensionato sui candidati PROPOSTI, non su quelli accettati: un blocco che non ne
+        # accetta nessuno lascerebbe l'istogramma lungo 1, e la curva -- che e' lunga quanto
+        # l'istogramma meno uno -- sparirebbe proprio nel caso piu' informativo.
+        if len(self._spec_hist) <= drafted:
+            self._spec_hist.extend([0] * (drafted + 1 - len(self._spec_hist)))
+        self._spec_hist[accepted] += 1
         self._spec_drafted_tot += drafted
         self._spec_accepted_tot += accepted
         self._spec_blocks_tot += 1
@@ -192,9 +205,29 @@ class SchedulerStatusReporter:
         # +1: ogni blocco commette anche il token bonus, come nel conteggio di llama.cpp
         mean_len = (self._spec_accepted + self._spec_blocks) / self._spec_blocks
         msg = (f", draft acceptance: {acc:.3f} ({self._spec_accepted} accepted / "
-               f"{self._spec_drafted} drafted), mean len: {mean_len:.2f}")
+               f"{self._spec_drafted} drafted), mean len: {mean_len:.2f}{self._per_pos()}")
         self._spec_drafted = self._spec_accepted = self._spec_blocks = 0
+        self._spec_hist = []
         return msg
+
+    def _per_pos(self) -> str:
+        """La frazione di blocchi in cui il candidato in posizione i e' stato accettato.
+
+        Serve a sapere DOVE il draft cede, non solo quanto. La posizione i sopravvive nei
+        blocchi che hanno accettato piu' di i candidati, quindi la curva e' la coda cumulativa
+        dell'istogramma: monotona decrescente per costruzione, e la sua forma distingue un
+        draft che sbaglia subito (primo valore gia' basso) da uno che si esaurisce strada
+        facendo (primo valore alto, discesa lenta).
+        """
+        blocchi = sum(self._spec_hist)
+        if not blocchi:
+            return ""
+        coda = blocchi
+        quote = []
+        for accettati in range(len(self._spec_hist) - 1):
+            coda -= self._spec_hist[accettati]
+            quote.append(f"{coda / blocchi:.2f}")
+        return f", per-pos: {' '.join(quote)}" if quote else ""
 
 
 def _usage_ratio(used: int, total: int) -> float:
