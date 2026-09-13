@@ -71,8 +71,16 @@ class EnvClassSingleton:
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     # Let speculative decoding run on hybrid linear-attention models by rewinding the GDN
-    # recurrent state to a block's accepted prefix. Off until the rewound state is shown to
-    # match a non-speculative run: a wrong rewind reads as fluent text, not as an error.
+    # recurrent state to a block's accepted prefix. A wrong rewind reads as fluent text, not
+    # as an error, so this asked to be shown equal to a non-speculative run before being
+    # trusted. It now is, for the eager path: tests/engine/test_gdn_rollback_numerics.py runs
+    # the same tokens twice -- once straight, once speculate-then-rewind -- and the recurrent
+    # state comes back bit-identical, with the convolution window inside one bf16 ulp (the
+    # floor is the input projection tiling over W rows instead of the committed rows, not the
+    # rewind). Held across eight consecutive partly-rejected blocks, so drift would show.
+    # Still off by default because that covers the eager verify only: under SPEC_VERIFY_GRAPH
+    # the stash points at the graph's static activations and is adopted rather than recorded,
+    # which nothing has yet shown equal to anything.
     SPEC_GDN_ROLLBACK = EnvBool(False)
     # Replay the K+1-row speculative verify forward as a CUDA graph instead of launching its
     # kernels one by one. Off until the replayed logits and rewound GDN state are shown to be
