@@ -146,7 +146,30 @@ class SchedulerStatusReporter:
         now = self.clock()
         gap = now - self._last_decode_time
         self._last_decode_time = now
-        gen_throughput = self._decode_generated_tokens / gap if gap > 0 else 0.0
+        # I token COMMESSI, non i passi di decodifica.
+        #
+        # `_decode_generated_tokens` somma len(batch.reqs) a ogni forward, cioe' presuppone
+        # un token per richiesta per passo. Con la decodifica speculativa ogni passo ne
+        # commette `mean len` -- gli accettati piu' il token bonus -- quindi quella riga
+        # riportava PASSI al secondo e sottostimava esattamente del fattore della
+        # speculazione. Misurato il 2026-09-13 sul 27B con DFlash2: la riga diceva 26,4
+        # token/s mentre la stessa finestra, cronometrata da fuori su richieste vere, ne
+        # faceva fra 67 e 155. Il numero sbagliato e' finito in giorni di confronti.
+        #
+        # Con la speculazione attiva i token della finestra sono accettati + blocchi (ogni
+        # blocco commette anche il bonus). I contatori sono ancora pieni qui: _spec_msg()
+        # li azzera piu' sotto, quando compone la sua parte della riga.
+        #
+        # Resta una seconda fonte di sottostima che questo non tocca: `gap` e' tempo di
+        # orologio fra due righe di log, quindi se fra un batch e l'altro il motore e'
+        # stato fermo quell'attesa finisce nel denominatore. Su una generazione continua
+        # incide poco, su un carico a singhiozzo no.
+        tokens_finestra = (
+            self._spec_accepted + self._spec_blocks
+            if self._spec_blocks
+            else self._decode_generated_tokens
+        )
+        gen_throughput = tokens_finestra / gap if gap > 0 else 0.0
         self._decode_generated_tokens = 0
         self.log(
             f"Decode batch, "
