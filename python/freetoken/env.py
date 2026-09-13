@@ -82,6 +82,12 @@ class EnvClassSingleton:
     # the stash points at the graph's static activations and is adopted rather than recorded,
     # which nothing has yet shown equal to anything.
     SPEC_GDN_ROLLBACK = EnvBool(False)
+    # Draft greedily with a plain per-position argmax even when the model carries a DFlash2
+    # selector. Not a speed knob: it is the A/B that says whether the selector is earning its
+    # place. Its job is to make a block whose tokens follow one another, so switching it off
+    # must cost acceptance -- and if it costs nothing, it is wired in but doing nothing, which
+    # the totals alone cannot reveal.
+    SPEC_NO_SELECTOR = EnvBool(False)
     # Replay the K+1-row speculative verify forward as a CUDA graph instead of launching its
     # kernels one by one. Off until the replayed logits and rewound GDN state are shown to be
     # bitwise equal to the eager verify: a stale captured buffer reads as fluent text.

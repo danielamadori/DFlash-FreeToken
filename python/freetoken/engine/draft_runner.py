@@ -449,6 +449,8 @@ class DFlashRunner:
         temperature: float,
     ) -> torch.Tensor:
         selector = getattr(self.draft_model, "candidate_selector", None)
+        if ENV.SPEC_NO_SELECTOR:
+            selector = None
         if selector is not None and temperature <= 0:
             # DFlash 2 does not pick each drafted token on its own. Its selector takes the
             # top-k candidates per position and then walks the block in order, scoring each
