@@ -35,7 +35,7 @@ import torch
 from freetoken.core import Batch, Context, Req, SamplingParams
 from freetoken.engine.gdn_rollback import GDNRollback
 from freetoken.models.config import LinearGatedDeltaGroupConfig
-from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet, rescan_prefix_fused
 from freetoken.utils import torch_dtype
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -243,6 +243,99 @@ def test_consecutive_blocks_do_not_accumulate_drift(shape):
 
     assert ref_len == spec_len
     rec_ref, conv_ref = _state(ctx, 1)
+    rec_rw, conv_rw = _state(ctx, 2)
+    torch.testing.assert_close(conv_rw.float(), conv_ref.float(), rtol=ULP, atol=ULP)
+    torch.testing.assert_close(rec_rw.float(), rec_ref.float(), rtol=ULP, atol=ULP)
+
+
+def _batch_for(ctx, hidden, *, slot: int, cached_len: int):
+    """A Req/Batch pair kept alive across capture and replay.
+
+    The graph bakes the addresses of everything the forward touches, the fla metadata
+    included, so capture and replay have to see the SAME batch object: a fresh one would
+    build fresh index tensors at fresh addresses and the replay would read the captured
+    ones, which still hold the capture's values.
+    """
+    n = hidden.shape[0]
+    req = Req(input_ids=torch.zeros(cached_len + n, dtype=torch.int32), table_idx=slot,
+              cached_len=cached_len, output_len=1, uid=slot,
+              sampling_params=SamplingParams(), cache_handle=None)
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = [req]
+    return batch
+
+
+@pytest.mark.parametrize("accepted", (0, 3, 6))
+def test_a_rewind_that_adopts_a_graphs_stash_lands_where_the_eager_one_does(accepted):
+    """The rewind after a REPLAYED verify, against the rewind after an eager one.
+
+    Under SPEC_VERIFY_GRAPH the verification forward runs no Python, so the layers never call
+    stash() and the rollback would find nothing to walk forward over. The graph runner instead
+    adopts the stash recorded at capture time, whose entries point at the graph's static
+    activations -- the ones the replay has just rewritten for this block's rows.
+
+    That is an argument, not a measurement, and it is the reason both SPEC_VERIFY_GRAPH and
+    SPEC_GDN_ROLLBACK are off by default: a stale captured buffer would feed the rewind the
+    PREVIOUS block's rows, and a recurrent state built from the wrong rows still produces
+    fluent text. Nothing about it looks like an error from outside.
+
+    So: the same tokens twice, one slot eager and one through a captured graph that is
+    replayed on them, and the two states compared. If the adopted entries were stale the
+    replayed slot would hold the warm-up block's state and this would fail.
+    """
+    shape = SHAPES[0]
+    hidden_size = shape[0]
+    op, ctx = _make_op(shape, seed=accepted), _ctx(shape)
+    committed = accepted + 1
+    prefix = 48
+    torch.manual_seed(404)
+    ctx_rows = torch.randn(prefix, hidden_size, device=DEV, dtype=torch.bfloat16)
+    warmup = torch.randn(BLOCK + 1, hidden_size, device=DEV, dtype=torch.bfloat16)
+    window = torch.randn(BLOCK + 1, hidden_size, device=DEV, dtype=torch.bfloat16)
+
+    # Slot 1: the control, entirely eager.
+    _run(op, ctx, ctx_rows, slot=1, cached_len=0)
+    _run(op, ctx, window[:committed], slot=1, cached_len=prefix)
+    rec_ref, conv_ref = _state(ctx, 1)
+
+    # Slot 2: capture a graph over the forward, then replay it on this block's rows.
+    _run(op, ctx, ctx_rows, slot=2, cached_len=0)
+    pool = ctx.linear_state_pool
+    before = (pool.recurrent_states[0, 2].clone(), pool.conv_states[0, 2].clone())
+
+    statico = warmup.clone()                      # the graph's static input row buffer
+    batch = _batch_for(ctx, statico, slot=2, cached_len=prefix)
+    rollback = GDNRollback(pool)
+    rollback.open(2)
+    ctx.gdn_rollback = rollback
+    try:
+        # Warm-up on a side stream, as torch requires before capture, then the capture itself.
+        flusso = torch.cuda.Stream()
+        flusso.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(flusso), ctx.forward_batch(batch):
+            op.forward(statico)
+        torch.cuda.current_stream().wait_stream(flusso)
+
+        grafo = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(grafo), ctx.forward_batch(batch):
+            op.forward(statico)
+        catturato = dict(rollback._stash)          # what the layers stashed while capturing
+        assert catturato, "the capture recorded no layer: there would be nothing to adopt"
+        rollback.close()
+
+        # The warm-up and the capture both advanced the state; put it back where the eager
+        # control started, so the replay below begins from the same place.
+        pool.recurrent_states[0, 2] = before[0]
+        pool.conv_states[0, 2] = before[1]
+
+        rollback.open(2)
+        statico.copy_(window)                      # this block's rows, into the baked address
+        grafo.replay()
+        rollback.adopt(catturato, rescan_prefix_fused)
+        rollback.rewind(accepted)
+    finally:
+        ctx.gdn_rollback = None
+
     rec_rw, conv_rw = _state(ctx, 2)
     torch.testing.assert_close(conv_rw.float(), conv_ref.float(), rtol=ULP, atol=ULP)
     torch.testing.assert_close(rec_rw.float(), rec_ref.float(), rtol=ULP, atol=ULP)

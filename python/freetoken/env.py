@@ -78,10 +78,12 @@ class EnvClassSingleton:
     # state comes back bit-identical, with the convolution window inside one bf16 ulp (the
     # floor is the input projection tiling over W rows instead of the committed rows, not the
     # rewind). Held across eight consecutive partly-rejected blocks, so drift would show.
-    # Still off by default because that covers the eager verify only: under SPEC_VERIFY_GRAPH
-    # the stash points at the graph's static activations and is adopted rather than recorded,
-    # which nothing has yet shown equal to anything.
-    SPEC_GDN_ROLLBACK = EnvBool(False)
+    # The graph path is covered now as well: the same file captures the forward, replays it on
+    # a block's rows, adopts the capture-time stash and rewinds, and lands on the eager
+    # control. That case discriminates -- replaying WITHOUT copying the block's rows into the
+    # baked address fails it by a factor of 968 -- so the adopted entries are shown to carry
+    # the replayed rows and not the capture's.
+    SPEC_GDN_ROLLBACK = EnvBool(True)
     # Draft greedily with a plain per-position argmax even when the model carries a DFlash2
     # selector. Not a speed knob: it is the A/B that says whether the selector is earning its
     # place. Its job is to make a block whose tokens follow one another, so switching it off
@@ -89,8 +91,16 @@ class EnvClassSingleton:
     # the totals alone cannot reveal.
     SPEC_NO_SELECTOR = EnvBool(False)
     # Replay the K+1-row speculative verify forward as a CUDA graph instead of launching its
-    # kernels one by one. Off until the replayed logits and rewound GDN state are shown to be
-    # bitwise equal to the eager verify: a stale captured buffer reads as fluent text.
+    # kernels one by one. The rewound GDN state is now shown equal to the eager verify's
+    # (tests/engine/test_gdn_rollback_numerics.py, the adopt case); the replayed LOGITS are
+    # not, and that is what still holds this off -- a stale captured buffer reads as fluent
+    # text, never as an error.
+    #
+    # What it is worth, measured on this model's GDN shapes: the vendored fla chunk kernel
+    # costs 157 us per layer eager and 23 us replayed from a graph, on the same inputs, and
+    # that figure does not move between 1 and 128 rows. It is 134 us of launch and dispatch
+    # overhead per layer -- 6.4 ms across the 48 GDN layers of Qwen3.8-27B, a fifth of the
+    # 32.7 ms verify, before counting the same overhead on the MLP and the attention.
     SPEC_VERIFY_GRAPH = EnvBool(False)
     # Replay the 8-row DFlash2 draft forward as one CUDA graph per context-row count. Off
     # until the replayed draft tokens are shown bitwise equal to the eager static-cache
