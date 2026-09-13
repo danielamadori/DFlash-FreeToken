@@ -112,11 +112,19 @@ class GGUFDraftEmbedding(nn.Module):
     saving this module exists for, and a lookup touches a handful of rows.
     """
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, quant_type: int) -> None:
+    def __init__(
+        self, num_embeddings: int, embedding_dim: int, quant_type: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.quant_type = quant_type
+        # The draft's serving dtype, not a constant. This used to dequantize to bf16 whatever
+        # the model was built as, so --spec-draft-dtype float32 bought a float32 draft with a
+        # bf16 hole in the middle of it: the selector reads these rows, and rounding them to
+        # eight mantissa bits costs candidates that never show up as an error.
+        self.dtype = dtype
         self.register_buffer(
             "qweight",
             torch.empty(num_embeddings, row_bytes(embedding_dim, quant_type), dtype=torch.uint8),
@@ -128,7 +136,7 @@ class GGUFDraftEmbedding(nn.Module):
         flat = ids.flatten()
         rows = self.qweight.index_select(0, flat)
         out = ggml_dequantize(
-            rows, self.quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16
+            rows, self.quant_type, flat.shape[0], self.embedding_dim, self.dtype
         )
         return out.view(*ids.shape, self.embedding_dim)
 
@@ -192,7 +200,7 @@ def load_gguf_draft(
         if kind == "linear":
             _install_linear(model, path, tensor, device)
         elif kind == "embedding":
-            _install_embedding(model, path, tensor, device)
+            _install_embedding(model, path, tensor, device, dtype)
         else:
             _install_param(model, path, tensor, device, dtype)
 
@@ -242,11 +250,13 @@ def _install_linear(model: nn.Module, path: str, tensor: GgufTensor, device) -> 
     setattr(owner, attr, module)
 
 
-def _install_embedding(model: nn.Module, path: str, tensor: GgufTensor, device) -> None:
+def _install_embedding(
+    model: nn.Module, path: str, tensor: GgufTensor, device, dtype: torch.dtype
+) -> None:
     owner, attr = _resolve(model, path)
     old = getattr(owner, attr)
     num_embeddings, embedding_dim = old.weight.shape
-    module = GGUFDraftEmbedding(num_embeddings, embedding_dim, tensor.ggml_type)
+    module = GGUFDraftEmbedding(num_embeddings, embedding_dim, tensor.ggml_type, dtype)
     packed = tensor.packed()
     if tuple(packed.shape) != tuple(module.qweight.shape):
         raise ValueError(
