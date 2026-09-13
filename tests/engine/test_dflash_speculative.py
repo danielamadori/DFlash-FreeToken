@@ -504,9 +504,21 @@ class _Selector:
         self.anchors: list[torch.Tensor] = []
 
     def select(self, h, lg, anchor_ids, temperature):  # noqa: ANN001 - fake
+        """The real selector's contract: tokens, its candidate set, and the q it drew from.
+
+        Greedy takes an argmax and has no q to report; sampling draws within the candidates
+        and must report the probabilities it drew with, or the verifier cannot weigh them.
+        """
         self.log.append("selector")
         self.anchors.append(anchor_ids.clone())
-        return torch.arange(h.shape[1], dtype=torch.long)[None], None, None
+        block = h.shape[1]
+        tokens = torch.arange(block, dtype=torch.long)[None]
+        if temperature <= 0:
+            return tokens, None, None
+        # top_k = 2 per position; the drawn token is the first of each pair.
+        candidates = torch.stack([tokens[0], (tokens[0] + 5) % _VOCAB], dim=-1)[None]
+        q = torch.tensor([0.75, 0.25]).expand(1, block, 2).contiguous()
+        return tokens, candidates, q
 
 
 class _FakeGraph:
@@ -639,7 +651,15 @@ def test_first_block_beyond_the_window_feeds_the_last_window_rows():
     assert torch.equal(r._static_cache.staged[0], torch.arange(seq_len - 16, seq_len + k))
 
 
-def test_greedy_static_path_uses_the_selector_and_sampling_bypasses_it():
+def test_the_selector_drafts_at_every_temperature_not_only_greedy():
+    """Sampling requests go through the selector too, which is every request in production.
+
+    The selector chains each candidate to the one just chosen; drawing every position on its
+    own is DFlash 1's rule, and it costs acceptance without ever raising. It used to run only
+    for greedy requests, on the grounds that rejection sampling wants a full-vocabulary q and
+    the selector scores a candidate set -- but speculative sampling is unbiased under ANY
+    proposal, provided the q it divides by is the q the tokens were drawn from.
+    """
     r, log = _static_runner(selector=_Selector([]))
     r.draft_model.candidate_selector.log = log
     tokens, _ = _draft(r, 2, 20, temperature=0.0)
@@ -649,9 +669,33 @@ def test_greedy_static_path_uses_the_selector_and_sampling_bypasses_it():
 
     del log[:]
     tokens, probs = _draft(r, 2, 21, temperature=0.7)
-    assert "selector" not in log, "T > 0 draws per position, as before"
-    assert tokens.shape == (1, r.block_size - 1)
-    assert r._warned_sampling_selector
+    assert "selector" in log, "T > 0 must draft through the selector as well"
+    assert torch.equal(tokens, torch.arange(r.block_size - 1)[None])
+
+
+def test_sampling_reports_the_proposal_the_selector_actually_drew_from():
+    """The probabilities handed back are the selector's, scattered by token id.
+
+    This is the half that makes the wiring correct rather than merely enabled: the verifier
+    divides the target's probability by this one, so reporting the per-position softmax while
+    the tokens came from the selector's candidate set would bias every acceptance decision.
+    Zero everywhere the selector could not have drawn is not a detail -- it is the statement
+    that those tokens had no chance of being proposed.
+    """
+    r, log = _static_runner(selector=_Selector([]))
+    r.draft_model.candidate_selector.log = log
+    tokens, probs = _draft(r, 2, 21, temperature=0.7)
+
+    block = r.block_size - 1
+    assert probs.shape == (1, block, _VOCAB)
+    for i in range(block):
+        drawn = int(tokens[0, i])
+        other = (drawn + 5) % _VOCAB
+        assert probs[0, i, drawn].item() == pytest.approx(0.75)
+        assert probs[0, i, other].item() == pytest.approx(0.25)
+        rest = probs[0, i].clone()
+        rest[drawn] = rest[other] = 0.0
+        assert rest.abs().max().item() == 0.0, "no mass outside the candidate set"
 
 
 def test_static_path_refuses_a_block_size_override():

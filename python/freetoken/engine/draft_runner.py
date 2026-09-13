@@ -401,7 +401,6 @@ class DFlashRunner:
         # Which request the draft cache belongs to. The cache holds that request's context
         # keys, built up block by block; it is meaningless for any other request.
         self._cache_owner: int | None = None
-        self._warned_sampling_selector = False
 
         # A windowed draft (DFlash 2) keeps its keys in one ring allocated here and never
         # replaced: a CUDA graph bakes the K/V addresses, and a second cache object for the
@@ -447,33 +446,53 @@ class DFlashRunner:
         draft_probs: torch.Tensor,
         anchor_ids: torch.Tensor,
         temperature: float,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The block's tokens and the proposal distribution they were drawn from.
+
+        The second return value is what rejection sampling divides by, so it has to describe
+        the distribution the tokens ACTUALLY came from. When the selector draws them, that is
+        the selector's own distribution and not the per-position softmax the caller computed.
+        """
         selector = getattr(self.draft_model, "candidate_selector", None)
         if ENV.SPEC_NO_SELECTOR:
             selector = None
-        if selector is not None and temperature <= 0:
-            # DFlash 2 does not pick each drafted token on its own. Its selector takes the
-            # top-k candidates per position and then walks the block in order, scoring each
-            # candidate against the token just chosen through the predecessor/successor
-            # codebooks. Choosing every position independently -- which is DFlash 1's rule --
-            # yields a block whose tokens do not follow one another, and the target rejects it:
-            # the cost shows up as a low acceptance rate, never as an error.
-            draft_tokens, _candidates, _q = selector.select(
-                draft_hidden, draft_logits, anchor_ids, temperature
-            )
-            return draft_tokens
+        if selector is None:
+            if temperature <= 0:
+                return torch.argmax(draft_logits, dim=-1), draft_probs
+            return _sample_probs(draft_probs), draft_probs
+
+        # DFlash 2 does not pick each drafted token on its own. Its selector takes the top-k
+        # candidates per position and then walks the block in order, scoring each candidate
+        # against the token just chosen through the predecessor/successor codebooks. Choosing
+        # every position independently -- which is DFlash 1's rule -- yields a block whose
+        # tokens do not follow one another, and the target rejects it: the cost shows up as a
+        # low acceptance rate, never as an error.
+        draft_tokens, candidates, q = selector.select(
+            draft_hidden, draft_logits, anchor_ids, temperature
+        )
         if temperature <= 0:
-            return torch.argmax(draft_logits, dim=-1)
-        if selector is not None and not self._warned_sampling_selector:
-            # Not a silent fallback: the selector returns scores over its candidate set,
-            # and rejection sampling here wants a full-vocabulary distribution, so wiring
-            # the two together is a change to the sampler, not to this call.
-            logger.info_rank0(
-                "DFlash 2 selector is bypassed at temperature > 0: candidates are drawn "
-                "per position, which lowers acceptance. Greedy drafting uses the selector."
+            # Greedy verification compares tokens, never probabilities; draft_probs is carried
+            # through untouched because nothing downstream reads it on this path.
+            return draft_tokens, draft_probs
+        if q is None:
+            raise RuntimeError(
+                "the DFlash 2 selector returned no proposal probabilities at temperature "
+                f"{temperature}: rejection sampling cannot weigh a draw it cannot measure"
             )
-            self._warned_sampling_selector = True
-        return _sample_probs(draft_probs)
+        # The selector samples within its own candidate set, so the proposal is sparse: top_k
+        # tokens per position carrying all the mass. Rejection sampling wants it indexed by
+        # token id like the target's, so it is scattered back to full width -- zero everywhere
+        # the selector could not have drawn.
+        #
+        # This is what "bypassed at temperature > 0" used to mean: the tokens came from the
+        # selector for greedy requests and from a plain per-position draw for every other one,
+        # which is every request production actually serves. Speculative sampling stays
+        # unbiased under any proposal as long as the q it divides by is the q it drew from --
+        # so the fix is to hand over the real one, not to widen it.
+        proposal = torch.zeros_like(draft_probs).scatter(
+            -1, candidates, q.to(draft_probs.dtype)
+        )
+        return draft_tokens, proposal
 
     def _run_block(
         self,
@@ -515,7 +534,7 @@ class DFlashRunner:
         cache.retire()
         draft_logits = _target_output_logits(self._target, draft_hidden)
         draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
-        draft_tokens = self._select_tokens(
+        draft_tokens, draft_probs = self._select_tokens(
             draft_hidden, draft_logits, draft_probs, block_ids[:, 0], temperature
         )
         return draft_tokens, draft_probs, draft_logits
@@ -595,7 +614,7 @@ class DFlashRunner:
 
         draft_logits = _target_output_logits(self._target, draft_hidden)
         draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
-        draft_tokens = self._select_tokens(
+        draft_tokens, draft_probs = self._select_tokens(
             draft_hidden, draft_logits, draft_probs, block_output_ids[:, 0], temperature
         )
         return draft_tokens, draft_probs
