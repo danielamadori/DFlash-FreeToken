@@ -180,7 +180,7 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = stamp_cache_ns(chat_request_to_genspec(req, model_sampling), request)
+        spec = stamp_cache_ns(chat_request_to_genspec(req, model_sampling), request, req.model)
     except ValueError as exc:
         return create_error_response(str(exc))
 

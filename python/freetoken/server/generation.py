@@ -306,16 +306,38 @@ def _mark_ack(ack: Any) -> None:
         marks[f"ack{n}[{getattr(ack, 'prompt_tokens_delta', 0)}p,{text_len}c]"] = time.monotonic()
 
 
-def stamp_cache_ns(spec: GenSpec, request: Any) -> GenSpec:
-    """Carry onto the spec the tenancy the auth middleware read off the credential.
+def stamp_cache_ns(spec: GenSpec, request: Any, model: str | None = None) -> GenSpec:
+    """Carry onto the spec the tenancy this caller was given, from whichever channel had it.
 
     Done at the handler, because that is the first place that has both: the adapters convert a
     wire request into a GenSpec and never see the HTTP request, and submit_generation sees the
-    spec and not the request either. Missing or absent means None, which is the shared tree --
-    a request that arrives without a namespace must still be served, just without partitioning.
+    spec and not the request either. Nothing found means None, which is the shared tree -- a
+    request that arrives without a namespace must still be served, just without partitioning.
+
+    TWO CHANNELS, because one is not enough to cross a proxy chain. The credential is the
+    honest place and works for anything talking to this server directly. It does not survive a
+    middlebox that authenticates upstream with its own key, though, and that is exactly what
+    sits in front of this deployment: measured, a namespace sent in the bearer arrives as None
+    after it. The model name does survive -- it has to, or the middlebox could not route --
+    so "<name>#<ns>" is the fallback, and the bearer wins when both are present.
+
+    The suffix is not a secret and is not treated as one: it comes back in the response's
+    model field, and a caller could put somebody else's there. What protects a namespace is
+    that it is an HMAC the caller cannot compute for anyone but itself, the same property the
+    credential channel relies on.
     """
-    spec.cache_ns = getattr(getattr(request, "state", None), "cache_ns", None)
+    dal_bearer = getattr(getattr(request, "state", None), "cache_ns", None)
+    dal_modello = None
+    if model and "#" in model:
+        coda = model.split("#", 1)[1].strip()
+        dal_modello = coda or None
+    spec.cache_ns = dal_bearer or dal_modello
     return spec
+
+
+def strip_cache_ns(model: str | None) -> str | None:
+    """The model name without its namespace suffix, for anything that compares model names."""
+    return model.split("#", 1)[0] if model and "#" in model else model
 
 
 async def submit_generation(spec: GenSpec, state: Any) -> int:

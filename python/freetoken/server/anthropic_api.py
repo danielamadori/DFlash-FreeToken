@@ -117,7 +117,7 @@ async def handle_anthropic_messages(
         spec = stamp_cache_ns(convert_anthropic_to_genspec(
             req, model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
-        ), request)
+        ), request, getattr(req, "model", None))
         uid = await submit_generation(spec, state)
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
