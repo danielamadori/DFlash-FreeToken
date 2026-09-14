@@ -176,7 +176,7 @@ torch::Tensor ggml_mul_mat_vec_a8(
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({vecs, row}, options);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  // 2..8 activation rows of a type with a planar kernel (mmvq_planar.cuh; -DMMVQ_PLANAR=0 compiles
+  // 2..MMVQ_PLANAR_MAX_COLS activation rows of a type with a planar kernel (mmvq_planar.cuh; -DMMVQ_PLANAR=0 compiles
   // this block out, FREETOKEN_MMVQ_PLANAR=0 skips it at runtime): quantize to the planar layout
   // instead of block_q8_1. Everything below the block is the previous dispatch, unchanged.
 #if MMVQ_PLANAR

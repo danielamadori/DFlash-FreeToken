@@ -133,6 +133,22 @@ def _module():
         extra_cuda_cflags += [f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"]
     if os.environ.get("FREETOKEN_GGUF_FAST_MATH", "").lower() in {"1", "true", "yes", "on"}:
         extra_cuda_cflags += ["--use_fast_math"]
+    # Weight rows per thread block in the planar GEVM. The default (1, in mmvq_planar.cuh) is
+    # what the prototype measured with; the right value is a property of the GPU, not of the
+    # kernel, so it is reachable without editing a header -- and a claim that a shape is
+    # block-limited can be tested by turning it rather than by reading the launch bounds.
+    # Changing it rebuilds the extension: measure in a separate TORCH_EXTENSIONS_DIR unless
+    # you mean to hand the new build to whatever is serving.
+    planar_warps = os.environ.get("FREETOKEN_GGUF_PLANAR_WARPS", "").strip()
+    if planar_warps.isdigit() and 1 <= int(planar_warps) <= 32:
+        extra_cuda_cflags += [f"-DMMVQ_PLANAR_WARPS={int(planar_warps)}"]
+    # Widest activation the planar path takes. Reachable so the ceiling can be MEASURED on a
+    # card rather than argued about -- and so the arm it replaced stays runnable: setting it
+    # back to 8 reproduces the behaviour production had before the ceiling moved, which is the
+    # only way to say what the move was worth in tokens a second instead of in GB/s.
+    planar_cols = os.environ.get("FREETOKEN_GGUF_PLANAR_MAX_COLS", "").strip()
+    if planar_cols.isdigit() and 2 <= int(planar_cols) <= 12:
+        extra_cuda_cflags += [f"-DMMVQ_PLANAR_MAX_COLS={int(planar_cols)}"]
     # MSVC DOES NOT TAKE -O3. Given a GCC-style optimisation flag it prints
     # D9002 "ignoring unknown option" and compiles anyway, so on Windows this
     # kernel was being built unoptimised while the flag asking otherwise sat

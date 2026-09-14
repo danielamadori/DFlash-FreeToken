@@ -1,10 +1,15 @@
 """The batched MMVQ kernel against a dequantized reference, on real tensors of the 27B.
 
 The kernel carries the shape of llama.cpp's mul_mat_vec_q (two warps splitting K, two weight
-rows per thread, one exact instantiation per column count up to 8, a guarded group-of-8 path
-above). What this checks, per quant type: every column count 1..9 and 16/17 (both the exact
+rows per thread, one exact instantiation per column count, a guarded group-of-8 path above).
+What this checks, per quant type: every column count 1..12 and 16/17 (both the exact
 instantiations and the guarded path), an odd number of rows (the row clamp at the tail of the
-grid), and the 1-column decode path. The reference is ggml_dequantize + a float matmul on the
+grid), and the 1-column decode path.
+
+Counts 9..12 matter beyond coverage: they are the planar instantiations added when the ceiling
+moved off 8, and NINE is the width production serves -- a speculative block of 8 presents 8
+candidates plus the bonus row. This is the check that the faster path returns the same numbers
+as the slower one it replaced there. The reference is ggml_dequantize + a float matmul on the
 same Q8_1-rounded activation the kernel consumes, so the two differ only by summation order.
 
 Skipped without CUDA or the GGUF file (this is a fork-local fixture: the file is 14 GiB).
@@ -64,7 +69,7 @@ def _tol(ref: torch.Tensor) -> float:
 
 
 @pytest.mark.parametrize("name", WANT)
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17])
 def test_matches_dequantized_reference(tensors, name, rows):
     from freetoken.kernel.gguf import ggml_dequantize, ggml_mul_mat_vec_a8
 

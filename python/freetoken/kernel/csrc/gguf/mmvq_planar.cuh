@@ -1,4 +1,6 @@
-// Planar-activation MMVQ ("design A", docs/plans/mmvq-8row-kernel-plan.md R3) for 2..8 activation rows.
+// Planar-activation MMVQ ("design A", docs/plans/mmvq-8row-kernel-plan.md R3) for 2..MMVQ_PLANAR_MAX_COLS
+// activation rows. The plan said 8; see the note on MMVQ_PLANAR_MAX_COLS for why that was one short
+// of the width production actually serves.
 //
 // Activation layout (built by quantize_row_planar_cuda in gguf_kernel.cu):
 //   yq[ncols_y][Kp]      int8    the q8_1 quants of activation row c, k-contiguous, zero past K
@@ -13,7 +15,7 @@
 // Kernel shape: one warp per weight row, 8 lanes per K-block (QK_K = 256), 4 K-blocks per
 // warp iteration; the weight block is unpacked ONCE per lane and dotted against all NCOLS
 // activation rows via 16-byte loads of yq and float4 loads of ds. NCOLS is a template
-// parameter (2..8): an odd row count runs the exact instantiation rather than an 8-wide loop on
+// parameter: an odd row count runs the exact instantiation rather than an 8-wide loop on
 // zero-padded columns, so the y-side loads and dp4a scale with the real row count and the
 // quantize buffer never needs 8-column zero fill.
 //
@@ -35,7 +37,21 @@
 #ifndef MMVQ_PLANAR_MIN_COLS
 #define MMVQ_PLANAR_MIN_COLS 2  // 1 column keeps the (bit-identical) one-warp block_q8_1 path
 #endif
-#define MMVQ_PLANAR_MAX_COLS 8
+#ifndef MMVQ_PLANAR_MAX_COLS
+// The widest activation the planar path takes. It was 8 because the kernel was written for a
+// speculative block of 7 (docs/plans/mmvq-8row-kernel-plan.md); production then moved the block
+// to 8, which presents 8 candidates plus the bonus row -- NINE -- and nine is one past the
+// ceiling, so the fast kernel stopped being called at exactly the width that serves. Measured on
+// a 4090, Q4_K, rotating past L2, with the planar path on and then off:
+//
+//   rows          2     4     6     7     8     9
+//   down, on    885   878   854   849   739   476   GB/s
+//   down, off   864   835   656   601   596   476
+//
+// At nine the two columns are the SAME number, which is the whole story: nothing planar ran.
+// Kept overridable so the ceiling can be re-measured on another card rather than argued about.
+#define MMVQ_PLANAR_MAX_COLS 12
+#endif
 
 // ---------------------------------------------------------------- shared helpers
 
@@ -161,7 +177,8 @@ mmvq_planar_q4_K(const void* __restrict__ vx, const int8_t* __restrict__ yq, con
 
 // ---------------------------------------------------------------- launch + dispatch
 
-// Launch KERNEL_<scalar_t, nvecs> for nvecs in 2..8 (call inside a function where scalar_t, vx,
+// Launch KERNEL_<scalar_t, nvecs> for nvecs in 2..MMVQ_PLANAR_MAX_COLS (call inside a function
+// where scalar_t, vx,
 // yq, ds, dst, ncols, nrows, Kp, nvecs, stream are in scope). Grid: one warp per weight row.
 #define MMVQ_PLANAR_CASE_(KERNEL_, N_)                                                       \
   case N_:                                                                                   \
@@ -179,8 +196,12 @@ mmvq_planar_q4_K(const void* __restrict__ vx, const int8_t* __restrict__ yq, con
       MMVQ_PLANAR_CASE_(KERNEL_, 6);                                                    \
       MMVQ_PLANAR_CASE_(KERNEL_, 7);                                                    \
       MMVQ_PLANAR_CASE_(KERNEL_, 8);                                                    \
+      MMVQ_PLANAR_CASE_(KERNEL_, 9);                                                    \
+      MMVQ_PLANAR_CASE_(KERNEL_, 10);                                                   \
+      MMVQ_PLANAR_CASE_(KERNEL_, 11);                                                   \
+      MMVQ_PLANAR_CASE_(KERNEL_, 12);                                                   \
       default:                                                                          \
-        break; /* unreachable: mmvq_planar_ok gates 2..8 */                             \
+        break; /* unreachable: mmvq_planar_ok gates the range */                        \
     }                                                                                   \
   } while (0)
 
