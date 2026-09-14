@@ -121,8 +121,8 @@ struct IndexKernel {
         .with_device<kDLCUDA>(device_)
         .verify(output);
     TensorMatcher({L}) //
-        .with_dtype<int32_t, int64_t>(indices_dtype_)
-        .with_device<kDLCUDA>(device_)
+        .template with_dtype<int32_t, int64_t>(indices_dtype_)
+        .template with_device<kDLCUDA>(device_)
         .verify(indices);
 
     const auto device = device_.unwrap();

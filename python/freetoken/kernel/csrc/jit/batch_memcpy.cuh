@@ -26,7 +26,7 @@ struct BatchMemcpy {
         auto ptr_dtype = SymbolicDType{};
         TensorMatcher({N})
             .with_dtype<int64_t>(ptr_dtype)
-            .with_device<kDLCPU>()
+            .template with_device<kDLCPU>()
             .verify(dst_ptrs)
             .verify(src_ptrs)
             .verify(sizes);
