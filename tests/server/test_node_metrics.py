@@ -101,3 +101,31 @@ def test_a_non_hybrid_model_reports_no_state_slots_rather_than_zero():
     d["mamba"] = None
     testo = "\n".join(_linee(d, 1))
     assert "freetoken:state_slots" not in testo
+
+
+def test_props_declares_what_the_front_door_accepts() -> None:
+    """A cluster that routes by model name alone sends a photo wherever that name is
+    served and learns it does not fit only when the node refuses it. The router can do
+    better only if the node says what it takes."""
+    from freetoken.server.node_metrics import build_props
+
+    props = build_props(_state(), _doc(), "0.1.2")
+
+    assert props["modalities"] == {"vision": False, "video": False, "audio": False}
+
+
+def test_the_advertisement_follows_the_tuple_the_api_checks() -> None:
+    """Never from the model's own abilities: a checkpoint with a vision tower loaded is
+    still refused an image by this API, so advertising vision because the weights are
+    there would be a node promising what it then rejects. Teaching the API a part type
+    must move the advertisement with it, without anyone remembering to."""
+    import freetoken.server.node_metrics as nm
+
+    originale = nm.ACCEPTED_CONTENT_PART_TYPES
+    try:
+        nm.ACCEPTED_CONTENT_PART_TYPES = ("text", "image_url")
+        assert nm.build_props(_state(), _doc(), "0.1.2")["modalities"]["vision"] is True
+    finally:
+        nm.ACCEPTED_CONTENT_PART_TYPES = originale
+
+    assert nm.build_props(_state(), _doc(), "0.1.2")["modalities"]["vision"] is False

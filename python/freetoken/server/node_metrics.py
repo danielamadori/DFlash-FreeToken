@@ -25,6 +25,16 @@ from typing import Any, Callable
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
+from .generation import ACCEPTED_CONTENT_PART_TYPES
+
+# OpenAI names a content part by its ``type``; llama-server's ``/props`` names the same
+# abilities as modalities. One map, so the two vocabularies cannot drift apart.
+_PART_TYPE_TO_MODALITY = {
+    "image_url": "vision",
+    "video_url": "video",
+    "input_audio": "audio",
+}
+
 
 def _ctx_per_slot(card: dict, slots: int) -> int:
     """Context one caller gets, which is what the watcher records.
@@ -58,8 +68,29 @@ def build_props(state: Any, doc: dict, version: str) -> dict:
         # A state, not a configuration, and this engine never idles its weights out.
         "is_sleeping": False,
         "endpoint_metrics": True,
+        "modalities": _modalities(),
         "default_generation_settings": {"n_ctx": _ctx_per_slot(card, slots)},
     }
+
+
+def _modalities() -> dict:
+    """What a caller may SEND this engine, in llama-server's spelling.
+
+    A cluster that routes by model name alone sends a photo wherever that name is served and
+    finds out it does not fit only when the node refuses it -- which is what happens today:
+    the request crosses the hub, is leased as a job, reaches the engine and dies there, and
+    the caller reads a refusal instead of being routed somewhere that could have answered.
+    A router can only do better if every node SAYS what it takes, so this says it.
+
+    Derived from ``ACCEPTED_CONTENT_PART_TYPES``, the tuple the front door actually checks,
+    and never from the model's own abilities: a checkpoint with a vision tower loaded would
+    still be refused an image by this API, and advertising vision because the weights are
+    there would be a node promising what it then rejects. When the API learns a part type,
+    this follows without anyone remembering to update it.
+    """
+    accettate = {_PART_TYPE_TO_MODALITY[t] for t in ACCEPTED_CONTENT_PART_TYPES
+                 if t in _PART_TYPE_TO_MODALITY}
+    return {nome: nome in accettate for nome in ("vision", "video", "audio")}
 
 
 def _linee(doc: dict, slots: int) -> list[str]:

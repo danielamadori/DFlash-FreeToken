@@ -238,11 +238,22 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
+# The content-part types this server accepts on the way in, and the ONE place that decides.
+# A part named anything else is refused, never dropped: a silently discarded image answers a
+# question the caller did not ask, and reads as a bad model instead of an unsupported request.
+#
+# ``/props`` derives the modalities it advertises from this tuple (see server/node_metrics.py),
+# so a node cannot announce an ability its own front door refuses. Teaching the server to accept
+# images means adding "image_url" HERE and building the embeds -- and the advertisement follows
+# on its own rather than being remembered separately.
+ACCEPTED_CONTENT_PART_TYPES: tuple[str, ...] = ("text",)
+
+
 def _flatten_text_parts(parts: list[Any]) -> str:
     texts: list[str] = []
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
-        if ptype == "text":
+        if ptype in ACCEPTED_CONTENT_PART_TYPES:
             texts.append((part.get("text") if isinstance(part, dict) else None) or "")
         else:
             raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
