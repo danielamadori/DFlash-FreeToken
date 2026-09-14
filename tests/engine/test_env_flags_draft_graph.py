@@ -14,13 +14,24 @@ from freetoken.env import ENV, EnvBool, EnvVar
 FLAGS = ["SPEC_DRAFT_GRAPH", "SPEC_DRAFT_GRAPH_SHADOW"]
 
 
+def test_the_draft_graph_is_on_and_the_shadow_is_not():
+    """The graph earns its default; the diagnostic beside it must not.
+
+    The graph replays the draft forward and was shown equal to the eager one -- 1400 blocks at
+    temperature 0, zero mismatching tokens. The shadow runs the block twice and returns the
+    eager result: correct, and half the speed, so a default of on would read as a regression.
+    """
+    assert ENV.SPEC_DRAFT_GRAPH and ENV.SPEC_DRAFT_GRAPH.value is True
+    assert not ENV.SPEC_DRAFT_GRAPH_SHADOW and ENV.SPEC_DRAFT_GRAPH_SHADOW.value is False
+
+
 @pytest.mark.parametrize("name", FLAGS)
-def test_draft_graph_flags_default_off(name):
+def test_both_flags_are_the_same_kind_of_switch(name):
+    """Same parser as every other speculative flag, so the environment can still turn the
+    graph off -- which is the way back out if a model or a backend captures badly."""
     flag = getattr(ENV, name)
     assert isinstance(flag, EnvVar)
     assert flag.fn is ENV.SPEC_VERIFY_GRAPH.fn
-    assert not flag
-    assert flag.value is False
 
 
 @pytest.mark.parametrize("name", FLAGS)

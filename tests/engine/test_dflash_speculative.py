@@ -522,15 +522,22 @@ class _Selector:
 
 
 class _FakeGraph:
-    """DraftGraphRunner's dispatch contract: can_replay -> c or None, replay -> (tokens, probs)."""
+    """DraftGraphRunner's dispatch contract: can_replay -> c or None, replay -> (hidden, logits).
+
+    Hidden and logits, not tokens and probabilities: the graph stops before the sampling, so
+    the runner still has to choose from what comes back. That is what lets a sampled block
+    replay, and every block production serves is sampled.
+    """
 
     def __init__(self, log: list, c: int | None, k: int) -> None:
         self.log = log
         self.c = c
         self.k = k
         self.replays: list[tuple] = []
-        self.tokens = torch.full((1, k - 1), 3, dtype=torch.long)
-        self.probs = torch.zeros(1, k - 1, _VOCAB)
+        self.hidden = torch.zeros(1, k - 1, _HIDDEN)
+        # Flat, like the fake forward's: both sides then pick the same token, so a shadow
+        # mismatch means a real disagreement rather than two different fakes.
+        self.logits = torch.zeros(1, k - 1, _VOCAB)
 
     def can_replay(self, target_hidden_states, k, temperature):  # noqa: ANN001 - fake
         self.log.append("can_replay")
@@ -539,7 +546,7 @@ class _FakeGraph:
     def replay(self, target_hidden_states, current_token_id, seq_len, c):  # noqa: ANN001
         self.log.append("replay")
         self.replays.append((seq_len, c, int(current_token_id.view(()))))
-        return self.tokens, self.probs
+        return self.hidden, self.logits
 
 
 def _target():
@@ -711,7 +718,10 @@ def test_graph_dispatch_runs_after_the_owner_reset_and_skips_the_forward():
     r.graph = graph
     tokens, probs = _draft(r, 3, 20, uid=7)
     assert log == ["reset", "can_replay", "replay"], "reset first, then replay; no eager body"
-    assert tokens is graph.tokens and probs is graph.probs
+    # The replay gives logits; the pick happens outside it, so the tokens are chosen here.
+    # Flat logits, so the greedy pick is the lowest id.
+    assert tokens.tolist() == [[0] * (r.block_size - 1)]
+    assert probs.shape == (1, r.block_size - 1, _VOCAB)
     assert graph.replays == [(20, 3, 5)]
 
     del log[:]
@@ -750,22 +760,26 @@ def test_shadow_mode_returns_the_eager_pair_and_logs_a_mismatch(monkeypatch, cap
     from freetoken.env import ENV
 
     monkeypatch.setattr(ENV, "SPEC_DRAFT_GRAPH_SHADOW", True, raising=False)
-    r, log = _static_runner(selector=_Selector([]))
-    r.draft_model.candidate_selector.log = log
+    # No selector, so the logits alone decide the tokens on both sides. With one, the fake
+    # returns a fixed block whatever it is shown, and perturbing the replayed logits would
+    # change nothing -- the check would pass while measuring nothing.
+    r, log = _static_runner()
     graph = _FakeGraph(log, c=3, k=r.block_size)
     r.graph = graph
-    graph.tokens = torch.arange(r.block_size - 1)[None].clone()  # what the selector returns
     with caplog.at_level("INFO"):
         tokens, probs = _draft(r, 3, 20)
-    assert log == ["reset", "can_replay", "replay", "stage", "mask", "forward", "retire", "selector"]
-    assert tokens is not graph.tokens and torch.equal(tokens, graph.tokens)
-    assert probs is not graph.probs
-    assert (r._shadow_blocks, r._shadow_mismatches) == (1, 0)
+    assert log == ["reset", "can_replay", "replay", "stage", "mask", "forward", "retire"]
+    eager = tokens.clone()
+    assert (r._shadow_blocks, r._shadow_mismatches) == (1, 0), (
+        "the fake graph's logits and the fake forward's agree, so the block matches"
+    )
 
-    graph.tokens[0, 2] = 9
+    # Make the replayed logits pick something else at position 2, and nowhere else.
+    graph.logits[0, 2] = -100.0
+    graph.logits[0, 2, 9] = 100.0
     with caplog.at_level("WARNING"):
         tokens, _ = _draft(r, 3, 23)
-    assert torch.equal(tokens, torch.arange(r.block_size - 1)[None]), "the eager tokens win"
+    assert torch.equal(tokens, eager), "the eager tokens win"
     assert (r._shadow_blocks, r._shadow_mismatches) == (2, 1)
     assert any("shadow mismatch" in m and "first at position 2" in m for m in caplog.messages)
 

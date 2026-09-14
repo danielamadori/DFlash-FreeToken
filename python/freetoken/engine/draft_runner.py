@@ -508,9 +508,14 @@ class DFlashRunner:
         temperature: float,
         top_p: float,
         top_k: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _solo_forward: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         """One draft forward over the static ring: the body eager, warm-up, capture and
         shadow all run, so a replay is op-for-op the eager block.
+
+        With ``_solo_forward`` it stops after the vocabulary projection and returns
+        (hidden, logits) -- everything a block computes that does not depend on the
+        temperature, which is what the CUDA graph captures.
 
         ``th`` is [1, c, features] context (a view of the graph's static buffer when
         captured), ``block_ids`` [1, k] the anchor id followed by mask tokens, ``c`` a Python
@@ -539,11 +544,42 @@ class DFlashRunner:
         # their keys stay in the ring but no later block may see them.
         cache.retire()
         draft_logits = _target_output_logits(self._target, draft_hidden)
+        if _solo_forward:
+            return draft_hidden, draft_logits
+        return self._pick_from(draft_hidden, draft_logits, block_ids[:, 0],
+                               temperature, top_p, top_k) + (draft_logits,)
+
+    def _block_forward(
+        self, th: torch.Tensor, block_ids: torch.Tensor, c: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The half of a draft block that does not depend on how it will be sampled.
+
+        Five layers and a vocabulary projection, which is where the block's time goes and the
+        only part worth putting in a CUDA graph. Split out from ``_run_block`` so the graph
+        stops being a greedy-only graph: it used to capture the selection too, with temperature
+        0 baked in, so every request above 0 -- which is every request production serves -- fell
+        back to the eager path and paid the launch overhead of all five layers.
+        """
+        return self._run_block(th, block_ids, c, 0.0, 1.0, 0, _solo_forward=True)
+
+    def _pick_from(
+        self,
+        draft_hidden: torch.Tensor,
+        draft_logits: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The other half: turn one block's logits into tokens and the proposal they came from.
+
+        Cheap next to the forward -- a softmax and the selector's walk over the block -- and it
+        is the only part that reads the temperature, so it stays outside the graph and runs on
+        whatever the request actually asked for.
+        """
         draft_probs = _sampling_probs(draft_logits, temperature, top_p, top_k)
-        draft_tokens, draft_probs = self._select_tokens(
-            draft_hidden, draft_logits, draft_probs, block_ids[:, 0], temperature
-        )
-        return draft_tokens, draft_probs, draft_logits
+        return self._select_tokens(draft_hidden, draft_logits, draft_probs, anchor_ids,
+                                   temperature)
 
     def _block_ids(self, k: int, current_token_id: torch.Tensor) -> torch.Tensor:
         block_output_ids = torch.full(
@@ -642,9 +678,18 @@ class DFlashRunner:
         merely rejects more often; nothing raises. Both runs stage the same positions to the
         same slots and retire the same noise rows, so running them back to back leaves the
         ring as one run would. The eager pair is what gets returned. One host sync per block.
+
+        The comparison is on the tokens either way, but they now have to be chosen from the
+        replayed logits first: the graph stops before the sampling. Chosen at the SAME
+        temperature as the eager run, or the two would be picking by different rules and every
+        sampled block would read as a mismatch.
         """
         assert self.graph is not None
-        tokens_g, _probs_g = self.graph.replay(target_hidden_states, current_token_id, seq_len, c)
+        hidden_g, logits_g = self.graph.replay(
+            target_hidden_states, current_token_id, seq_len, c)
+        anchor = self._block_ids(k, current_token_id)[:, 0]
+        tokens_g, _probs_g = self._pick_from(
+            hidden_g, logits_g, anchor, temperature, top_p, top_k)
         # The replay's outputs live in static buffers the next replay rewrites: keep a copy so
         # a later warm-up or replay cannot alter what is compared here.
         tokens_g = tokens_g.clone()
@@ -736,7 +781,13 @@ class DFlashRunner:
                         target_hidden_states, current_token_id, seq_len, c, k,
                         temperature, top_p, top_k,
                     )
-                return graph.replay(target_hidden_states, current_token_id, seq_len, c)
+                # The graph gives back the logits; the choosing happens here, at the
+                # temperature this request actually asked for. That is what lets a sampled
+                # block replay at all -- and sampled is every block production serves.
+                hidden, logits = graph.replay(
+                    target_hidden_states, current_token_id, seq_len, c)
+                anchor = self._block_ids(k, current_token_id)[:, 0]
+                return self._pick_from(hidden, logits, anchor, temperature, top_p, top_k)
 
         target_hidden = self._extract_context_feature(target_hidden_states, self.target_layer_ids)
         if self._static_cache is not None:

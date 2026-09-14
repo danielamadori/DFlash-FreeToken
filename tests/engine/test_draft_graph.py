@@ -58,17 +58,18 @@ class FakeRunner:
     def reset_cache(self) -> None:
         self._static_cache.reset()
 
-    def _run_block(self, th, ids, c, temperature, top_p, top_k):  # noqa: ANN001 - fake
+    def _block_forward(self, th, ids, c):  # noqa: ANN001 - fake
+        """The half the graph captures: hidden states and logits, no temperature in sight."""
         self.forwards += 1
         self.log.append(
-            ("run", c, th, ids.clone(), int(self._seq_len_t), temperature, top_p, top_k,
+            ("run", c, th, ids.clone(), int(self._seq_len_t), 0.0, 1.0, 0,
              torch.is_inference_mode_enabled())
         )
         n = float(self.forwards)
         candidates = 1 if self.bad_shapes else BLOCK - 1
-        tokens = torch.full((1, candidates), self.forwards, dtype=torch.int64)
+        hidden = torch.full((1, candidates, HIDDEN), n)
         logits = torch.full((1, candidates, VOCAB), n)
-        return tokens, logits + 0.5, logits
+        return hidden, logits
 
 
 class FakeGraph:
@@ -84,8 +85,8 @@ class FakeGraph:
         self.replays += 1
         self.log.append(("graph", self.c, self.replays))
         # What the captured body would compute: a function of the inputs it reads.
-        self.bufs.tokens.fill_(100 * self.c + self.replays)
-        self.bufs.probs.fill_(float(self.bufs.seq_len) + float(self.bufs.ids[0, 0]))
+        self.bufs.hidden_out.fill_(100 * self.c + self.replays)
+        self.bufs.logits_out.fill_(float(self.bufs.seq_len) + float(self.bufs.ids[0, 0]))
 
 
 @pytest.fixture()
@@ -148,7 +149,7 @@ def test_buffer_shapes_and_capture_values():
     assert bufs.th.shape == (1, BLOCK, FEATURES) and bufs.th.dtype == torch.bfloat16
     assert bufs.ids.shape == (1, BLOCK) and bufs.ids.dtype == torch.int64
     assert bufs.hidden == HIDDEN and bufs.seq_len is seq_len
-    assert bufs.tokens is None and bufs.probs is None
+    assert bufs.hidden_out is None and bufs.logits_out is None
 
     bufs.th.fill_(3.0)
     bufs.ids.fill_(4)
@@ -173,19 +174,19 @@ def test_buffer_outputs_are_sized_from_the_first_forward_and_copies_refuse_broad
         mask_token_id=MASK, seq_len=torch.zeros(1, dtype=torch.int64), device=CPU,
         dtype=torch.float32,
     )
-    tokens = torch.ones(1, BLOCK - 1, dtype=torch.int64)
-    probs = torch.ones(1, BLOCK - 1, VOCAB, dtype=torch.bfloat16)
-    bufs.alloc_outputs(tokens, probs)
-    assert bufs.tokens.shape == tokens.shape and bufs.tokens.dtype == torch.int64
-    assert bufs.probs.shape == probs.shape and bufs.probs.dtype == torch.bfloat16
-    assert bufs.tokens is not tokens and bufs.probs is not probs
+    hidden = torch.ones(1, BLOCK - 1, HIDDEN, dtype=torch.bfloat16)
+    logits = torch.ones(1, BLOCK - 1, VOCAB, dtype=torch.bfloat16)
+    bufs.alloc_outputs(hidden, logits)
+    assert bufs.hidden_out.shape == hidden.shape and bufs.hidden_out.dtype == torch.bfloat16
+    assert bufs.logits_out.shape == logits.shape and bufs.logits_out.dtype == torch.bfloat16
+    assert bufs.hidden_out is not hidden and bufs.logits_out is not logits
     with pytest.raises(AssertionError):
-        bufs.copy_outputs(tokens[:, :1], probs)  # [1, 1] would broadcast into [1, 7]
+        bufs.copy_outputs(hidden[:, :1], logits)  # [1, 1, H] would broadcast into [1, 7, H]
     with pytest.raises(AssertionError):
-        bufs.copy_outputs(tokens, probs[:, :, :1])
-    bufs.copy_outputs(tokens * 5, probs * 2)
-    assert bufs.tokens.tolist() == [[5] * (BLOCK - 1)]
-    assert float(bufs.probs[0, 0, 0]) == 2.0
+        bufs.copy_outputs(hidden, logits[:, :, :1])
+    bufs.copy_outputs(hidden * 5, logits * 2)
+    assert float(bufs.hidden_out[0, 0, 0]) == 5.0
+    assert float(bufs.logits_out[0, 0, 0]) == 2.0
 
 
 # ------------------------------------------------------------------------------- capture
@@ -224,12 +225,12 @@ def test_capture_warms_up_then_captures_each_row_count_into_one_shared_pool(cuda
 
     # the outputs hold the last captured forward, not a warm-up
     assert fake.forwards == 2 * BLOCK
-    assert bufs.tokens.tolist() == [[2 * BLOCK] * (BLOCK - 1)]
-    assert float(bufs.probs[0, 0, 0]) == 2 * BLOCK + 0.5
-    assert bufs.probs.shape == (1, BLOCK - 1, VOCAB)
+    assert float(bufs.hidden_out[0, 0, 0]) == float(2 * BLOCK)
+    assert float(bufs.logits_out[0, 0, 0]) == float(2 * BLOCK)
+    assert bufs.logits_out.shape == (1, BLOCK - 1, VOCAB)
     # the scheduler keeps the outputs past draft()'s inference_mode; an inference tensor
     # would refuse the next in-place update there
-    assert not bufs.tokens.is_inference() and not bufs.probs.is_inference()
+    assert not bufs.hidden_out.is_inference() and not bufs.logits_out.is_inference()
 
     # the ring was reset and the owner cleared before the first warm-up and after the last
     # capture, so the rows the captures staged are never a request's context
@@ -278,7 +279,6 @@ def test_can_replay_returns_the_row_count_of_a_greedy_full_block(cuda_stubs):
         (dict(c=BLOCK + 1), BLOCK, 0.0),  # first block after a prefill
         (dict(c=3, rows={TARGET_LAYERS[0]: 4}), BLOCK, 0.0),  # layers disagree on c
         (dict(c=3), BLOCK - 1, 0.0),  # truncated block
-        (dict(c=3), BLOCK, 0.7),  # sampled: a greedy graph would hand one-hot probs
         (dict(c=3, dtype=torch.bfloat16), BLOCK, 0.0),  # another dtype than the buffer
         (dict(c=3, batch=2), BLOCK, 0.0),  # not one request
     ],
@@ -288,6 +288,21 @@ def test_can_replay_refuses_what_no_graph_was_captured_for(
 ):
     runner, *_ = _captured(cuda_stubs)
     assert runner.can_replay(_store(**store_kwargs), k, temperature) is None
+
+
+def test_a_sampled_block_replays_now_that_the_graph_stops_at_the_logits(cuda_stubs):
+    """Temperature used to disqualify a replay, and that disqualified production.
+
+    The graph captured the whole block with temperature 0 baked in, so replaying it for a
+    sampled request would have returned one-hot probabilities and the rejection sampler would
+    have divided by them: wrong, not merely slow. It now stops at the logits, which no
+    temperature changes, and the choosing happens outside on what the request asked for --
+    which is the only reason the graph is worth having, since every block production serves is
+    sampled.
+    """
+    runner, _, _ = _captured(cuda_stubs)
+    assert runner.can_replay(_store(c=3), BLOCK, 0.7) == 3
+    assert runner.can_replay(_store(c=3), BLOCK, 0.0) == 3, "and greedy still does"
 
 
 def test_can_replay_refuses_a_two_dimensional_or_narrow_hidden_state(cuda_stubs):
@@ -327,7 +342,7 @@ def test_replay_copies_the_context_rows_fills_the_start_and_runs_the_matching_gr
     anchor = torch.tensor(5, dtype=torch.int32)
 
     with caplog.at_level("INFO"):
-        tokens, probs = runner.replay(store, anchor, seq_len, c)
+        hidden, logits = runner.replay(store, anchor, seq_len, c)
 
     # rows [:c] of every target layer land in their column block, nothing else moves
     for i, layer_id in enumerate(TARGET_LAYERS):
@@ -339,9 +354,10 @@ def test_replay_copies_the_context_rows_fills_the_start_and_runs_the_matching_gr
     assert bufs.ids.dtype == torch.int64 and bufs.ids.tolist() == [[5] + [MASK] * (BLOCK - 1)]
     # graphs[c] ran, once, and the static buffers came back
     assert log == [("graph", c, 1)]
-    assert tokens is bufs.tokens and probs is bufs.probs
-    assert tokens.tolist() == [[100 * c + 1] * (BLOCK - 1)]
-    assert float(probs[0, 0, 0]) == seq_len + 5
+    assert hidden is bufs.hidden_out and logits is bufs.logits_out
+    # what the fake graph writes: the hidden a function of c, the logits of the inputs it reads
+    assert float(hidden[0, 0, 0]) == float(100 * c + 1)
+    assert float(logits[0, 0, 0]) == seq_len + 5
     assert runner.replays == 1
     assert "Draft graph replay active" in caplog.text
 

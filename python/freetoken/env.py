@@ -115,12 +115,25 @@ class EnvClassSingleton:
     # nothing -- it says nothing between eager and eager either. Costs a whole extra verify per
     # block, and returns the eager logits, so it is a diagnostic and never a serving mode.
     SPEC_VERIFY_GRAPH_SHADOW = EnvBool(False)
-    # Replay the 8-row DFlash2 draft forward as one CUDA graph per context-row count. Off
-    # until the replayed draft tokens are shown bitwise equal to the eager static-cache
-    # draft: a graph baking a stale ring or hidden address only reads as lost acceptance.
-    SPEC_DRAFT_GRAPH = EnvBool(False)
+    # Replay the 8-row DFlash2 draft forward as one CUDA graph per context-row count. This
+    # asked for the replayed draft tokens to be shown equal to the eager static-cache draft
+    # before being trusted, since a graph baking a stale ring or hidden address reads as lost
+    # acceptance and never as an error. Shown by SPEC_DRAFT_GRAPH_SHADOW below: 1400 blocks at
+    # temperature 0, zero mismatching tokens.
+    #
+    # The graph stops at the logits. It used to capture the whole block, sampling included,
+    # with temperature 0 baked in -- so a request above 0 could not replay it at all without
+    # the rejection sampler dividing by one-hot probabilities, and every request production
+    # serves is above 0. Splitting the forward from the choosing is what made it apply where
+    # it pays: the draft goes from 5.4 to 4.7 ms of a 28.7 ms block at temperature 1.
+    SPEC_DRAFT_GRAPH = EnvBool(True)
     # Also run the eager draft on every replayed block, log a token mismatch, return the
     # eager pair. One host sync per block: the only way to see what rejection hides.
+    #
+    # It compares TOKENS, so it can only prove anything at temperature 0. Above it the two
+    # paths sample independently from the same distribution and disagree by construction --
+    # measured at 1329 mismatching blocks of 1419, which looks like a broken graph and is
+    # nothing but two honest draws.
     SPEC_DRAFT_GRAPH_SHADOW = EnvBool(False)
 
     # Name each step of the speculative block for a profiler (nsys -t cuda,nvtx). Off by

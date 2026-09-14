@@ -61,8 +61,10 @@ class DraftCaptureBuffer:
     ids: torch.Tensor  # int64 [1, block]: the anchor token then mask tokens
     seq_len: torch.Tensor  # int64 [1], shared with the runner
     mask_token_id: int
-    tokens: torch.Tensor | None = None  # int64 [1, block - 1]
-    probs: torch.Tensor | None = None  # [1, block - 1, vocab]
+    # Hidden states and logits, not tokens and probabilities: the graph stops before the
+    # sampling, so what it hands back is what a block computes regardless of temperature.
+    hidden_out: torch.Tensor | None = None  # [1, block - 1, hidden]
+    logits_out: torch.Tensor | None = None  # [1, block - 1, vocab]
 
     @classmethod
     def init(
@@ -102,33 +104,33 @@ class DraftCaptureBuffer:
         self.ids.fill_(self.mask_token_id)
         self.ids[0, 0] = 0
 
-    def alloc_outputs(self, tokens: torch.Tensor, probs: torch.Tensor) -> None:
+    def alloc_outputs(self, hidden: torch.Tensor, logits: torch.Tensor) -> None:
         """Size the output buffers from the first warm-up's outputs."""
         candidates = self.block - 1
-        assert tokens.shape == (1, candidates) and probs.dim() == 3, (
-            f"the draft forward returned tokens {tuple(tokens.shape)} and probs "
-            f"{tuple(probs.shape)} for a block of {self.block}"
+        assert hidden.shape[:2] == (1, candidates) and logits.dim() == 3, (
+            f"the draft forward returned hidden {tuple(hidden.shape)} and logits "
+            f"{tuple(logits.shape)} for a block of {self.block}"
         )
-        assert probs.shape[:2] == (1, candidates), (
-            f"probs {tuple(probs.shape)} do not cover the {candidates} candidates"
+        assert logits.shape[:2] == (1, candidates), (
+            f"logits {tuple(logits.shape)} do not cover the {candidates} candidates"
         )
         # Allocated as ordinary tensors even though capture runs under inference_mode: an
         # inference tensor refuses in-place updates outside that mode, and the scheduler
         # keeps these buffers after draft() returns.
         with torch.inference_mode(False):
-            self.tokens = torch.empty(tokens.shape, dtype=tokens.dtype, device=tokens.device)
-            self.probs = torch.empty(probs.shape, dtype=probs.dtype, device=probs.device)
+            self.hidden_out = torch.empty(hidden.shape, dtype=hidden.dtype, device=hidden.device)
+            self.logits_out = torch.empty(logits.shape, dtype=logits.dtype, device=logits.device)
 
-    def copy_outputs(self, tokens: torch.Tensor, probs: torch.Tensor) -> None:
+    def copy_outputs(self, hidden: torch.Tensor, logits: torch.Tensor) -> None:
         """The copies recorded into each graph, so a replay lands in the static buffers."""
-        assert self.tokens is not None and self.probs is not None
+        assert self.hidden_out is not None and self.logits_out is not None
         # copy_ broadcasts: a [1, 1] result would silently fill every candidate slot.
-        assert tokens.shape == self.tokens.shape and probs.shape == self.probs.shape, (
-            f"a forward returned tokens {tuple(tokens.shape)} probs {tuple(probs.shape)}, "
-            f"the buffers hold {tuple(self.tokens.shape)} {tuple(self.probs.shape)}"
+        assert hidden.shape == self.hidden_out.shape and logits.shape == self.logits_out.shape, (
+            f"a forward returned hidden {tuple(hidden.shape)} logits {tuple(logits.shape)}, "
+            f"the buffers hold {tuple(self.hidden_out.shape)} {tuple(self.logits_out.shape)}"
         )
-        self.tokens.copy_(tokens)
-        self.probs.copy_(probs)
+        self.hidden_out.copy_(hidden)
+        self.logits_out.copy_(logits)
 
 
 class DraftGraphRunner:
@@ -184,14 +186,14 @@ class DraftGraphRunner:
                     # Eager first, on the same buffers and shapes: lazy buffers (the embedding
                     # scale, cuBLAS workspaces, the SDPA kernel for this shape) must exist
                     # before the capture, which refuses allocations it cannot replay.
-                    tokens, probs, _ = runner._run_block(th, bufs.ids, c, 0.0, 1.0, 0)
-                    if bufs.tokens is None:
-                        bufs.alloc_outputs(tokens, probs)
+                    hidden, logits = runner._block_forward(th, bufs.ids, c)
+                    if bufs.hidden_out is None:
+                        bufs.alloc_outputs(hidden, logits)
                     torch.cuda.synchronize(self.device)
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                        tokens, probs, _ = runner._run_block(th, bufs.ids, c, 0.0, 1.0, 0)
-                        bufs.copy_outputs(tokens, probs)
+                        hidden, logits = runner._block_forward(th, bufs.ids, c)
+                        bufs.copy_outputs(hidden, logits)
                     if pool is None:
                         pool = graph.pool()
                     graphs[c] = graph
@@ -219,14 +221,20 @@ class DraftGraphRunner:
     ) -> int | None:
         """The context-row count ``c`` of the graph this block replays through, or None.
 
-        Host-side checks only. A block of another size has no graph; a sampled block must
-        stay eager because a greedy graph returns one-hot probs, and the stochastic rejection
-        sampler would treat those as the draft distribution (a correctness bug, not a slower
-        path); a first block after a prefill has more rows than any graph.
+        Host-side checks only. A block of another size has no graph; a first block after a
+        prefill has more rows than any graph.
+
+        The temperature no longer decides. It used to: the graph captured the whole block,
+        selection included, with temperature 0 baked in, so a sampled block replaying it would
+        have got one-hot probabilities and the rejection sampler would have divided by them --
+        wrong, not merely slow. Now the graph stops at the logits, which no temperature
+        changes, and the sampling runs eagerly on whatever the request asked for. That matters
+        because every request production serves asks for a temperature above zero, so the
+        graph was never used where it would have paid.
         """
         if not self.graphs or self.bufs is None:
             return None
-        if k != self.block or temperature > 0:
+        if k != self.block:
             return None
         bufs = self.bufs
         c: int | None = None
@@ -279,7 +287,7 @@ class DraftGraphRunner:
         self.replays += 1
         if self.replays == 1:
             logger.info_rank0("Draft graph replay active (first replay)")
-        return bufs.tokens, bufs.probs  # type: ignore[return-value]
+        return bufs.hidden_out, bufs.logits_out  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ teardown
 
