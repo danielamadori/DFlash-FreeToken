@@ -85,11 +85,30 @@ class SWARadixCache:
         self._revives = 0        # observability: # of insert-side tombstone revives (Branches 1/2)
 
     # ---------------------------------------------------------------- match / insert
-    def match_prefix(self, input_ids: torch.Tensor) -> SWAMatch:
+    def match_prefix(
+        self, input_ids: torch.Tensor, ns: str | None = None, public_len: int = 0
+    ) -> SWAMatch:
         """Match the token prefix for the full layers, then truncate the reusable length to the
         windowed-reuse boundary for the swa layers: the deepest node whose run of contiguous live
         (non-tombstone) tokens back to the last tombstone is ``>= sliding_window_size`` (or the
-        path is tombstone-free to root). Mirrors sglang ``_match_prefix_helper``."""
+        path is tombstone-free to root). Mirrors sglang ``_match_prefix_helper``.
+
+        ``ns`` isolates, the same way and with the same default as the other two trees: None
+        matches everything, a name matches only what is public or its own.
+
+        ``public_len`` is REFUSED here rather than ignored. The two-tier split cuts a node at
+        the boundary, and in this tree a node also carries a tombstone and a window run that a
+        cut would have to divide correctly -- untestable without an SWA model, and no model
+        served here is one. Raising says so; accepting and doing nothing would leave a caller
+        believing the system section was shared when it was not, which is the failure mode the
+        whole namespace exists to avoid.
+        """
+        if public_len:
+            raise NotImplementedError(
+                "SWARadixCache has no public tier: a cut at public_len would have to divide a "
+                "node's tombstone and window run too. Pass public_len=0 and share nothing, or "
+                "implement it against a model that exercises the window."
+            )
         node = self.root
         value: List[torch.Tensor] = []
         # path connected to root without a tombstone is always reusable -> start at +inf.
@@ -99,7 +118,11 @@ class SWARadixCache:
         prefix_pos, total = 0, len(input_ids)
 
         while prefix_pos < total:
-            child = node.children.get(self.key_fn(input_ids[prefix_pos:]))
+            k = self.key_fn(input_ids[prefix_pos:])
+            # Public first, then this caller's own; somebody else's node is under another key.
+            child = node.children.get(k)
+            if child is None and ns is not None:
+                child = node.children.get((k, ns))
             if child is None:
                 break
             if child.swa_tombstone:
@@ -135,7 +158,8 @@ class SWARadixCache:
         return SWAMatch(kv, int(kv.numel()), best_node)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0
+               swa_evicted_seqlen: int = 0, update_kv_after_len: int = 0,
+               ns: str | None = None, public_len: int = 0
                ) -> Tuple[int, torch.Tensor]:
         """Insert the committed full KV prefix. ``kv_indices`` are the request's full-pool page
         indices (the swa rides along via the full->swa mapping, live where the request allocated
@@ -161,7 +185,14 @@ class SWARadixCache:
         node = self.root
         total = 0
         while total < insert_len:
-            child = node.children.get(self.key_fn(input_ids[total:]))
+            if public_len:
+                raise NotImplementedError(
+                    "SWARadixCache has no public tier; see match_prefix for why"
+                )
+            k = self.key_fn(input_ids[total:])
+            child = node.children.get(k)
+            if child is None and ns is not None:
+                child = node.children.get((k, ns))
             if child is None:
                 break
             match_len = align_down(child.get_match_len(input_ids[total:]), self.page_size)
@@ -221,16 +252,19 @@ class SWARadixCache:
             boundary = min(boundary, max(0, len(suffix_ids) - self.page_size))
             if boundary > 0:
                 node = self._add_child(node, suffix_ids[:boundary], suffix_kv[:boundary],
-                                       tombstone=True)
+                                       tombstone=True, ns=ns)
                 suffix_ids, suffix_kv = suffix_ids[boundary:], suffix_kv[boundary:]
             if len(suffix_ids):
-                self._add_child(node, suffix_ids, suffix_kv, tombstone=False)
+                self._add_child(node, suffix_ids, suffix_kv, tombstone=False, ns=ns)
         return total, (torch.cat(freed) if freed else self.empty)
 
     def _add_child(self, parent: RadixTreeNode, ids: torch.Tensor, kv: torch.Tensor,
-                   *, tombstone: bool) -> RadixTreeNode:
+                   *, tombstone: bool, ns: str | None = None) -> RadixTreeNode:
         child = RadixTreeNode(self.key_fn, self._tick())
         child.set_key_value(ids, kv)
+        # The owner before the parent: set_parent files the node under a key that includes it,
+        # so assigning ns afterwards would leave it unreachable from its own parent.
+        child.ns = ns
         child.set_parent(parent)
         child.swa_tombstone = tombstone
         self.full_evictable += child.length

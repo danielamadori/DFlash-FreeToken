@@ -183,21 +183,45 @@ class RadixPrefixCache(BasePrefixCache):
                 node.ref_count += 1
                 node = node.parent
 
-    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
-        node, prefix_len = self._tree_walk(input_ids)
+    def match_prefix(
+        self, input_ids: torch.Tensor, ns: str | None = None, public_len: int = 0
+    ) -> MatchResult:
+        """Match, stopping where the tokens belong to somebody else.
+
+        Same rule and same defaults as HybridRadixCache: None matches everything, which is
+        what every caller that does not partition gets. Kept in step with its sibling on
+        purpose -- a tree that carried the owner on the node but ignored it in the walk would
+        read as isolating and would not, which is the worst of the three states to be in.
+        """
+        node, prefix_len = self._tree_walk(input_ids, ns, public_len)
         return MatchResult(RadixCacheHandle(prefix_len, node))
 
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+    def insert_prefix(
+        self, input_ids: torch.Tensor, indices: torch.Tensor,
+        ns: str | None = None, public_len: int = 0,
+    ) -> InsertResult:
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, indices = input_ids[:insert_len], indices[:insert_len]
-        node, prefix_len = self._tree_walk(input_ids)
-        if prefix_len != insert_len:  # NOTE: prefix_len < insert_len
+        node, matched = self._tree_walk(input_ids, ns, public_len)
+        # The RETURNED length is what the tree already held; the cursor is only where the next
+        # node starts. The hybrid sibling lost twelve pages to conflating them, because the
+        # caller frees up to the returned value as redundant.
+        cursore = matched
+        if cursore != insert_len:  # NOTE: cursore < insert_len
+            cut = align_down(min(public_len, insert_len), self.page_size)
+            if cursore < cut < insert_len:
+                pubblico = RadixTreeNode(self.key_fn)
+                pubblico.set_key_value(input_ids[cursore:cut], indices[cursore:cut].clone())
+                pubblico.set_parent(node)   # ns stays None: the shared section
+                self.evictable_size += pubblico.length
+                node, cursore = pubblico, cut
             new_node = RadixTreeNode(self.key_fn)
-            new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
+            new_node.set_key_value(input_ids[cursore:], indices[cursore:].clone())
+            new_node.ns = None if cursore < cut else ns   # owner before parent: it keys the node
             new_node.set_parent(node)
             self.evictable_size += new_node.length
             node = new_node
-        return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
+        return InsertResult(matched, RadixCacheHandle(insert_len, node))
 
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:
@@ -256,14 +280,21 @@ class RadixPrefixCache(BasePrefixCache):
 
         return leave_nodes
 
-    def _tree_walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+    def _tree_walk(
+        self, input_ids: torch.Tensor, ns: str | None = None, public_len: int = 0
+    ) -> Tuple[RadixTreeNode, int]:
         prefix_len = 0
         indice_len = len(input_ids)
         node = self.root_node
         tic = time.monotonic_ns()
 
         while prefix_len < indice_len:
-            child_node = node.children.get(self.key_fn(input_ids[prefix_len:]))
+            k = self.key_fn(input_ids[prefix_len:])
+            # Public first, then this caller's own. Somebody else's node lives under a
+            # different key, so the walk simply ends here and the caller prefills the rest.
+            child_node = node.children.get(k)
+            if child_node is None and ns is not None:
+                child_node = node.children.get((k, ns))
             if child_node is None:
                 return node, prefix_len
             node = child_node  # walk to child node
