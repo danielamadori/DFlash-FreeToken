@@ -915,3 +915,34 @@ def test_static_path_runs_on_the_real_ring():
     live = ring.slot_pos[ring.slot_pos != NEG].sort().values
     assert torch.equal(live, torch.arange(100 - 16, 100)), "the last window rows, no noise"
     assert r._draft_cache is ring
+
+
+def test_greedy_ties_go_to_the_lowest_id_whatever_the_shape():
+    """The plain decode and the speculative verify must break a tie the same way.
+
+    torch.argmax documents the first maximal index but on CUDA answers by reduction order,
+    which follows the tensor's shape: the plain path reduces [batch, vocab] and the verify a
+    slice of [1, block, vocab]. On a real 300-token greedy run they parted at position 255,
+    where token 25 and token 11 were both at logit 21.25 -- an exact tie, margin 0.0 -- and
+    the plain path committed 25 while the speculative one committed 11. Everything after that
+    was a different answer to the same question, which is also why the block size appeared to
+    change the generated text.
+    """
+    from freetoken.engine.sample import greedy_argmax
+
+    riga = torch.full((1, 64), -10.0)
+    riga[0, 25] = 21.25
+    riga[0, 11] = 21.25
+    assert int(greedy_argmax(riga)[0]) == 11, "the lower id wins a tie"
+    # the same row seen as a block of eight, which is the verify's shape
+    blocco = riga.expand(8, 64).contiguous()
+    assert greedy_argmax(blocco).tolist() == [11] * 8, "and the shape must not change it"
+
+
+def test_without_ties_the_greedy_pick_is_just_argmax():
+    """A tie-break that moved anything else would be a silent change of what the model says."""
+    from freetoken.engine.sample import greedy_argmax
+
+    torch.manual_seed(5)
+    logits = torch.randn(4, 997)
+    assert torch.equal(greedy_argmax(logits), logits.argmax(dim=-1))

@@ -29,7 +29,28 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        """Whether this request has exactly one possible answer.
+
+        Not conditioned on top_p, and it never should have been. Nucleus sampling keeps the
+        smallest set of tokens whose mass reaches p, and that set always contains the argmax
+        for any p > 0; so does top_k for any k >= 1. At temperature 0 the distribution IS the
+        argmax, and no filter can remove it. A request at temperature 0 therefore has one
+        answer whatever top_p says.
+
+        Requiring top_p == 1.0 made that request non-greedy in practice, because
+        sampling_defaults="model" fills an unspecified top_p from the checkpoint -- and this
+        model's GGUF carries general.sampling.top_p = 0.95. So a client asking for temperature
+        0 went down the stochastic path with the temperature clamped to 1e-6: argmax in all but
+        name, and drawn from an RNG whose state depends on how many samples the path happened
+        to take. Identical requests answered identically, two different paths did not, and an
+        exact tie between the top two logits is where it showed -- four positions in 298 on one
+        300-token run, each a fork in the rest of the answer.
+
+        That is how the block size came to change the generated text, and how greedy
+        speculative decoding came to disagree with greedy decoding: not a wrong draft, a
+        request that was never greedy to begin with.
+        """
+        return self.temperature <= 0.0 or self.top_k == 1
 
 
 @dataclass(eq=False)

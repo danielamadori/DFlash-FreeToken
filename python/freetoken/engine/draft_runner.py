@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from freetoken.engine.sample import greedy_argmax
 from freetoken.env import ENV
 from freetoken.models.gguf.reader import resolve_gguf_path
 from freetoken.utils import init_logger
@@ -206,8 +207,13 @@ def rejection_sample(
             "verification forward has to run over the drafted tokens, not the last one"
         )
     if temperature <= 0:
-        # Greedy acceptance: accept as long as argmax matches
-        target_tokens = torch.argmax(target_probs[:, :gamma], dim=-1)
+        # Greedy acceptance: accept as long as the target's own pick matches the candidate.
+        # greedy_argmax, not torch.argmax, and for the same reason the plain decode uses it:
+        # at an exact tie CUDA's argmax follows the reduction order, so this slice of
+        # [1, block, vocab] and the plain path's [batch, vocab] answered differently on a real
+        # generation. Speculative greedy has to commit the token plain greedy would, or the
+        # engine's output depends on the block size.
+        target_tokens = greedy_argmax(target_probs[:, :gamma])
         matches = (target_tokens == draft_tokens)[0]
         accepted = 0
         for m in matches:
@@ -215,7 +221,7 @@ def rejection_sample(
                 accepted += 1
             else:
                 break
-        next_token = torch.argmax(target_probs[:, accepted], dim=-1)
+        next_token = greedy_argmax(target_probs[:, accepted])
         return accepted, next_token
 
     # Stochastic rejection sampling

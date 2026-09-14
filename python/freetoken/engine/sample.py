@@ -21,6 +21,34 @@ def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> 
     return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
 
 
+def greedy_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """Greedy pick over the last dim, ties going to the LOWEST id, everywhere the same.
+
+    ``torch.argmax`` documents that it returns the first maximal index, but on CUDA the answer
+    at an exact tie follows the reduction order, which follows the tensor's shape. The plain
+    decode reduces over ``[batch, vocab]`` and the speculative verify over a slice of
+    ``[1, block, vocab]``, so the two disagreed -- and they disagreed on a real generation:
+    position 255 of a 300-token greedy run had token 25 and token 11 both at logit 21.25,
+    exactly tied, and the plain path committed 25 while the speculative one committed 11. From
+    there the two streams say different things for the rest of the answer.
+
+    That is not the draft being wrong. Greedy speculative decoding is supposed to reproduce
+    greedy decoding token for token -- the draft only proposes, the target decides -- and up to
+    that tie it did, for 255 positions. But because the tie went two ways, the block size
+    changed the generated text, which is also why no comparison between configurations could
+    be read off the output.
+
+    Exact ties are not rare enough to wave away: four positions in 298 on that run, roughly one
+    in seventy, each one a fork in the rest of the answer.
+
+    The cost is a comparison and a min over the vocabulary, next to a forward that reads
+    seventeen gigabytes of weights.
+    """
+    top = logits.max(dim=-1, keepdim=True).values
+    ids = torch.arange(logits.shape[-1], device=logits.device, dtype=torch.int64)
+    return torch.where(logits == top, ids, logits.shape[-1]).min(dim=-1).values
+
+
 def sample_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -76,5 +104,5 @@ class Sampler:
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
             if args.temperatures is None:  # greedy sampling
-                return torch.argmax(logits, dim=-1)
+                return greedy_argmax(logits)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
