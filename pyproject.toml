@@ -51,6 +51,13 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
     "safetensors>=0.6,<1",
+    # WINDOWS ONLY, AND NOT OPTIONAL THERE. asyncio on Windows runs a Proactor
+    # event loop, which has no add_reader; pyzmq needs one, and falls back to
+    # tornado's selector thread when it can find tornado. Without it the engine
+    # loads and the scheduler generates, but FrontendManager.listen() dies at the
+    # first message and no answer ever reaches the HTTP caller -- the server looks
+    # healthy and every request hangs.
+    "tornado>=6.1; sys_platform == 'win32'",
     # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
     # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
