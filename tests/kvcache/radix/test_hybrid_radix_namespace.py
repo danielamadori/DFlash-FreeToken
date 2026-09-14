@@ -113,3 +113,23 @@ def test_two_sessions_sending_the_same_tokens_do_not_clobber_each_other():
     bob = c.match_prefix(ids(1, 2), ns="bob")
     assert alice.mamba_value != bob.mamba_value, "two trees, two snapshots"
     assert not torch.equal(alice.kv_indices, bob.kv_indices), "and two sets of pages"
+
+
+def test_insert_reports_what_the_tree_already_had_not_where_it_cut():
+    """The returned length is an ownership statement, and getting it wrong loses pages.
+
+    The caller frees ``page_indices`` up to this number, on the grounds that those pages were
+    already in the tree and the request's copies of them are redundant. Returning the public
+    cut instead handed back pages the public node had just taken ownership of: the tree kept
+    referencing them while the free list handed them out again. Twelve pages, and the
+    CacheManager's integrity check was what noticed, on the second request of the day --
+    nothing in the tree's own tests had a reason to look.
+    """
+    c = _cache()
+    matched, _ = c.insert(ids(1, 2, 3), slots(3), mamba_value=7, ns="alice", public_len=PAGE)
+    assert matched == 0, "the tree held nothing, so nothing of this request was redundant"
+
+    # now the tree holds the first page publicly; a second session sending it must be told so
+    matched, _ = c.insert(ids(1, 9), slots(2, base=50), mamba_value=8, ns="bob",
+                          public_len=PAGE)
+    assert matched == PAGE, "one page was already there; only that page is redundant"

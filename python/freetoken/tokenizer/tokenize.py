@@ -85,11 +85,30 @@ class TokenizeManager:
             msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
         )
 
+    def tokenize_prefix(self, msg: TokenizeMsg, messages: list[dict[str, Any]]) -> torch.Tensor:
+        """Encode a LEADING SLICE of a chat so it really is a prefix of the whole.
+
+        Rendered without the generation prompt, which is the whole point: the full render ends
+        with the assistant's header, and a slice rendered the usual way would end with one too
+        -- in the middle, where the next message belongs. It would not be a prefix of anything,
+        which is exactly what a caller measuring the shared section would then conclude.
+
+        Same tokenizer and the same add_special_tokens rule as ``tokenize``, so the ids line up
+        with the real prompt's instead of merely resembling them.
+        """
+        if not isinstance(msg.text, list) or self._dsv4_encoder is not None:
+            return torch.empty(0, dtype=torch.int32)
+        prompt = self._render(messages, msg.tools, dict(msg.chat_template_kwargs or {}),
+                              add_generation_prompt=False)
+        ids = self.tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=False)
+        return ids.view(-1).to(torch.int32)  # type: ignore[union-attr]
+
     def _render(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
+        add_generation_prompt: bool = True,
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
@@ -111,7 +130,7 @@ class TokenizeManager:
         prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
+            add_generation_prompt=add_generation_prompt,
             **chat_template_kwargs,
         )
         assert isinstance(prompt, str)

@@ -113,33 +113,39 @@ class HybridRadixCache:
         """
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
-        node, prefix_len = self._walk(input_ids, ns, public_len)
-        if prefix_len != insert_len:
+        node, matched = self._walk(input_ids, ns, public_len)
+        # ``matched`` is what the tree ALREADY held and is what this returns; the cursor below
+        # is only where the next node starts. Conflating the two cost a leak: the caller frees
+        # page_indices up to the returned length as "already cached", so returning the cut
+        # handed back pages the public node had just taken ownership of -- 12 of them, and the
+        # integrity check caught it on the second request.
+        cursore = matched
+        if cursore != insert_len:
             # The boundary is a page boundary or it is nothing: a node cannot end mid-page, and
             # asking for a cut the pages cannot express would leave the two halves disagreeing
             # about which tokens they hold.
             cut = align_down(min(public_len, insert_len), self.page_size)
-            if prefix_len < cut < insert_len:
+            if cursore < cut < insert_len:
                 pubblico = RadixTreeNode(self.key_fn)
-                pubblico.set_key_value(input_ids[prefix_len:cut], kv_indices[prefix_len:cut].clone())
+                pubblico.set_key_value(input_ids[cursore:cut], kv_indices[cursore:cut].clone())
                 pubblico.set_parent(node)   # ns stays None: this half is the shared section
                 self.full_evictable += pubblico.length
-                node, prefix_len = pubblico, cut
+                node, cursore = pubblico, cut
             new_node = RadixTreeNode(self.key_fn)
-            new_node.set_key_value(input_ids[prefix_len:], kv_indices[prefix_len:].clone())
+            new_node.set_key_value(input_ids[cursore:], kv_indices[cursore:].clone())
             # Owner before parent: set_parent files the node under a key that includes it.
-            new_node.ns = None if prefix_len < cut else ns
+            new_node.ns = None if cursore < cut else ns
             new_node.set_parent(node)
             self.full_evictable += new_node.length
             node = new_node
         if node.is_root():
-            return prefix_len, True   # root can't hold a snapshot; report exist so caller frees it
+            return matched, True   # root can't hold a snapshot; report exist so caller frees it
         if node.mamba_value is not None:
-            return prefix_len, True                 # dedup: caller frees its donated slot
+            return matched, True                 # dedup: caller frees its donated slot
         node.mamba_value = mamba_value              # fills a fresh node or a tombstone
         if node.mamba_ref_count == 0:
             self.mamba_evictable += 1
-        return prefix_len, False
+        return matched, False
 
     # ---------------------------------------------------------------- locking (dual)
     def inc_lock(self, node: RadixTreeNode) -> None:

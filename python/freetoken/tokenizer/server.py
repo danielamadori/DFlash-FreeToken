@@ -4,8 +4,6 @@ import multiprocessing as mp
 import time
 from typing import Any, List
 
-from dataclasses import replace
-
 import torch
 from freetoken.env import ENV
 from freetoken.message import (
@@ -108,9 +106,12 @@ def _public_prefix_len(tokenize_manager, msg: TokenizeMsg, tokens: torch.Tensor)
     if not testa:
         return 0
     try:
-        pubblici = tokenize_manager.tokenize(
-            [replace(msg, text=testa, cache_ns=None)]
-        )[0]
+        # Without the generation prompt, or it would not be a prefix: the full render ends with
+        # the assistant's header, and a slice rendered the ordinary way ends with one too, in
+        # the middle. Measured before this was fixed: the check below rejected every rendering
+        # and the shared section was never shared at all -- two namespaces sending the same
+        # 1502-token system prompt each prefilled it in full.
+        pubblici = tokenize_manager.tokenize_prefix(msg, testa)
     except Exception:  # noqa: BLE001 -- a template that will not render half a chat is not an error
         return 0
     n = int(pubblici.numel())
