@@ -22,6 +22,15 @@ _SSM_DTYPES = {
     # 0.33% at bfloat16, 5.3% at e4m3, 10.6% at e5m2, and on the 9% of heads whose state
     # half-life exceeds 4096 tokens it saturates at 2.2% / 29% / 50%. Kept selectable so the
     # claim stays falsifiable; not a default.
+    #
+    # What that per-layer error costs in BEHAVIOUR, measured 2026-09-14 on Qwen3.8-27B with the
+    # KV cache at e5m2 in both arms: e5m2 and bfloat16 came out INDISTINGUISHABLE. Needle recall
+    # at four context lengths (1.8k, 7.3k, 17.5k, 35.5k tokens) x three depths: 12/12 both. A
+    # five-counter task whose facts are spread end to end -- the shape the linear layers have to
+    # carry, since a single needle is mostly the full-attention layers' work -- 5/5 at 7.3k,
+    # 17.6k and 35.6k, both. So the probes do not separate them below ~35k, which is NOT the
+    # same as showing e5m2 is free: it bounds where the cost is not visible, and says nothing
+    # about 65k, the context this node advertises.
     "float8_e4m3fn": torch.float8_e4m3fn,
     "float8_e5m2": torch.float8_e5m2,
 }
