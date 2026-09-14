@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import shutil
+import sys
 
 import torch
 
@@ -132,7 +133,13 @@ def _module():
         extra_cuda_cflags += [f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"]
     if os.environ.get("FREETOKEN_GGUF_FAST_MATH", "").lower() in {"1", "true", "yes", "on"}:
         extra_cuda_cflags += ["--use_fast_math"]
-    extra_cflags = ["-O3", "-DNDEBUG"]
+    # MSVC DOES NOT TAKE -O3. Given a GCC-style optimisation flag it prints
+    # D9002 "ignoring unknown option" and compiles anyway, so on Windows this
+    # kernel was being built unoptimised while the flag asking otherwise sat
+    # unread on the command line. (-DNDEBUG it does accept.)
+    extra_cflags = (
+        ["/O2", "/DNDEBUG"] if sys.platform == "win32" else ["-O3", "-DNDEBUG"]
+    )
     host_cxx = _host_compiler()
     if host_cxx is not None:
         # Point both nvcc's host pass (-ccbin) and torch's C++ compile (CXX) at a
