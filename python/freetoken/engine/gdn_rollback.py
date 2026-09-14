@@ -198,6 +198,23 @@ class GDNRollback:
         finally:
             self.close()
 
+    def restore_snapshot(self) -> None:
+        """Put the live slot back to what ``open()`` saw, and keep the block open.
+
+        For running the same block twice: the shadow check replays the verify graph, then has
+        to run the eager verify over the SAME rows to compare the two. Without this the second
+        forward would start from the state the first one left, and the comparison would be
+        between a block and its successor rather than between two ways of running one block.
+
+        Not ``rewind``: that walks forward over a committed prefix and ends the block. This
+        only undoes, and leaves the recording on so the eager forward can stash over whatever
+        the replay adopted.
+        """
+        if not self._open:
+            raise RuntimeError("GDNRollback.restore_snapshot() without an open block")
+        assert self._live_slot is not None and self._scratch_slot is not None
+        self._pool.copy_from(self._scratch_slot, self._live_slot)
+
     def close(self) -> None:
         """End the block and stop recording. Idempotent; the scratch slot is kept."""
         self._open = False

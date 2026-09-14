@@ -111,16 +111,32 @@ def test_pad_batch_pads_only_what_the_graph_will_serve():
     assert big.padded_reqs == big.reqs
 
 
-def test_verify_graph_flag_defaults_off_and_parses_like_the_other_spec_flags(monkeypatch):
-    assert not ENV.SPEC_VERIFY_GRAPH
-    assert ENV.SPEC_VERIFY_GRAPH.value is False
+def test_verify_graph_flag_defaults_on_and_parses_like_the_other_spec_flags(monkeypatch):
+    """On by default since the replay was shown bitwise equal to the eager verify -- the state
+    by tests/engine/test_gdn_rollback_numerics.py, the logits by SPEC_VERIFY_GRAPH_SHADOW over
+    2700 blocks. Still has to switch OFF from the environment: it is the way back out if a
+    model or a backend turns out to capture badly, and a flag that only goes one way is not
+    one."""
+    assert ENV.SPEC_VERIFY_GRAPH
+    assert ENV.SPEC_VERIFY_GRAPH.value is True
+
+    monkeypatch.setenv("FREETOKEN_SPEC_VERIFY_GRAPH", "0")
+    flag = EnvBool(True)
+    flag._init("FREETOKEN_SPEC_VERIFY_GRAPH")
+    assert not flag
 
     monkeypatch.setenv("FREETOKEN_SPEC_VERIFY_GRAPH", "1")
-    flag = EnvBool(False)
+    flag = EnvBool(True)
     flag._init("FREETOKEN_SPEC_VERIFY_GRAPH")
     assert flag
 
-    monkeypatch.setenv("FREETOKEN_SPEC_VERIFY_GRAPH", "0")
+
+def test_the_verify_shadow_is_off_by_default(monkeypatch):
+    """It runs the block twice and returns the eager result: correct, and half the speed.
+    A diagnostic that switched itself on would look exactly like a performance regression."""
+    assert not ENV.SPEC_VERIFY_GRAPH_SHADOW
+
+    monkeypatch.setenv("FREETOKEN_SPEC_VERIFY_GRAPH_SHADOW", "1")
     flag = EnvBool(False)
-    flag._init("FREETOKEN_SPEC_VERIFY_GRAPH")
-    assert not flag
+    flag._init("FREETOKEN_SPEC_VERIFY_GRAPH_SHADOW")
+    assert flag

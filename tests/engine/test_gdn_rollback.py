@@ -417,3 +417,51 @@ def test_close_after_adopt_clears_the_block_but_not_the_captured_copy():
     rb.rewind(accepted=1)
     assert fused_calls == [3]
     assert len(captured) == 3
+
+
+def test_restore_snapshot_undoes_the_block_without_ending_it():
+    """Running one block twice is the shadow check's whole method.
+
+    It replays the verify graph, puts the recurrent state back, and runs the same rows
+    eagerly to compare the two sets of logits. Without the restore the eager forward would
+    start from the state the replay left, and the comparison would be between a block and
+    its successor rather than between two ways of running the same one.
+
+    The block has to stay open across it: the eager forward still needs to stash, over
+    whatever the replay adopted.
+    """
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    rb.open(3)
+    scratch = pool.freed and None  # noqa: F841 - readability: the scratch came from alloc
+    _stash_into(rb, 0, 9, [])
+    del pool.copies[:]
+
+    rb.restore_snapshot()
+
+    assert len(pool.copies) == 1, "one copy, scratch -> live"
+    src, dst = pool.copies[0]
+    assert dst == 3, "the live slot is the destination"
+    assert src != 3, "the source is the scratch slot, not the live one"
+    assert rb.recording, "the block stays open: the eager forward still has to stash"
+    assert rb._stash, "and the entries stay, to be overwritten rather than lost"
+
+
+def test_restore_snapshot_without_an_open_block_is_refused():
+    """Restoring a closed block would copy a stale scratch over a slot that has moved on --
+    silently, since the pool cannot tell one slot's contents from another's."""
+    rb = GDNRollback(FakePool())
+    with pytest.raises(RuntimeError, match="without an open block"):
+        rb.restore_snapshot()
+
+
+def test_restore_snapshot_can_run_twice_in_one_block():
+    """Nothing in the block consumes the snapshot, so a second diagnostic pass is free."""
+    pool = FakePool()
+    rb = GDNRollback(pool)
+    rb.open(2)
+    _stash_into(rb, 0, 9, [])
+    del pool.copies[:]
+    rb.restore_snapshot()
+    rb.restore_snapshot()
+    assert pool.copies == [pool.copies[0], pool.copies[0]]

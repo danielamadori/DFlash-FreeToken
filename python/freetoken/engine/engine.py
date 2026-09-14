@@ -1018,6 +1018,12 @@ class Engine:
         removes launch gaps, and the eager path is the one the outputs were validated on.
         """
         self.verify_graph: VerifyGraphRunner | None = None
+        # Counters of the shadow check (SPEC_VERIFY_GRAPH_SHADOW). Reset with the graph, so a
+        # pool rebuild that recaptures does not carry the old graph's tally into the new one.
+        self._shadow_blocks = 0
+        self._shadow_mismatches = 0
+        self._shadow_rows = 0
+        self._shadow_logit_gap = 0.0
         reason = self._verify_graph_unsupported_reason()
         if reason is not None:
             if ENV.SPEC_VERIFY_GRAPH:
@@ -1153,12 +1159,66 @@ class Engine:
         verify_graph = self.verify_graph
         with self.ctx.forward_batch(batch):
             if verify_graph is not None and verify_graph.can_replay(batch):
-                logits = verify_graph.replay(batch)
+                if ENV.SPEC_VERIFY_GRAPH_SHADOW:
+                    logits = self._shadow_verify(verify_graph, batch)
+                else:
+                    logits = verify_graph.replay(batch)
             else:
                 logits = self.model.forward()
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
         return logits
+
+    def _shadow_verify(self, verify_graph, batch: Batch) -> torch.Tensor:
+        """Replay the block, then run it again eagerly, and say where the two disagree.
+
+        The graph's state is proven equal to the eager one's
+        (tests/engine/test_gdn_rollback_numerics.py); its LOGITS are not, and that is the only
+        thing keeping SPEC_VERIFY_GRAPH off. The claim cannot be checked from the outside,
+        because this engine does not reproduce its own greedy output run to run -- five
+        prompts at temperature 0 gave five different texts twice over, with the draft
+        unloaded and the prefix cache warm. So the two paths have to be compared inside one
+        block, on the same rows, where nothing else can differ.
+
+        Running the block twice means undoing the first run: the replay advances the GDN
+        recurrent state, and an eager forward starting from there would be answering a
+        different question. The rollback already holds the pre-block snapshot for its own
+        purposes, so restoring from it costs one copy and no extra slot.
+
+        Returns the EAGER logits. If the two ever disagree this path must not be the one that
+        decided the tokens, or the check would be reporting a divergence it had already acted
+        on. Costs a full extra verify per block -- a diagnostic, never a serving mode.
+        """
+        replayed = verify_graph.replay(batch).clone()  # static buffer; the eager run rewrites it
+        rollback = self.ctx.gdn_rollback
+        if rollback is not None and rollback.recording:
+            rollback.restore_snapshot()
+        eager = self.model.forward()
+
+        self._shadow_blocks += 1
+        if replayed.shape != eager.shape:
+            logger.warning_rank0(
+                f"verify shadow: the replay returned {tuple(replayed.shape)} and the eager "
+                f"forward {tuple(eager.shape)} -- the graph was captured for another batch"
+            )
+            self._shadow_mismatches += 1
+            return eager
+        # Two numbers, because they answer different questions. The argmax disagreement is
+        # what changes the tokens the target accepts; the logit distance says whether a
+        # disagreement was a near-tie flipping (rounding, nothing to fix) or a real one.
+        diverse = int((replayed.argmax(-1) != eager.argmax(-1)).sum().item())
+        scarto = (replayed.float() - eager.float()).abs().max().item()
+        self._shadow_logit_gap = max(self._shadow_logit_gap, scarto)
+        if diverse:
+            self._shadow_mismatches += 1
+            self._shadow_rows += diverse
+        if self._shadow_blocks % 100 == 0:
+            logger.info_rank0(
+                f"verify shadow: {self._shadow_blocks} blocks, "
+                f"{self._shadow_mismatches} with a different argmax "
+                f"({self._shadow_rows} rows), worst logit gap {self._shadow_logit_gap:.3e}"
+            )
+        return eager
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

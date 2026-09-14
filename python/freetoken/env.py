@@ -91,17 +91,30 @@ class EnvClassSingleton:
     # the totals alone cannot reveal.
     SPEC_NO_SELECTOR = EnvBool(False)
     # Replay the K+1-row speculative verify forward as a CUDA graph instead of launching its
-    # kernels one by one. The rewound GDN state is now shown equal to the eager verify's
-    # (tests/engine/test_gdn_rollback_numerics.py, the adopt case); the replayed LOGITS are
-    # not, and that is what still holds this off -- a stale captured buffer reads as fluent
-    # text, never as an error.
+    # kernels one by one. This asked to be shown bitwise equal to the eager verify before
+    # being trusted, in both the state it leaves and the logits it returns, because a stale
+    # captured buffer reads as fluent text and never as an error. Both are now shown:
     #
-    # What it is worth, measured on this model's GDN shapes: the vendored fla chunk kernel
-    # costs 157 us per layer eager and 23 us replayed from a graph, on the same inputs, and
-    # that figure does not move between 1 and 128 rows. It is 134 us of launch and dispatch
-    # overhead per layer -- 6.4 ms across the 48 GDN layers of Qwen3.8-27B, a fifth of the
-    # 32.7 ms verify, before counting the same overhead on the MLP and the attention.
-    SPEC_VERIFY_GRAPH = EnvBool(False)
+    #   state   tests/engine/test_gdn_rollback_numerics.py, the adopt case. Replaying without
+    #           copying the block's rows into the baked address fails it by a factor of 968,
+    #           so the case can tell a stale stash from a fresh one.
+    #   logits  SPEC_VERIFY_GRAPH_SHADOW below, 2700 blocks over two runs of ten prompts on
+    #           Qwen3.8-27B: zero rows with a different argmax, and a worst logit gap of
+    #           exactly 0. Adding 1.0 to one logit of one path moved that gap to 1.031, so
+    #           the comparison measures something.
+    #
+    # What it is worth: the vendored fla chunk kernel costs 157 us per layer eager and 23 us
+    # replayed, on the same inputs, unchanged from 1 row to 128 -- 134 us per layer of launch
+    # and dispatch overhead, 6.4 ms across 48 GDN layers. End to end the verify goes from 32.7
+    # to 22.2 ms and the block from 38.8 to 28.3: 73 to 100 tokens a second, at identical
+    # acceptance.
+    SPEC_VERIFY_GRAPH = EnvBool(True)
+    # Replay the verify block, then run it again eagerly on the same rows and report where the
+    # two disagree. The only way to check the replayed logits: this engine does not reproduce
+    # its own greedy output run to run, so comparing generated text between the two paths says
+    # nothing -- it says nothing between eager and eager either. Costs a whole extra verify per
+    # block, and returns the eager logits, so it is a diagnostic and never a serving mode.
+    SPEC_VERIFY_GRAPH_SHADOW = EnvBool(False)
     # Replay the 8-row DFlash2 draft forward as one CUDA graph per context-row count. Off
     # until the replayed draft tokens are shown bitwise equal to the eager static-cache
     # draft: a graph baking a stale ring or hidden address only reads as lost acceptance.
