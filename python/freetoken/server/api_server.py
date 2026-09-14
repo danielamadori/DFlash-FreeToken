@@ -39,6 +39,7 @@ from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
+from .node_metrics import register_node_metrics_routes
 from .openai_api import register_openai_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
@@ -418,8 +419,25 @@ app = FastAPI(title="FreeToken API Server", version=__version__, lifespan=lifesp
 register_openai_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_anthropic_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_responses_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
+def _stats_doc() -> dict:
+    """The /v1/stats document, for the endpoints that serve the same numbers in another
+    dialect. One source, so /props and /metrics cannot drift away from /v1/stats."""
+    from . import request_ring
+    from .stats import build_stats
+
+    doc = build_stats(
+        get_global_state(), request_ring.requests_p95_ms(), request_ring.requests_ttft_mean_ms()
+    )
+    doc["model"]["sampling"] = _MODEL_SAMPLING or {}
+    return doc
+
+
 register_control_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
 register_accounting_routes(app, get_global_state)
+# /props and /metrics at the ROOT, not under /v1: that is where a llama.cpp-shaped watcher
+# looks, and until these existed a node running this engine reported heartbeats and never a
+# single metric. They read the same numbers /v1/stats does.
+register_node_metrics_routes(app, get_global_state, _stats_doc, __version__)
 
 
 # Paths the HTTP middleware logs into the request ring. The three chat protocols funnel through
