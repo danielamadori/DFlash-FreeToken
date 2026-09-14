@@ -171,7 +171,17 @@ torch::Tensor ggml_mul_mat_vec_a8(
     int64_t row) {
   int col = X.sizes()[1];
   int vecs = X.sizes()[0];
-  const int padded = (col + 512 - 1) / 512 * 512;
+  // Row stride of the planar activation. Always a multiple of 512, so consecutive rows sit a
+  // large power of two apart and can collide in the same cache sets -- a candidate mechanism for
+  // the step between 7 and 8 rows (849 -> 740 GB/s on the down projection, measured 2026-09-14).
+  // A skew breaks the alignment without changing a single value the kernel reads, so measuring
+  // with and without it decides whether the step is set conflicts or something else. In BYTES,
+  // a multiple of 32 (the ds plane is Kp/32); 0 (default) keeps the original stride.
+  //
+  // ANSWER, measured 2026-09-14: NOT set conflicts. Skews of 0, 128 and 256 bytes give 738,
+  // 739 and 736 GB/s at 8 rows -- the step is identical at all three. Kept because the knob is
+  // what makes that negative result re-runnable on another card, where the answer may differ.
+  const int padded = (col + 512 - 1) / 512 * 512 + MMVQ_PLANAR_SKEW;
   const at::cuda::OptionalCUDAGuard device_guard(device_of(X));
   auto options = torch::TensorOptions().dtype(X.dtype()).device(W.device());
   at::Tensor Y = torch::empty({vecs, row}, options);

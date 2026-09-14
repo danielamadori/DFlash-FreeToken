@@ -146,6 +146,11 @@ def _module():
     # card rather than argued about -- and so the arm it replaced stays runnable: setting it
     # back to 8 reproduces the behaviour production had before the ceiling moved, which is the
     # only way to say what the move was worth in tokens a second instead of in GB/s.
+    # Bytes added to the planar activation row stride, to test whether the 7->8 step is cache
+    # set conflicts. Multiple of 32; 0 keeps the original stride.
+    skew = os.environ.get("FREETOKEN_GGUF_PLANAR_SKEW", "").strip()
+    if skew.isdigit() and int(skew) % 32 == 0 and int(skew) <= 4096:
+        extra_cuda_cflags += [f"-DMMVQ_PLANAR_SKEW={int(skew)}"]
     planar_cols = os.environ.get("FREETOKEN_GGUF_PLANAR_MAX_COLS", "").strip()
     if planar_cols.isdigit() and 2 <= int(planar_cols) <= 12:
         extra_cuda_cflags += [f"-DMMVQ_PLANAR_MAX_COLS={int(planar_cols)}"]

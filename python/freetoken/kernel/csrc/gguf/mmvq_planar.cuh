@@ -52,6 +52,9 @@
 // Kept overridable so the ceiling can be re-measured on another card rather than argued about.
 #define MMVQ_PLANAR_MAX_COLS 12
 #endif
+#ifndef MMVQ_PLANAR_SKEW
+#define MMVQ_PLANAR_SKEW 0  // bytes added to the activation row stride; see gguf_kernel.cu
+#endif
 
 // ---------------------------------------------------------------- shared helpers
 
