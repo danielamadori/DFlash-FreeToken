@@ -4,6 +4,7 @@ import importlib
 import os
 import pathlib
 import re
+import sys
 from typing import TYPE_CHECKING, List, NamedTuple, Tuple, TypeAlias, Union
 
 if TYPE_CHECKING:
@@ -17,7 +18,19 @@ DISABLE_KERNEL_CACHE_VERSION_CHECK_ENV = "FREETOKEN_DISABLE_KERNEL_CACHE_VERSION
 DISABLE_JIT_ENV = "FREETOKEN_DISABLE_JIT"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
-DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
+# MSVC DOES NOT SPEAK GCC'S FLAG SYNTAX. Handed -std=c++20 and -O3 it warns
+# D9002 "ignoring unknown option" and compiles anyway, so on Windows every host
+# C++ module was built at tvm-ffi's default /std:c++17 -- where <source_location>
+# does not exist, and utils.h stopped the build with
+#   error C2039: 'source_location': is not a member of 'std'
+# while the flag that was meant to prevent it sat unread on the command line.
+# /Zc:__cplusplus goes with the standard switch: without it MSVC keeps reporting
+# __cplusplus as 199711L and every feature test in those headers reads false.
+DEFAULT_CFLAGS = (
+    ["/std:c++20", "/O2", "/Zc:__cplusplus"]
+    if sys.platform == "win32"
+    else ["-std=c++20", "-O3"]
+)
 DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
 DEFAULT_LDFLAGS = []
 
