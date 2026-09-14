@@ -4,7 +4,7 @@ from typing import Iterator
 
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.loader import MergeRule, iter_merged_tensors, iter_weight_files, shard_tensor, safe_open_device
+from freetoken.models.loader import MergeRule, iter_merged_tensors, iter_shard_tensors, iter_weight_files, shard_tensor
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
@@ -38,26 +38,21 @@ def iter_weights(
             desc="Loading weights",
             disable=not tp_info.is_primary(),
         ):
-            # Not safe_open(device=...) directly: on some builds that path raises
-            # on the first read and the engine dies during load. The helper probes
-            # it once and says which path it got, so the move below happens only
-            # when the tensors really arrived on the host.
-            handle, gia_su_device = safe_open_device(file, device)
-            with handle as f:
-                for raw_name in f.keys():
-                    name = raw_name.removeprefix("language_model.")
-                    raw = f.get_tensor(raw_name)
-                    if not gia_su_device:
-                        raw = raw.to(device)
-                    tensor = shard_tensor(
-                        name,
-                        raw,
-                        rank=tp_info.rank,
-                        world_size=tp_info.size,
-                        num_kv_heads=config.num_kv_heads,
-                    )
-                    del raw
-                    yield name, tensor
+            # Not safe_open(device=...) directly: reading straight into VRAM works
+            # on some builds and not others, and where it fails it does so partway
+            # through the file, not on the first tensor. iter_shard_tensors tries it
+            # and finishes through host memory if it breaks, saying so.
+            for raw_name, raw in iter_shard_tensors(file, device):
+                name = raw_name.removeprefix("language_model.")
+                tensor = shard_tensor(
+                    name,
+                    raw,
+                    rank=tp_info.rank,
+                    world_size=tp_info.size,
+                    num_kv_heads=config.num_kv_heads,
+                )
+                del raw
+                yield name, tensor
 
     yield from iter_merged_tensors(
         sharded_tensors(),

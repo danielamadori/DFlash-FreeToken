@@ -24,57 +24,36 @@ class MergeRule:
     slots: tuple[str, ...]
 
 
-_APERTURA_DIRETTA_SU_GPU: "bool | None" = None
+def iter_shard_tensors(file: str, device) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield every tensor of one safetensors shard, already on ``device``.
 
+    ``safe_open(..., device="cuda:0")`` reads the shard straight into VRAM with
+    no copy through host memory, which is what every model family here does.
 
-def safe_open_device(file: str, device) -> "tuple[object, bool]":
-    """Open a safetensors shard, and say whether its tensors land on ``device``.
-
-    ``safe_open(..., device="cuda:0")`` is the fast path: the shard is read
-    straight into VRAM with no copy through host memory. It does not work
-    everywhere. Measured on Windows 11 with safetensors 0.8.0 and
-    torch 2.11.0+cu126, the same file that reads perfectly with ``device="cpu"``
-    raises on the first ``get_tensor``:
+    OPEN THE FILE ONCE. An earlier version of this module probed the path first
+    -- open, read one tensor, close, then open again for real -- to find out
+    whether the direct read worked on this build. The probe was the defect it
+    was meant to detect: measured on Windows 11 with safetensors 0.8.0 and
+    torch 2.11.0+cu126, opening the same shard twice in one process reads
+    correctly 2 times in 4, while a single open read all 338 tensors 6 times in
+    6. When the second open loses, the very first ``get_tensor`` raises
 
         RuntimeError: Attempted to access the data pointer on an invalid
-        python storage.
+        python storage
 
-    The engine died during load with that, and the message says nothing about
-    the device, so it reads like a corrupt checkpoint rather than a loader that
-    cannot use this path here.
+    and the backend worker dies during load -- so the engine came up only some
+    of the time, and the message named neither the file nor the device.
 
-    The probe runs ONCE per process and its outcome is remembered: it opens the
-    shard and reads one tensor, because opening alone succeeds and the failure
-    only appears on the read. The caller is told which path it got, so it can
-    move the tensor itself instead of assuming; falling back silently would hide
-    that every tensor is now travelling through host RAM, which on a small
-    machine is the difference between loading and being killed.
+    There is deliberately no fall back to ``device="cpu"`` on failure. On this
+    machine that path does not raise, it takes the process down with a Windows
+    access violation inside ``torch.storage.__getitem__``, which turns a
+    readable error into a worker that vanishes with no traceback at all.
     """
     import safetensors
 
-    global _APERTURA_DIRETTA_SU_GPU
-    if str(device) == "cpu":
-        return safetensors.safe_open(file, framework="pt", device="cpu"), False
-
-    if _APERTURA_DIRETTA_SU_GPU is None:
-        try:
-            with safetensors.safe_open(file, framework="pt", device=str(device)) as prova:
-                chiave = next(iter(prova.keys()), None)
-                if chiave is not None:
-                    prova.get_tensor(chiave)
-            _APERTURA_DIRETTA_SU_GPU = True
-        except Exception as exc:  # noqa: BLE001 - the reason is logged, not swallowed
-            _APERTURA_DIRETTA_SU_GPU = False
-            logger.warning(
-                "safetensors cannot read straight into %s here (%s: %s); weights will "
-                "go through host memory instead, which is slower and needs room for the "
-                "largest tensor",
-                device, type(exc).__name__, str(exc)[:120],
-            )
-
-    if _APERTURA_DIRETTA_SU_GPU:
-        return safetensors.safe_open(file, framework="pt", device=str(device)), True
-    return safetensors.safe_open(file, framework="pt", device="cpu"), False
+    with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+        for raw_name in f.keys():
+            yield raw_name, f.get_tensor(raw_name)
 
 
 def shard_tensor(
