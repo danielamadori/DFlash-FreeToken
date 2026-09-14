@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from typing import Iterator
 
-import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.loader import MergeRule, iter_merged_tensors, iter_weight_files, shard_tensor
+from freetoken.models.loader import MergeRule, iter_merged_tensors, iter_weight_files, shard_tensor, safe_open_device
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
@@ -39,10 +38,17 @@ def iter_weights(
             desc="Loading weights",
             disable=not tp_info.is_primary(),
         ):
-            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            # Not safe_open(device=...) directly: on some builds that path raises
+            # on the first read and the engine dies during load. The helper probes
+            # it once and says which path it got, so the move below happens only
+            # when the tensors really arrived on the host.
+            handle, gia_su_device = safe_open_device(file, device)
+            with handle as f:
                 for raw_name in f.keys():
                     name = raw_name.removeprefix("language_model.")
                     raw = f.get_tensor(raw_name)
+                    if not gia_su_device:
+                        raw = raw.to(device)
                     tensor = shard_tensor(
                         name,
                         raw,

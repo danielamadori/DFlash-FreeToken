@@ -2,6 +2,20 @@
 
 #include <freetoken/utils.h>
 
+// ``__always_inline`` IS NOT A LANGUAGE KEYWORD. It is a glibc macro from
+// <sys/cdefs.h>, which does not exist on Windows, so on MSVC the token is read
+// as a type name and every declaration using it fails with "this declaration
+// has no storage class or type specifier". The header used to pull in
+// <sys/cdefs.h> for it, which cannot work off glibc; this defines the same
+// thing in terms each compiler has.
+#if !defined(__always_inline)
+#if defined(_MSC_VER)
+#define __always_inline __forceinline
+#else
+#define __always_inline inline __attribute__((__always_inline__))
+#endif
+#endif
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 

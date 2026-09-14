@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from typing import Iterable, Iterator
 
 import torch
 from freetoken.utils import div_ceil, download_hf_weight
+
+logger = logging.getLogger(__name__)
 
 SPLIT_DIM_0 = (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj")
 SPLIT_DIM_1 = (".o_proj", ".down_proj")
@@ -19,6 +22,59 @@ class MergeRule:
     fused_suffix: str
     slot: str
     slots: tuple[str, ...]
+
+
+_APERTURA_DIRETTA_SU_GPU: "bool | None" = None
+
+
+def safe_open_device(file: str, device) -> "tuple[object, bool]":
+    """Open a safetensors shard, and say whether its tensors land on ``device``.
+
+    ``safe_open(..., device="cuda:0")`` is the fast path: the shard is read
+    straight into VRAM with no copy through host memory. It does not work
+    everywhere. Measured on Windows 11 with safetensors 0.8.0 and
+    torch 2.11.0+cu126, the same file that reads perfectly with ``device="cpu"``
+    raises on the first ``get_tensor``:
+
+        RuntimeError: Attempted to access the data pointer on an invalid
+        python storage.
+
+    The engine died during load with that, and the message says nothing about
+    the device, so it reads like a corrupt checkpoint rather than a loader that
+    cannot use this path here.
+
+    The probe runs ONCE per process and its outcome is remembered: it opens the
+    shard and reads one tensor, because opening alone succeeds and the failure
+    only appears on the read. The caller is told which path it got, so it can
+    move the tensor itself instead of assuming; falling back silently would hide
+    that every tensor is now travelling through host RAM, which on a small
+    machine is the difference between loading and being killed.
+    """
+    import safetensors
+
+    global _APERTURA_DIRETTA_SU_GPU
+    if str(device) == "cpu":
+        return safetensors.safe_open(file, framework="pt", device="cpu"), False
+
+    if _APERTURA_DIRETTA_SU_GPU is None:
+        try:
+            with safetensors.safe_open(file, framework="pt", device=str(device)) as prova:
+                chiave = next(iter(prova.keys()), None)
+                if chiave is not None:
+                    prova.get_tensor(chiave)
+            _APERTURA_DIRETTA_SU_GPU = True
+        except Exception as exc:  # noqa: BLE001 - the reason is logged, not swallowed
+            _APERTURA_DIRETTA_SU_GPU = False
+            logger.warning(
+                "safetensors cannot read straight into %s here (%s: %s); weights will "
+                "go through host memory instead, which is slower and needs room for the "
+                "largest tensor",
+                device, type(exc).__name__, str(exc)[:120],
+            )
+
+    if _APERTURA_DIRETTA_SU_GPU:
+        return safetensors.safe_open(file, framework="pt", device=str(device)), True
+    return safetensors.safe_open(file, framework="pt", device="cpu"), False
 
 
 def shard_tensor(
