@@ -144,6 +144,9 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    # Prefix-cache tenancy, read off the credential by the auth middleware. Not a sampling
+    # field and not a wire field: it says which cached prefixes this caller may reuse.
+    cache_ns: str | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -303,6 +306,18 @@ def _mark_ack(ack: Any) -> None:
         marks[f"ack{n}[{getattr(ack, 'prompt_tokens_delta', 0)}p,{text_len}c]"] = time.monotonic()
 
 
+def stamp_cache_ns(spec: GenSpec, request: Any) -> GenSpec:
+    """Carry onto the spec the tenancy the auth middleware read off the credential.
+
+    Done at the handler, because that is the first place that has both: the adapters convert a
+    wire request into a GenSpec and never see the HTTP request, and submit_generation sees the
+    spec and not the request either. Missing or absent means None, which is the shared tree --
+    a request that arrives without a namespace must still be served, just without partitioning.
+    """
+    spec.cache_ns = getattr(getattr(request, "state", None), "cache_ns", None)
+    return spec
+
+
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
@@ -315,6 +330,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            cache_ns=spec.cache_ns,
         )
     )
     _mark("sent")

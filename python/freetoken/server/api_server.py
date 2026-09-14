@@ -443,6 +443,22 @@ def _served_model_name() -> str | None:
     return getattr(cfg, "served_model_name", None)
 
 
+def _split_cache_ns(presented: str, api_key: str) -> tuple[str, str | None]:
+    """Split ``<key>.<namespace>`` into the key to check and the cache namespace.
+
+    Only when the prefix really is the configured key and a separator really follows it: a key
+    that happens to contain dots, or a wrong key with a dot in it, must come out unchanged so
+    the comparison below rejects it exactly as before. Nothing here decides access -- the
+    namespace only says which prefixes this caller may reuse, and it is checked after the key.
+
+    An empty namespace ("key.") reads as none, so a client cannot land in a nameless partition
+    by accident and start sharing with everyone.
+    """
+    if api_key and presented.startswith(api_key + ".") and len(presented) > len(api_key) + 1:
+        return api_key, presented[len(api_key) + 1:]
+    return presented, None
+
+
 @app.middleware("http")
 async def _api_key_auth_middleware(request: Request, call_next):
     """Enforce API key authentication if --api-key / FREETOKEN_API_KEY is configured."""
@@ -455,11 +471,19 @@ async def _api_key_auth_middleware(request: Request, call_next):
             auth_header = request.headers.get("authorization", "")
             x_api_key = request.headers.get("x-api-key", "")
             bearer = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else auth_header
+            # "<key>.<namespace>" partitions the prefix cache. The namespace rides on the
+            # credential because that is the one thing a proxy chain cannot drop: a body
+            # marker does not survive a compacting middlebox, a custom header is not
+            # forwarded, and Authorization has to arrive or the request does not authenticate.
+            # Measured on this stack -- see docs/backlog.md (42) in the Agents repo.
+            bearer, ns = _split_cache_ns(bearer, api_key)
+            x_api_key, ns_x = _split_cache_ns(x_api_key, api_key)
             if bearer != api_key and x_api_key != api_key:
                 return JSONResponse(
                     {"error": {"message": "Invalid or missing API key", "type": "authentication_error", "code": 401}},
                     status_code=401,
                 )
+            request.state.cache_ns = ns if bearer == api_key else ns_x
     return await call_next(request)
 
 

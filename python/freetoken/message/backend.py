@@ -37,6 +37,10 @@ class UserMsg(BaseBackendMsg):
     # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
     # the in-process offline path; remains None for the (serialized) online path.
     mm_embeds: torch.Tensor | None = None
+    # Prefix-cache tenancy: who may reuse what this request caches, and from which token its
+    # private part begins. None keeps the single shared tree the server has always had.
+    cache_ns: str | None = None
+    cache_public_len: int = 0
 
 
 @dataclass

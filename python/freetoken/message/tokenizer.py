@@ -72,6 +72,9 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # Prefix-cache tenancy, taken off the credential by the api server. None keeps the single
+    # shared tree: every deployment that does not ask for partitions is unaffected.
+    cache_ns: str | None = None
 
 
 @dataclass

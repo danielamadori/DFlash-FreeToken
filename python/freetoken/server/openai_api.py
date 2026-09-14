@@ -25,17 +25,18 @@ from .request_logger import log_request
 from .generation import (
     ContentDelta,
     GenDone,
-    GenerationError,
     GenSpec,
+    GenerationError,
     ReasoningDelta,
     ToolCallArgsDelta,
-    ToolCallsDelta,
     ToolCallStart,
+    ToolCallsDelta,
     generate_events,
     generate_full,
     prerender_error,
     render_messages,
     resolve_sampling,
+    stamp_cache_ns,
     submit_generation,
 )
 
@@ -179,7 +180,7 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        spec = stamp_cache_ns(chat_request_to_genspec(req, model_sampling), request)
     except ValueError as exc:
         return create_error_response(str(exc))
 

@@ -33,22 +33,23 @@ from .anthropic_models import (
     AnthropicUsage,
 )
 from .generation import (
-    KEEPALIVE,
     ContentDelta,
     GenDone,
-    GenerationError,
     GenResult,
     GenSpec,
+    GenerationError,
+    KEEPALIVE,
     ReasoningDelta,
     ToolCallArgsDelta,
-    ToolCallsDelta,
     ToolCallStart,
+    ToolCallsDelta,
     count_prompt_tokens,
     generate_events,
     generate_full,
     render_messages,
     resolve_sampling,
     split_tool_lists,
+    stamp_cache_ns,
     submit_generation,
     with_keepalive,
 )
@@ -113,10 +114,10 @@ async def handle_anthropic_messages(
     model_sampling: dict[str, Any],
 ):
     try:
-        spec = convert_anthropic_to_genspec(
+        spec = stamp_cache_ns(convert_anthropic_to_genspec(
             req, model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
-        )
+        ), request)
         uid = await submit_generation(spec, state)
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))

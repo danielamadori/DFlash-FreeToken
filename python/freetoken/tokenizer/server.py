@@ -4,6 +4,8 @@ import multiprocessing as mp
 import time
 from typing import Any, List
 
+from dataclasses import replace
+
 import torch
 from freetoken.env import ENV
 from freetoken.message import (
@@ -80,6 +82,41 @@ def _send_generation_replies(
     _put_user_replies(send_frontend, admitted)
     _put_user_replies(send_frontend, sampled)
     _put_user_replies(send_frontend, terminal_errors)
+
+
+def _public_prefix_len(tokenize_manager, msg: TokenizeMsg, tokens: torch.Tensor) -> int:
+    """How many leading tokens are the same for every session, and therefore shareable.
+
+    The system section -- system message plus tool definitions -- is byte-identical across
+    sessions by construction, so a cache hit on it tells nobody anything. Everything from the
+    first user turn on is that session's own. Splitting there is what keeps isolation
+    affordable: re-prefilling a system prompt carrying 81 MCP tools per session does not fit
+    in the KV budget, and without the split isolation would cost exactly that.
+
+    Rendered through the same tokenizer as the real prompt, so the boundary lands on a token
+    edge rather than near one. A prompt with no user turn, or one whose rendering does not
+    prefix the full one, yields 0 -- nothing shared, which is the safe direction: the request
+    still works, it only reuses less.
+    """
+    if msg.cache_ns is None or not isinstance(msg.text, list):
+        return 0
+    testa = []
+    for m in msg.text:
+        if isinstance(m, dict) and m.get("role") == "user":
+            break
+        testa.append(m)
+    if not testa:
+        return 0
+    try:
+        pubblici = tokenize_manager.tokenize(
+            [replace(msg, text=testa, cache_ns=None)]
+        )[0]
+    except Exception:  # noqa: BLE001 -- a template that will not render half a chat is not an error
+        return 0
+    n = int(pubblici.numel())
+    if n == 0 or n > int(tokens.numel()) or not torch.equal(tokens[:n], pubblici):
+        return 0
+    return n
 
 
 def _tokenize_requests(
@@ -269,7 +306,9 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
+                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params,
+                                cache_ns=msg.cache_ns,
+                                cache_public_len=_public_prefix_len(tokenize_manager, msg, t))
                         for msg, t in zip(ok_msgs, ok_tensors, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))

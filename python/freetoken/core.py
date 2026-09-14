@@ -66,6 +66,20 @@ class Req:
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
 
+    # Who this request is, for the prefix cache, and where its private part begins.
+    #
+    # None is the default and means the old behaviour: one shared tree, everybody reusing
+    # everybody's prefixes. That is fine when a deployment has one tenant and wrong when it has
+    # several, because a cache hit is readable from the outside -- a session can send a guessed
+    # prefix and learn from the prefill length whether somebody else had already sent it.
+    #
+    # ``cache_public_len`` keeps the sharing that is worth having. The prompt's system section
+    # is byte-identical for every session, so it leaks nothing, and re-prefilling it per
+    # session would not fit: the KV cache holds tens of thousands of tokens and so does a
+    # system prompt carrying 81 MCP tools.
+    cache_ns: str | None = None
+    cache_public_len: int = 0
+
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
     linear_slot_idx: int | None = None              # live GDN state slot (sglang mamba_pool_idx)
