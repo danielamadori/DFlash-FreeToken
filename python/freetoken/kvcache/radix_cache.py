@@ -44,6 +44,17 @@ class RadixTreeNode:
         self.swa_ref_count: int = 0
         self.swa_uuid: int | None = None
 
+        # Who may reuse this node's KV. None means public -- anybody, which is what every node
+        # is until a caller passes a namespace, so a deployment that does not use them behaves
+        # exactly as before. A non-empty string means only requests carrying that same string.
+        #
+        # This is not about correctness of the KV: two requests with the same tokens have the
+        # same KV whoever sent them. It is about what a cache HIT tells you. Without it, one
+        # session can ask "has anyone else sent this exact prefix?" and read the answer off the
+        # prefill length -- an oracle over other people's prompts, measured at 8 hits out of 8
+        # by scripts/probe_cache_isolation.py.
+        self.ns: str | None = None
+
         # these fields should be updated later
         self._key: torch.Tensor
         self._value: torch.Tensor
@@ -55,9 +66,21 @@ class RadixTreeNode:
         self._value = value
         self._length = len(key)
 
+    def child_key(self) -> Any:
+        """How the parent indexes this node: the page key, plus the owner when there is one.
+
+        Two namespaces can send the same tokens -- in fact that is the interesting case -- and
+        with the page key alone the second one's node would land on the first one's slot in the
+        children dict and silently orphan its whole subtree: the KV would leak and the first
+        session would lose a cache it is still entitled to. A public node keeps the bare page
+        key, so a tree that uses no namespaces is byte-for-byte the tree it was before.
+        """
+        k = self.key_fn(self._key)
+        return k if self.ns is None else (k, self.ns)
+
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
-        parent.children[self.key_fn(self._key)] = self
+        parent.children[self.child_key()] = self
 
     @property
     def length(self) -> int:
@@ -90,6 +113,9 @@ class RadixTreeNode:
 
         new_node = RadixTreeNode(self.key_fn, self.timestamp)
         new_node.set_key_value(self._key[:pos], self._value[:pos])
+        # The owner first: set_parent indexes the node by it, so assigning ns afterwards would
+        # file the half under the wrong key and leave it unreachable from its own parent.
+        new_node.ns = self.ns
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
         # SWA: a tombstone covers all the node's tokens, so both halves inherit it; both halves

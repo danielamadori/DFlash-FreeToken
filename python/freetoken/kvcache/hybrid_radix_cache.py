@@ -73,11 +73,24 @@ class HybridRadixCache:
         self.mamba_protected = 0
 
     # ---------------------------------------------------------------- match / insert
-    def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
+    def match_prefix(
+        self, input_ids: torch.Tensor, ns: str | None = None, public_len: int = 0
+    ) -> HybridMatch:
         """Match the token prefix, then truncate the reusable length to the deepest node on
         the path that still owns a LIVE snapshot (a continuation can only resume the GDN
-        recurrence from a checkpointed boundary)."""
-        node, _ = self._walk(input_ids)
+        recurrence from a checkpointed boundary).
+
+        ``ns`` is who is asking. None keeps the old behaviour exactly -- everything matches
+        everything -- so a deployment that sets no namespace is unchanged. With one, the walk
+        stops at the first node owned by somebody else, which is what stops a session from
+        reading another session's prefill length back as an answer to "did anyone send this?".
+
+        ``public_len`` is where that stops applying, counted in tokens from the start. The
+        prompt's system section is identical for every session by construction, so sharing it
+        leaks nothing and re-prefilling it per session would not fit: the KV cache holds 92,693
+        tokens and a system prompt with 81 tools runs to tens of thousands.
+        """
+        node, _ = self._walk(input_ids, ns, public_len)
         # walk up to the deepest node whose END boundary has a live snapshot
         cur, end_len = node, self._path_len(node)
         while not cur.is_root():
@@ -88,17 +101,34 @@ class HybridRadixCache:
         return HybridMatch(self.empty, 0, None, self.root)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               mamba_value: int) -> Tuple[int, bool]:
+               mamba_value: int, ns: str | None = None, public_len: int = 0) -> Tuple[int, bool]:
         """Insert the committed KV prefix and DONATE ``mamba_value`` at the (page-aligned) end
         boundary node. Returns (matched_prefix_len, mamba_exist). If the boundary node already
         owns a live snapshot, returns mamba_exist=True and does not attach (caller frees the
-        donated slot -- dedup)."""
+        donated slot -- dedup).
+
+        What is created below ``public_len`` is public and what is created above it belongs to
+        ``ns``. A new span that crosses the boundary is cut in two, so the shared system
+        section stays shared instead of being swallowed into the first session that arrives.
+        """
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
-        node, prefix_len = self._walk(input_ids)
+        node, prefix_len = self._walk(input_ids, ns, public_len)
         if prefix_len != insert_len:
+            # The boundary is a page boundary or it is nothing: a node cannot end mid-page, and
+            # asking for a cut the pages cannot express would leave the two halves disagreeing
+            # about which tokens they hold.
+            cut = align_down(min(public_len, insert_len), self.page_size)
+            if prefix_len < cut < insert_len:
+                pubblico = RadixTreeNode(self.key_fn)
+                pubblico.set_key_value(input_ids[prefix_len:cut], kv_indices[prefix_len:cut].clone())
+                pubblico.set_parent(node)   # ns stays None: this half is the shared section
+                self.full_evictable += pubblico.length
+                node, prefix_len = pubblico, cut
             new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], kv_indices[prefix_len:].clone())
+            # Owner before parent: set_parent files the node under a key that includes it.
+            new_node.ns = None if prefix_len < cut else ns
             new_node.set_parent(node)
             self.full_evictable += new_node.length
             node = new_node
@@ -272,12 +302,20 @@ class HybridRadixCache:
             stack.extend(n.children.values())
         return out
 
-    def _walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+    def _walk(
+        self, input_ids: torch.Tensor, ns: str | None = None, public_len: int = 0
+    ) -> Tuple[RadixTreeNode, int]:
         prefix_len, total = 0, len(input_ids)
         node = self.root
         tic = time.monotonic_ns()
         while prefix_len < total:
-            child = node.children.get(self.key_fn(input_ids[prefix_len:]))
+            k = self.key_fn(input_ids[prefix_len:])
+            # Public first, then this session's own. Somebody else's node is not looked for at
+            # all: it lives under a different key, so the walk simply ends here, the caller
+            # prefills the rest, and the only thing lost is a reuse that was never ours.
+            child = node.children.get(k)
+            if child is None and ns is not None:
+                child = node.children.get((k, ns))
             if child is None:
                 return node, prefix_len
             node = child
