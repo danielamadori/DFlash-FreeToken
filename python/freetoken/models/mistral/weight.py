@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from typing import Iterator
 
-import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.models.loader import MergeRule, iter_merged_tensors, iter_weight_files, shard_tensor
+from freetoken.models.loader import MergeRule, iter_merged_tensors, iter_shard_tensors, iter_weight_files, shard_tensor
 from freetoken.utils import cached_load_hf_config
 from tqdm import tqdm
 
@@ -39,19 +38,17 @@ def iter_weights(
             desc="Loading weights",
             disable=not tp_info.is_primary(),
         ):
-            with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-                for raw_name in f.keys():
-                    name = raw_name.removeprefix("language_model.")
-                    raw = f.get_tensor(raw_name)
-                    tensor = shard_tensor(
-                        name,
-                        raw,
-                        rank=tp_info.rank,
-                        world_size=tp_info.size,
-                        num_kv_heads=config.num_kv_heads,
-                    )
-                    del raw
-                    yield name, tensor
+            for raw_name, raw in iter_shard_tensors(file, device):
+                name = raw_name.removeprefix("language_model.")
+                tensor = shard_tensor(
+                    name,
+                    raw,
+                    rank=tp_info.rank,
+                    world_size=tp_info.size,
+                    num_kv_heads=config.num_kv_heads,
+                )
+                del raw
+                yield name, tensor
 
     yield from iter_merged_tensors(
         sharded_tensors(),

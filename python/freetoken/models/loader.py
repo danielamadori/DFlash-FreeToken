@@ -48,6 +48,13 @@ def iter_shard_tensors(file: str, device) -> Iterator[tuple[str, torch.Tensor]]:
     machine that path does not raise, it takes the process down with a Windows
     access violation inside ``torch.storage.__getitem__``, which turns a
     readable error into a worker that vanishes with no traceback at all.
+
+    NOT FOR EVERY FAMILY. This reads every tensor in the shard, so a loader that
+    skips keys -- the MoE families dropping experts, the ones whose rename returns
+    None -- must keep its own loop, or it pulls tensors into VRAM only to discard
+    them. The same goes for loaders that need the handle itself (``get_slice``, a
+    ``set(f.keys())`` to look ahead, a handle held open across shards). Those are
+    already opening once, which is the part that matters.
     """
     import safetensors
 
