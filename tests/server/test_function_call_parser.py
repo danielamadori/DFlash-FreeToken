@@ -343,3 +343,70 @@ def test_streaming_support_flags():
     # test_streaming_model_matrix.py::test_non_streaming_detector_falls_back_to_buffered_parse).
     for name in SUPPORTED_TOOL_CALL_PARSERS:
         assert FunctionCallParser(TOOLS, tool_call_parser=name).supports_streaming() is True
+
+
+def _infer_from(module) -> "callable":
+    """The inference function out of an args module, without importing the CLI.
+
+    ``_infer_tool_call_parser`` is defined in the class body, so it is not an
+    attribute of ServerArgs and cannot be called directly; the argument parser it
+    belongs to wants a full command line. Lifting the source is ugly and honest:
+    the alternative is not testing the rule that decides which dialect a model
+    speaks.
+    """
+    import io
+    import textwrap
+
+    righe = io.open(module.__file__, encoding="utf-8").read().split("\n")
+    inizio = next(
+        i for i, r in enumerate(righe) if r.strip().startswith("def _infer_tool_call_parser")
+    )
+    fine = inizio + 1
+    while fine < len(righe) and (righe[fine].strip() == "" or righe[fine].startswith("        ")):
+        fine += 1
+    spazio: dict = {}
+    exec(textwrap.dedent("\n".join(righe[inizio:fine])), spazio)  # noqa: S102
+    return spazio["_infer_tool_call_parser"]
+
+
+@pytest.mark.parametrize("modulo", ["freetoken.server.args", "freetoken.engine.args"])
+def test_the_whole_qwen3_8_family_gets_the_xml_dialect(modulo: str):
+    """Qwen3.8-27B emits the qwen3_coder XML, and only "-Flash" was enumerated.
+
+    Measured through the cluster gateway: the 27B answered a tools request with
+
+        <tool_call><function=read><parameter=filePath>segreto.txt</parameter>
+        </function></tool_call>
+
+    -- a correct call -- and the response carried no tool_calls at all. The name
+    fell past the "-Flash" test into the generic "qwen" branch and got qwen25,
+    which looks for JSON inside the tags, finds none, logs "Failed to parse JSON
+    part", and drops it. The caller is then handed a tool call as prose.
+
+    Both args modules carry a copy of the rule, and a fix in one of them is a
+    node that behaves differently depending on how it was started.
+    """
+    import importlib
+
+    dedurre = _infer_from(importlib.import_module(modulo))
+
+    assert dedurre("Qwen3.8-27B") == "qwen3_coder"
+    assert dedurre("Qwen3.8-Flash") == "qwen3_coder"
+    # The families on either side must not move.
+    assert dedurre("Qwen2.5-Coder-1.5B-Instruct") == "qwen25"
+    assert dedurre("Qwen2-7B") == "qwen25"
+
+
+def test_the_xml_dialect_needs_its_own_detector():
+    """The same text to both detectors: qwen25 yields nothing, and says so only
+    in a log line nobody reads on the caller's side."""
+    uscita = (
+        "<tool_call>\n<function=read>\n<parameter=filePath>\nsegreto.txt\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    giusto = FunctionCallParser(TOOLS, tool_call_parser="qwen3_coder").parse_non_stream(uscita)
+    assert [c.name for c in giusto.calls] == ["read"]
+    assert json.loads(giusto.calls[0].parameters) == {"filePath": "segreto.txt"}
+
+    sbagliato = FunctionCallParser(TOOLS, tool_call_parser="qwen25").parse_non_stream(uscita)
+    assert sbagliato.calls == []

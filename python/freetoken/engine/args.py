@@ -180,6 +180,14 @@ def parse_args(
         if (
             "qwen3_5" in marker
             or "qwen3.5" in marker
+            # The Qwen3.8 FAMILY, not one variant: a plain Qwen3.8-27B fell
+            # through to the generic "qwen" branch and got the qwen25 detector,
+            # which looks for JSON inside <tool_call>, while this family emits
+            # the XML dialect <function=name><parameter=x>...  Measured through
+            # the cluster gateway: the model made the call correctly and the
+            # response carried no tool_calls, so the caller saw prose.
+            or "qwen3.8" in marker
+            or "qwen3_8" in marker
             or ("qwen3" in marker and "coder" in marker)
         ):
             return "qwen3_coder"

@@ -178,7 +178,20 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
-        if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
+        if (
+            "qwen4_exp" in marker
+            or "qwen4exp" in marker
+            # The FAMILY, not one variant. Only "qwen3.8-flash" was listed, so a
+            # plain Qwen3.8-27B fell through to the generic "qwen" branch and got
+            # the qwen25 detector -- which looks for JSON inside <tool_call>, while
+            # this family emits the XML dialect:
+            #   <tool_call><function=read><parameter=filePath>x</parameter>...
+            # Measured through the cluster gateway: the model made the call
+            # correctly and the response carried no tool_calls at all, because
+            # nothing matched. The caller then sees a tool call as plain prose.
+            or "qwen3.8" in marker
+            or "qwen3_8" in marker
+        ):
             return "qwen3_coder"
         if (
             "qwen3_5" in marker
