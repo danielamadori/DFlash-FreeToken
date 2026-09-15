@@ -15,7 +15,10 @@ from types import SimpleNamespace
 from freetoken.server.node_metrics import build_props, _ctx_per_slot, _linee
 
 
-def _doc(ctx=65536, used=10, total=100, slots_used=1, slots_total=25):
+# total_pages: un fondo VERO, non 100. Da quando /props riporta il minimo fra tetto e
+# fondo, un fixture con cento pagine farebbe dichiarare al nodo un contesto di cento
+# token -- e i test delle percentuali passano comunque, perche' guardano il rapporto.
+def _doc(ctx=65536, used=12190, total=121899, slots_used=1, slots_total=25):
     return {
         "model": {"id": "Qwen3.8-27B-UD-Q4_K_S.gguf", "ctx": ctx, "quant": "Q4_K_S"},
         "kv": {"used_pages": used, "total_pages": total, "page_size": 1},
@@ -232,3 +235,21 @@ def test_a_server_that_cannot_name_itself_refuses_nothing() -> None:
 
     cieco = SimpleNamespace(config=SimpleNamespace(served_model_name=None, model_path=None))
     assert _model_refusal(SimpleNamespace(model="qualunque"), cieco) is None
+
+
+def test_the_context_reported_is_the_lower_of_ceiling_and_pool() -> None:
+    """max_seq_len and the KV pool are sized independently, so they can disagree.
+
+    Measured on thething 2026-09-15: the ceiling was raised 65536 -> 128000 and the pool stayed
+    at 121899, because the pool comes from the free-memory ratio and not from the ceiling. A
+    127711-token prompt then came back "prompt is too long: 127711 tokens > 121899 maximum". The
+    engine refuses at the true number; reporting the other would leave the node as the only
+    party in the chain believing the wrong figure.
+    """
+    from freetoken.server.node_metrics import _ctx_effettivo
+
+    assert _ctx_effettivo({"ctx": 128000}, {"kv": {"total_pages": 121899}}) == 121899
+    assert _ctx_effettivo({"ctx": 65536}, {"kv": {"total_pages": 121899}}) == 65536
+    # Un fatto mancante non deve azzerare l'altro.
+    assert _ctx_effettivo({"ctx": 128000}, {}) == 128000
+    assert _ctx_effettivo({}, {"kv": {"total_pages": 121899}}) == 121899

@@ -61,6 +61,28 @@ def _ctx_per_slot(card: dict) -> int:
     return int(card.get("ctx") or 0)
 
 
+def _ctx_effettivo(card: dict, doc: dict) -> int:
+    """The ceiling the engine ACTUALLY enforces: the lower of the model ceiling and the pool.
+
+    ``max_seq_len`` is a ceiling on what a caller may ASK for; the KV pool is how much the card
+    could hold. They are sized independently -- the pool comes from the free-memory ratio -- so
+    raising the ceiling does not grow the pool, and the node would then advertise a number it
+    refuses. Measured on thething 2026-09-15: ceiling raised 65536 -> 128000, pool stayed at
+    121899, and a 127711-token prompt came back
+
+        prompt is too long: 127711 tokens > 121899 maximum
+
+    The engine already refuses at the true number. Reporting the other one would make the node
+    the only party in the chain that believes the wrong figure -- which is the shape of defect
+    this file has already produced twice today.
+    """
+    tetto = _ctx_per_slot(card)
+    pagine = int(((doc.get("kv") or {}).get("total_pages")) or 0)
+    if tetto and pagine:
+        return min(tetto, pagine)
+    return tetto or pagine
+
+
 # The ServerArgs field that holds how many requests run at once. Spelled out here, once,
 # because getattr with a wrong name does not raise: it takes the default and the endpoint
 # reports a plausible number that is not the engine's. That is what happened -- this asked for
@@ -98,7 +120,7 @@ def build_props(state: Any, doc: dict, version: str) -> dict:
         "is_sleeping": False,
         "endpoint_metrics": True,
         "modalities": _modalities(),
-        "default_generation_settings": {"n_ctx": _ctx_per_slot(card)},
+        "default_generation_settings": {"n_ctx": _ctx_effettivo(card, doc)},
     }
 
 
