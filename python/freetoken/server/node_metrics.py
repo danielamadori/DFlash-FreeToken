@@ -48,6 +48,22 @@ def _ctx_per_slot(card: dict, slots: int) -> int:
     return ctx // slots if slots > 0 and ctx > 0 else ctx
 
 
+# The ServerArgs field that holds how many requests run at once. Spelled out here, once,
+# because getattr with a wrong name does not raise: it takes the default and the endpoint
+# reports a plausible number that is not the engine's. That is what happened -- this asked for
+# "max_running_requests", which no version of ServerArgs has ever had, so a node configured for
+# 4 told BOS it had 1 slot and, since ctx_per_slot divides by it, claimed 65536 of context per
+# caller instead of 16384. Both are stored on the asset, so the fleet page was wrong about the
+# two facts this endpoint exists to carry, and the tests passed because the fixture used the
+# same wrong name. test_the_slot_field_is_the_one_ServerArgs_has guards the spelling now.
+_SLOTS_FIELD = "max_running_req"
+
+
+def _slots(config: Any) -> int:
+    """How many requests this engine serves at once, never fewer than 1."""
+    return int(getattr(config, _SLOTS_FIELD, 0) or 1)
+
+
 def build_props(state: Any, doc: dict, version: str) -> dict:
     """The ``/props`` body, in llama-server's spelling because that is what is read.
 
@@ -58,7 +74,7 @@ def build_props(state: Any, doc: dict, version: str) -> dict:
     """
     config = getattr(state, "config", None)
     card = doc.get("model") or {}
-    slots = int(getattr(config, "max_running_requests", 0) or 1)
+    slots = _slots(config)
     return {
         "model_alias": card.get("id"),
         "model_path": getattr(config, "model_path", None),
@@ -156,7 +172,7 @@ def register_node_metrics_routes(
     async def metrics():
         doc = build_doc()
         config = getattr(get_state(), "config", None)
-        slots = int(getattr(config, "max_running_requests", 0) or 1)
+        slots = _slots(config)
         return "\n".join(_linee(doc, slots)) + "\n"
 
 

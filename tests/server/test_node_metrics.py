@@ -27,7 +27,12 @@ def _doc(ctx=65536, used=10, total=100, slots_used=1, slots_total=25):
 
 
 def _state(slots=1, model_path="/models/qwen.gguf"):
-    return SimpleNamespace(config=SimpleNamespace(max_running_requests=slots,
+    # The field name is imported, not written out: a fixture that spells it itself is green
+    # whatever the engine calls it, which is exactly how a node came to report 1 slot while
+    # serving 4.
+    from freetoken.server.node_metrics import _SLOTS_FIELD
+
+    return SimpleNamespace(config=SimpleNamespace(**{_SLOTS_FIELD: slots},
                                                   model_path=model_path))
 
 
@@ -129,3 +134,21 @@ def test_the_advertisement_follows_the_tuple_the_api_checks() -> None:
         nm.ACCEPTED_CONTENT_PART_TYPES = originale
 
     assert nm.build_props(_state(), _doc(), "0.1.2")["modalities"]["vision"] is False
+
+
+def test_the_slot_field_is_the_one_ServerArgs_has() -> None:
+    """The one assertion the fixture cannot make for itself.
+
+    ``getattr(config, "wrong_name", 0)`` does not raise: it takes the default, and the endpoint
+    answers a plausible number that is not the engine's. This node reported 1 slot while serving
+    4, and 65536 of context per caller instead of 16384, because the name asked for here never
+    existed -- with every test green, since the fixture built a namespace around the same wrong
+    name. Comparing against the real ServerArgs is what closes that loop.
+    """
+    from freetoken.server.args import ServerArgs
+    from freetoken.server.node_metrics import _SLOTS_FIELD
+
+    assert hasattr(ServerArgs, _SLOTS_FIELD), (
+        f"node_metrics reads config.{_SLOTS_FIELD}, which ServerArgs does not have: "
+        f"/props would answer the default instead of the engine's real slot count"
+    )
