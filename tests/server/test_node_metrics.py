@@ -8,6 +8,8 @@ measured on thething the 2026-09-14. The numbers were never missing: /v1/stats h
 
 from __future__ import annotations
 
+import json
+
 from types import SimpleNamespace
 
 from freetoken.server.node_metrics import build_props, _ctx_per_slot, _linee
@@ -180,3 +182,40 @@ def test_a_response_names_the_model_that_answered_not_the_one_asked_for() -> Non
         assert _answering_model(SimpleNamespace(model="gpt-4")) == "gpt-4"
     finally:
         api_server._GLOBAL_STATE = originale
+
+
+def test_a_model_this_node_does_not_serve_is_refused() -> None:
+    """No fallback: Daniel's call, 2026-09-15.
+
+    Answering any name meant a misrouted request came back as a normal answer from whatever
+    model happened to be loaded. Naming the real model in the reply made the swap visible but
+    did not stop it, and a plausible text from the wrong model is indistinguishable from a right
+    one to anything downstream not reading that field. The refusal names what IS served, because
+    an error that does not say what would have worked costs a round trip to find out.
+    """
+    from types import SimpleNamespace
+
+    from freetoken.server.openai_api import _model_refusal
+
+    state = SimpleNamespace(config=SimpleNamespace(served_model_name="Qwen3.8-27B",
+                                                   model_path="/m/q.gguf"))
+
+    assert _model_refusal(SimpleNamespace(model="Qwen3.8-27B"), state) is None
+
+    rifiuto = _model_refusal(SimpleNamespace(model="gpt-4"), state)
+    assert rifiuto is not None and rifiuto.status_code == 404
+    corpo = json.loads(bytes(rifiuto.body).decode())
+    assert corpo["error"]["code"] == "model_not_found"
+    assert "gpt-4" in corpo["error"]["message"]
+    assert "Qwen3.8-27B" in corpo["error"]["message"], "the refusal must name what IS served"
+
+
+def test_a_server_that_cannot_name_itself_refuses_nothing() -> None:
+    """Refusing on an unknown served name would turn one missing field into a node that
+    answers nobody. Absent is not a mismatch."""
+    from types import SimpleNamespace
+
+    from freetoken.server.openai_api import _model_refusal
+
+    cieco = SimpleNamespace(config=SimpleNamespace(served_model_name=None, model_path=None))
+    assert _model_refusal(SimpleNamespace(model="qualunque"), cieco) is None
