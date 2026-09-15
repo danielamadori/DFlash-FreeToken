@@ -248,8 +248,41 @@ def test_the_context_reported_is_the_lower_of_ceiling_and_pool() -> None:
     """
     from freetoken.server.node_metrics import _ctx_effettivo
 
-    assert _ctx_effettivo({"ctx": 128000}, {"kv": {"total_pages": 121899}}) == 121899
-    assert _ctx_effettivo({"ctx": 65536}, {"kv": {"total_pages": 121899}}) == 65536
+    assert _ctx_effettivo({"ctx": 128000}, {"kv": {"total_pages": 121899}}, 1) == 121899
+    assert _ctx_effettivo({"ctx": 65536}, {"kv": {"total_pages": 121899}}, 1) == 65536
     # Un fatto mancante non deve azzerare l'altro.
-    assert _ctx_effettivo({"ctx": 128000}, {}) == 128000
-    assert _ctx_effettivo({}, {"kv": {"total_pages": 121899}}) == 121899
+    assert _ctx_effettivo({"ctx": 128000}, {}, 1) == 128000
+    assert _ctx_effettivo({}, {"kv": {"total_pages": 121899}}, 1) == 121899
+
+
+def test_the_pool_is_counted_in_pages_and_the_ceiling_in_tokens() -> None:
+    """A page holds page_size tokens, so the pool has to be converted before the min.
+
+    Every token-valued quantity beside ``total_pages`` multiplies by it --
+    ``CacheManager.available_size`` is ``evictable + len(free_slots) * page_size``, and the
+    prefill adder's ``_kv_reservation_size`` (upstream #367) returns «the token-equivalent
+    cost of the additional KV pages». Comparing the ceiling with a bare page count is right
+    only where ``--page-size`` is 1, which is what the two nodes measured on happen to run.
+
+    With ``--page-size 16`` the node would advertise a sixteenth of the context it holds and
+    a router would turn away prompts it answers -- the defect this function exists to remove,
+    pointing the other way.
+    """
+    from freetoken.server.node_metrics import _ctx_effettivo
+
+    doc = {"kv": {"total_pages": 8000}}
+    # page_size 1: pages and tokens coincide, and the pool is the lower of the two.
+    assert _ctx_effettivo({"ctx": 32768}, doc, 1) == 8000
+    # page_size 16: the pool is 128000 tokens, so the ceiling is what a caller meets.
+    assert _ctx_effettivo({"ctx": 32768}, doc, 16) == 32768
+    # ... and stays the pool when the ceiling is higher than what the pages hold.
+    assert _ctx_effettivo({"ctx": 200000}, doc, 16) == 128000
+
+
+def test_a_missing_page_size_is_read_as_one_not_as_zero() -> None:
+    """``getattr(config, "page_size", 1)`` can still hand over None from a config that has the
+    attribute set to nothing. Zero pages of context would be reported as no context at all."""
+    from freetoken.server.node_metrics import _ctx_effettivo
+
+    assert _ctx_effettivo({"ctx": 32768}, {"kv": {"total_pages": 8000}}, None) == 8000
+    assert _ctx_effettivo({"ctx": 32768}, {"kv": {"total_pages": 8000}}, 0) == 8000
