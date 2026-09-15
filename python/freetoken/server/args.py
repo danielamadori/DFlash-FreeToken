@@ -729,9 +729,17 @@ def parse_args(
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
 
     if kwargs["served_model_name"] is None:
-        kwargs["served_model_name"] = (
-            os.path.basename(os.path.normpath(kwargs["model_path"])) or kwargs["model_path"]
-        )
+        # The name clients ask for and a router routes on. Derived from the path when not
+        # given, and a GGUF path ends in a FILE, so the basename alone carried ".gguf" into
+        # the served name: a node announced "Qwen3.8-27B-UD-Q4_K_S.gguf" while the fleet
+        # routed on "Qwen3.8-27B", and declared and observed disagreed for no reason but an
+        # extension. The quantisation suffix is left alone -- it names a real difference
+        # between two files of the same model, and /props reports it separately as
+        # model_ftype -- but ".gguf" names nothing a caller could ask for.
+        base = os.path.basename(os.path.normpath(kwargs["model_path"])) or kwargs["model_path"]
+        if base.lower().endswith(".gguf"):
+            base = base[: -len(".gguf")]
+        kwargs["served_model_name"] = base
 
     if kwargs["tool_call_parser"] == "auto":
         kwargs["tool_call_parser"] = _infer_tool_call_parser(kwargs["model_path"])

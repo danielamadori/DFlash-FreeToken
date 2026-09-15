@@ -152,3 +152,31 @@ def test_the_slot_field_is_the_one_ServerArgs_has() -> None:
         f"node_metrics reads config.{_SLOTS_FIELD}, which ServerArgs does not have: "
         f"/props would answer the default instead of the engine's real slot count"
     )
+
+
+def test_a_response_names_the_model_that_answered_not_the_one_asked_for() -> None:
+    """A misroute must be visible in the answer.
+
+    This engine accepts any model name: measured on thething 2026-09-15, `gpt-4` and
+    `nome-inventato` both returned 200. Echoing the requested name back meant a request that
+    landed on the wrong node came home with a confident answer wearing the right label -- the
+    client asked X, the body said X, the text came from Y, and no point in the chain showed the
+    swap. Naming the model that actually ran does not make the misroute correct; it makes it
+    detectable, which is the whole difference.
+    """
+    from types import SimpleNamespace
+
+    import freetoken.server.api_server as api_server
+    from freetoken.server.openai_api import _answering_model
+
+    originale = api_server._GLOBAL_STATE
+    try:
+        api_server._GLOBAL_STATE = SimpleNamespace(
+            config=SimpleNamespace(served_model_name="Qwen3.8-27B"))
+        assert _answering_model(SimpleNamespace(model="gpt-4")) == "Qwen3.8-27B"
+        assert _answering_model(SimpleNamespace(model="Qwen3.8-27B")) == "Qwen3.8-27B"
+        # Un server che non sa dire il proprio nome ricade sul richiesto, non su None.
+        api_server._GLOBAL_STATE = SimpleNamespace(config=SimpleNamespace(served_model_name=None))
+        assert _answering_model(SimpleNamespace(model="gpt-4")) == "gpt-4"
+    finally:
+        api_server._GLOBAL_STATE = originale

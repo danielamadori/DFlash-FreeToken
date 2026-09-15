@@ -213,7 +213,7 @@ async def handle_chat_completion(
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": req.model,
+        "model": _answering_model(req),
         "choices": [
             {
                 "index": 0,
@@ -366,7 +366,7 @@ async def stream_chat_completion_chunks(
                 "id": f"chatcmpl-{uid}",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": req.model,
+                "model": _answering_model(req),
                 "choices": [],
                 "usage": _usage(
                     prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
@@ -430,7 +430,7 @@ async def handle_completion(
         "id": f"cmpl-{uuid.uuid4().hex}",
         "object": "text_completion",
         "created": int(time.time()),
-        "model": req.model,
+        "model": _answering_model(req),
         "choices": choices,
         "usage": _usage(prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)),
     }
@@ -455,7 +455,7 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
                     "id": f"cmpl-{uid}",
                     "object": "text_completion.chunk",
                     "created": int(time.time()),
-                    "model": req.model,
+                    "model": _answering_model(req),
                     "choices": [
                         {
                             "text": ack.incremental_output,
@@ -475,7 +475,7 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
             "id": f"cmpl-{uid}",
             "object": "text_completion.chunk",
             "created": int(time.time()),
-            "model": req.model,
+            "model": _answering_model(req),
             "choices": [{"text": "", "index": 0, "finish_reason": finish_reason, "logprobs": None}],
         }
     )
@@ -485,7 +485,7 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
                 "id": f"cmpl-{uid}",
                 "object": "text_completion.chunk",
                 "created": int(time.time()),
-                "model": req.model,
+                "model": _answering_model(req),
                 "choices": [],
                 "usage": _usage(
                     prompt_tokens, completion_tokens, _reported_cached(state, cached_tokens)
@@ -593,7 +593,7 @@ def _chat_chunk(req: ChatCompletionRequest, uid: int, choices: list[dict[str, An
         "id": f"chatcmpl-{uid}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
-        "model": req.model,
+        "model": _answering_model(req),
         "choices": choices,
     }
 
@@ -671,6 +671,26 @@ async def _effort_fields(state: Any) -> tuple[list[str] | None, str | None]:
         return None, None
     ordered = sorted(served, key=lambda name: -EFFORT_SCALE.get(name, 0.0))
     return ordered, profile.default
+
+
+def _answering_model(req: Any) -> str | None:
+    """The model that ACTUALLY produced this response, not the one that was asked for.
+
+    Echoing ``req.model`` back made a misroute invisible. This engine accepts any model name --
+    measured on thething 2026-09-15, ``gpt-4`` and ``nome-inventato`` both answer 200 -- so a
+    request that lands on the wrong node is not refused: it is answered, and the body says it
+    came from the model that was requested. The client asked for X, the answer claims X, the
+    text came from Y, and nothing in the chain shows the swap. That is how the hub came to see
+    "declared and observed disagree" from the outside.
+
+    OpenAI defines this field as the model USED for the completion, so the served name is the
+    right answer; the requested name stays only as the fallback for a server that cannot name
+    itself. Naming the real model does not make a misroute correct -- it makes it visible, which
+    is the difference between a wrong answer and a wrong answer nobody can detect.
+    """
+    from .api_server import _served_model_name as _servito  # lazy: api_server imports this module
+
+    return _servito() or getattr(req, "model", None)
 
 
 def _served_model_name(state: Any) -> str:
