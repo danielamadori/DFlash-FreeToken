@@ -148,18 +148,83 @@ _FTYPE_PER_DTYPE = {
 }
 
 
+# llama.cpp's ``llama_ftype`` -> the spelling ``llama_ftype_name`` prints, so a GGUF node
+# names its quantisation the way the llama.cpp nodes beside it on the fleet page do.
+# Generated from llama.h (the enum values) and llama-model-loader.cpp (the strings);
+# an ftype absent here is left unnamed rather than approximated.
+_FTYPE_PER_GGUF = {
+    0: "all F32",
+    1: "F16",
+    2: "Q4_0",
+    3: "Q4_1",
+    7: "Q8_0",
+    8: "Q5_0",
+    9: "Q5_1",
+    10: "Q2_K - Medium",
+    11: "Q3_K - Small",
+    12: "Q3_K - Medium",
+    13: "Q3_K - Large",
+    14: "Q4_K - Small",
+    15: "Q4_K - Medium",
+    16: "Q5_K - Small",
+    17: "Q5_K - Medium",
+    18: "Q6_K",
+    19: "IQ2_XXS - 2.0625 bpw",
+    20: "IQ2_XS - 2.3125 bpw",
+    21: "Q2_K - Small",
+    22: "IQ3_XS - 3.3 bpw",
+    23: "IQ3_XXS - 3.0625 bpw",
+    24: "IQ1_S - 1.5625 bpw",
+    25: "IQ4_NL - 4.5 bpw",
+    26: "IQ3_S - 3.4375 bpw",
+    27: "IQ3_S mix - 3.66 bpw",
+    28: "IQ2_S - 2.5 bpw",
+    29: "IQ2_M - 2.7 bpw",
+    30: "IQ4_XS - 4.25 bpw",
+    31: "IQ1_M - 1.75 bpw",
+    32: "BF16",
+    36: "TQ1_0 - 1.69 bpw ternary",
+    37: "TQ2_0 - 2.06 bpw ternary",
+    38: "MXFP4 MoE",
+    39: "NVFP4",
+    40: "Q1_0",
+    41: "Q2_0",
+}
+
+
+def _codice_ftype_gguf(model_path: Any) -> int | None:
+    """The checkpoint's own ``general.file_type``, or None when there is no GGUF to ask.
+
+    Imported inside the function: ``/props`` must answer on a node whose model is not a
+    GGUF, and on one where gguf-py is not importable, without either turning into a 500.
+    """
+    if not model_path:
+        return None
+    try:
+        from freetoken.models.gguf.reader import gguf_file_type
+
+        return gguf_file_type(str(model_path))
+    except Exception:
+        return None
+
+
 def _model_ftype(card: dict, config: Any) -> str | None:
     """How the weights are stored, in llama-server's spelling.
 
-    ``card["quant"]`` is the quantisation a GGUF checkpoint carries in its own header
-    ("Q4_K - Medium"). A safetensors checkpoint has none, and nothing in this engine
-    fills that key, so every FreeToken node published an empty field -- the Dell's card
-    on the fleet page reads "Quantization: not reported" beside three llama.cpp nodes
-    that state theirs.
+    Three sources, in the order of how directly each one knows the answer.
 
-    It was never unknown. The weights are held at the engine's dtype, which is on the
-    config the caller already has: reporting BF16 says the same kind of thing the
-    quantised nodes say, in the same field, and lets the fleet compare them.
+    ``card["quant"]`` is what the model card states outright, and nothing overrides it.
+
+    Then the checkpoint's own ``general.file_type``. This engine never fills ``quant``,
+    so before this a GGUF node fell through to the dtype below and answered BF16 for a
+    Q4_K_S file: the weights are four-bit on disk and bfloat16 only once dequantised on
+    the way to the kernels. The fleet page then read "Quantization: BF16" for a node
+    serving Q4_K_S -- a wrong statement in the field a router compares, which is worse
+    than the empty field it replaced, and exactly the guesswork the note below forbids.
+
+    Last the engine's dtype, which is the right answer for a safetensors checkpoint:
+    there the weights ARE held at it, and a node that reported nothing now reports BF16
+    like the quantised nodes report theirs.
 
     An unrecognised dtype is left ABSENT rather than guessed: "not reported" is true,
     and a made-up spelling in a field other tools read by name is not.
@@ -167,6 +232,12 @@ def _model_ftype(card: dict, config: Any) -> str | None:
     dichiarato = card.get("quant")
     if dichiarato:
         return str(dichiarato)
+    codice = _codice_ftype_gguf(getattr(config, "model_path", None))
+    if codice is not None:
+        # A GGUF that declares an ftype this table cannot name is left ABSENT. Falling
+        # through to the dtype here would put back the very claim this branch removes:
+        # the weights are quantised, whatever the engine computes in.
+        return _FTYPE_PER_GGUF.get(int(codice))
     dtype = getattr(config, "dtype", None)
     if dtype is None:
         return None

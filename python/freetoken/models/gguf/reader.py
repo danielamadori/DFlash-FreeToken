@@ -349,6 +349,29 @@ def gguf_architecture(model_path: str) -> str:
     return str(arch)
 
 
+def gguf_file_type(model_path: str) -> int | None:
+    """``general.file_type``: how the WEIGHTS are stored, as llama.cpp's ``llama_ftype``.
+
+    This is not the dtype the engine computes in. A Q4_K_S checkpoint reports 14 and is
+    dequantised into bfloat16 on the way to the kernels: reading the engine's dtype off the
+    config and calling it the checkpoint's format states a number nobody measured.
+
+    Returns None rather than raising: a caller asking how the weights are stored can say
+    "not reported" truthfully, and every caller of this function has that option.
+    """
+    shard1_path = resolve_gguf_path(model_path)
+    if shard1_path is None:
+        return None
+
+    value = _field_value(_reader(shard1_path), "general.file_type")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
     """Yield every tensor with its torch shape, ggml type, and packed block bytes.
 

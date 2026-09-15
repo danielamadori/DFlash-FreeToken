@@ -318,3 +318,50 @@ def test_an_unknown_dtype_is_left_absent_rather_than_guessed() -> None:
     assert _model_ftype({}, SimpleNamespace(dtype="torch.float8_e4m3fn")) is None
     assert _model_ftype({}, SimpleNamespace(dtype=None)) is None
     assert _model_ftype({}, None) is None
+
+
+def test_a_gguf_node_names_its_own_quantisation_not_the_engine_dtype(monkeypatch) -> None:
+    """The weights are four-bit on disk; bfloat16 is only what the kernels compute in.
+
+    Nothing in this engine fills ``card["quant"]``, so before the checkpoint was consulted
+    a GGUF node fell through to the dtype and published "BF16" for a Q4_K_S file. On the
+    fleet page that is a wrong statement in the field a router compares, which is worse
+    than the empty field it replaced.
+    """
+    from types import SimpleNamespace
+
+    from freetoken.models.gguf import reader
+    from freetoken.server.node_metrics import _model_ftype
+
+    monkeypatch.setattr(reader, "gguf_file_type", lambda _p: 14)
+    config = SimpleNamespace(dtype="torch.bfloat16", model_path="/m/Qwen3.8-27B-UD-Q4_K_S.gguf")
+    assert _model_ftype({}, config) == "Q4_K - Small"
+    # A card that states its own quantisation still outranks the header.
+    assert _model_ftype({"quant": "Q4_K - Medium"}, config) == "Q4_K - Medium"
+
+
+def test_a_gguf_ftype_the_table_cannot_name_is_absent_not_the_dtype(monkeypatch) -> None:
+    """Falling through to the dtype for an unnameable GGUF ftype would restore the claim
+    the previous test removes: the weights are quantised whatever the engine computes in."""
+    from types import SimpleNamespace
+
+    from freetoken.models.gguf import reader
+    from freetoken.server.node_metrics import _model_ftype
+
+    monkeypatch.setattr(reader, "gguf_file_type", lambda _p: 4242)
+    config = SimpleNamespace(dtype="torch.bfloat16", model_path="/m/strano.gguf")
+    assert _model_ftype({}, config) is None
+
+
+def test_a_node_without_a_gguf_still_answers_with_its_dtype(monkeypatch) -> None:
+    """The safetensors case 37c5dd8 added, which this change must not take away."""
+    from types import SimpleNamespace
+
+    from freetoken.models.gguf import reader
+    from freetoken.server.node_metrics import _model_ftype
+
+    monkeypatch.setattr(reader, "gguf_file_type", lambda _p: None)
+    config = SimpleNamespace(dtype="torch.bfloat16", model_path="/m/modello.safetensors")
+    assert _model_ftype({}, config) == "BF16"
+    # And a node whose config names no model at all never opens a file to find out.
+    assert _model_ftype({}, SimpleNamespace(dtype="torch.bfloat16")) == "BF16"
