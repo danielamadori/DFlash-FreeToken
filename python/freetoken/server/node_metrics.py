@@ -126,7 +126,7 @@ def build_props(state: Any, doc: dict, version: str) -> dict:
     return {
         "model_alias": card.get("id"),
         "model_path": getattr(config, "model_path", None),
-        "model_ftype": card.get("quant"),
+        "model_ftype": _model_ftype(card, config),
         "total_slots": slots,
         "build_info": f"freetoken-{version}",
         # A state, not a configuration, and this engine never idles its weights out.
@@ -137,6 +137,42 @@ def build_props(state: Any, doc: dict, version: str) -> dict:
             "n_ctx": _ctx_effettivo(card, doc, getattr(config, "page_size", 1))
         },
     }
+
+
+_FTYPE_PER_DTYPE = {
+    "bfloat16": "BF16",
+    "float16": "F16",
+    "half": "F16",
+    "float32": "F32",
+    "float": "F32",
+}
+
+
+def _model_ftype(card: dict, config: Any) -> str | None:
+    """How the weights are stored, in llama-server's spelling.
+
+    ``card["quant"]`` is the quantisation a GGUF checkpoint carries in its own header
+    ("Q4_K - Medium"). A safetensors checkpoint has none, and nothing in this engine
+    fills that key, so every FreeToken node published an empty field -- the Dell's card
+    on the fleet page reads "Quantization: not reported" beside three llama.cpp nodes
+    that state theirs.
+
+    It was never unknown. The weights are held at the engine's dtype, which is on the
+    config the caller already has: reporting BF16 says the same kind of thing the
+    quantised nodes say, in the same field, and lets the fleet compare them.
+
+    An unrecognised dtype is left ABSENT rather than guessed: "not reported" is true,
+    and a made-up spelling in a field other tools read by name is not.
+    """
+    dichiarato = card.get("quant")
+    if dichiarato:
+        return str(dichiarato)
+    dtype = getattr(config, "dtype", None)
+    if dtype is None:
+        return None
+    # torch.bfloat16 renders as "torch.bfloat16"; a plain string is taken as it comes.
+    nome = str(dtype).rsplit(".", 1)[-1].strip().lower()
+    return _FTYPE_PER_DTYPE.get(nome)
 
 
 def _modalities() -> dict:

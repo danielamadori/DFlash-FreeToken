@@ -286,3 +286,35 @@ def test_a_missing_page_size_is_read_as_one_not_as_zero() -> None:
 
     assert _ctx_effettivo({"ctx": 32768}, {"kv": {"total_pages": 8000}}, None) == 8000
     assert _ctx_effettivo({"ctx": 32768}, {"kv": {"total_pages": 8000}}, 0) == 8000
+
+
+def test_a_safetensors_node_says_how_its_weights_are_held() -> None:
+    """``quant`` is a GGUF header field, and nothing in this engine fills it.
+
+    Every FreeToken node therefore published an empty ``model_ftype``: the Dell's card on
+    the fleet page reads "Quantization: not reported" beside three llama.cpp nodes that
+    state theirs. It was never unknown -- the weights are held at the engine's dtype, and
+    the config carries it.
+    """
+    from types import SimpleNamespace
+
+    from freetoken.server.node_metrics import _model_ftype
+
+    config = SimpleNamespace(dtype="torch.bfloat16")
+    assert _model_ftype({}, config) == "BF16"
+    assert _model_ftype({"quant": None}, config) == "BF16"
+    # A checkpoint that carries its own quantisation keeps saying it: the dtype is the
+    # fallback, not a replacement.
+    assert _model_ftype({"quant": "Q4_K - Medium"}, config) == "Q4_K - Medium"
+
+
+def test_an_unknown_dtype_is_left_absent_rather_than_guessed() -> None:
+    """"not reported" is true; an invented spelling in a field other tools read by name
+    is not."""
+    from types import SimpleNamespace
+
+    from freetoken.server.node_metrics import _model_ftype
+
+    assert _model_ftype({}, SimpleNamespace(dtype="torch.float8_e4m3fn")) is None
+    assert _model_ftype({}, SimpleNamespace(dtype=None)) is None
+    assert _model_ftype({}, None) is None
