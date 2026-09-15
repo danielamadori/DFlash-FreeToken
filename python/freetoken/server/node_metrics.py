@@ -36,16 +36,29 @@ _PART_TYPE_TO_MODALITY = {
 }
 
 
-def _ctx_per_slot(card: dict, slots: int) -> int:
-    """Context one caller gets, which is what the watcher records.
+def _ctx_per_slot(card: dict) -> int:
+    """The longest prompt one caller can send, which is what this field is read for.
 
-    llama-server reports this in ``default_generation_settings.n_ctx``: started with -c 32768
-    -np 2 it says 16384, and the client relies on that being per-slot -- the difference between
-    "this node holds 32k" and "this node holds 32k, twice over, for two callers". This engine
-    configures the total, so it divides.
+    It used to divide the total by the slot count, copied from llama-server where `-c 32768
+    -np 2` really does partition the cache and each slot holds 16384. **This engine has no such
+    partition**: the KV cache is one pool allocated page by page, and any caller may take up to
+    the model ceiling. Importing another engine's semantics understated this node by 4x, and the
+    two halves did not even agree with each other -- 4 x 16384 is 65536 while the pool actually
+    held 122351 tokens.
+
+    Measured on thething, 2026-09-15, config `max_running_req=4`, `max_seq_len=65536`:
+
+        one caller           59428 tokens of prompt: fine; 68289: refused, "> 65536 maximum"
+        two callers at 59k   20.7 s against 20.5 s for one -- they run together, free
+        three                41.5 s; four 61.9 s -- queued, never refused
+        KV pool              122351 tokens, so exactly two full-context callers fit
+
+    So the ceiling a caller meets is `max_seq_len`, and reporting the division would have a
+    router turn away a 20k prompt this node answers without noticing. The sharing limit -- two
+    at full size, the rest queued -- is a different fact, and llama-server's shape has no field
+    for it: it belongs in the backlog, not in an invented key.
     """
-    ctx = int(card.get("ctx") or 0)
-    return ctx // slots if slots > 0 and ctx > 0 else ctx
+    return int(card.get("ctx") or 0)
 
 
 # The ServerArgs field that holds how many requests run at once. Spelled out here, once,
@@ -85,7 +98,7 @@ def build_props(state: Any, doc: dict, version: str) -> dict:
         "is_sleeping": False,
         "endpoint_metrics": True,
         "modalities": _modalities(),
-        "default_generation_settings": {"n_ctx": _ctx_per_slot(card, slots)},
+        "default_generation_settings": {"n_ctx": _ctx_per_slot(card)},
     }
 
 

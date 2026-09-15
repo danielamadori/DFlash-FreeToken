@@ -38,20 +38,31 @@ def _state(slots=1, model_path="/models/qwen.gguf"):
                                                   model_path=model_path))
 
 
-def test_props_reports_the_context_of_ONE_slot():
-    """The watcher records this as ctx_per_slot, which is the difference between 'this node
-    holds 64k' and 'this node holds 64k, twice over, for two callers'. llama-server divides,
-    so an engine that reported the total would overstate every multi-slot node."""
-    assert _ctx_per_slot({"ctx": 65536}, 1) == 65536
-    assert _ctx_per_slot({"ctx": 65536}, 2) == 32768
-    assert _ctx_per_slot({"ctx": 65536}, 4) == 16384
+def test_the_context_reported_is_the_ceiling_a_caller_actually_meets():
+    """No division: this engine does not partition its KV cache.
 
+    The field used to divide the total by the slot count, copied from llama-server where
+    `-c 32768 -np 2` really does give each slot 16384. Here the cache is one pool, any caller
+    may take up to the model ceiling, and the division understated this node by 4x while
+    contradicting itself: 4 x 16384 is 65536, and the pool held 122351 tokens.
+
+    Measured on thething 2026-09-15: a 59428-token prompt is served, 68289 is refused with
+    "> 65536 maximum". So 65536 is what a router needs to know -- reporting 16384 would have it
+    turn away a 20k prompt this node answers without noticing.
+    """
+    assert _ctx_per_slot({"ctx": 65536}) == 65536
+    assert _ctx_per_slot({"ctx": 65536}) == build_props(_state(slots=4), _doc(ctx=65536),
+                                                        "0")["default_generation_settings"]["n_ctx"]
+
+
+def test_a_card_without_a_context_reports_zero_not_a_guess():
+    assert _ctx_per_slot({}) == 0
 
 def test_props_survives_an_engine_that_has_not_reported_a_context_yet():
     """Before the readiness meta arrives the card is empty, and a watcher asking then must get
     an answer rather than a traceback."""
-    assert _ctx_per_slot({}, 4) == 0
-    assert _ctx_per_slot({"ctx": 1024}, 0) == 1024
+    assert _ctx_per_slot({}) == 0
+    assert _ctx_per_slot({"ctx": 1024}) == 1024
 
 
 def test_props_carries_exactly_the_fields_the_watcher_takes():
@@ -61,7 +72,9 @@ def test_props_carries_exactly_the_fields_the_watcher_takes():
     assert p["model_alias"] == "Qwen3.8-27B-UD-Q4_K_S.gguf"
     assert p["model_path"] == "/models/qwen.gguf"
     assert p["total_slots"] == 2
-    assert p["default_generation_settings"]["n_ctx"] == 32768
+    # Non diviso per gli slot: 65536 e' il tetto che un chiamante incontra davvero, e questo
+    # motore non partiziona la cache. Vedi test_the_context_reported_is_the_ceiling...
+    assert p["default_generation_settings"]["n_ctx"] == 65536
     assert p["endpoint_metrics"] is True
     assert p["is_sleeping"] is False
     assert p["build_info"].startswith("freetoken-")
