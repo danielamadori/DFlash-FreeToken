@@ -135,7 +135,7 @@ def test_hybrid_chunk_donate_skips_unaligned_boundary(ps):
 
     req = _req(3 * ps + 3, 1)
     h = cm.match_req(SimpleNamespace(input_ids=req.input_ids, input_len=req.input_len,
-                                     mm_embeds=None, cache_ns=None, cache_public_len=0)).cuda_handle
+                                     mm_items=None, cache_ns=None, cache_public_len=0)).cuda_handle
     req.cache_handle = h
     req.cached_len = h.cached_len
     cm.lock(h)

@@ -1,10 +1,17 @@
-from .config import parse_config
-from .model import Glm5NextForCausalLM
-from .weight import iter_weights, load_nvfp4_expert_sources
+from .config import VisionConfig, parse_config, parse_vision_config
+from .model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
+from .vision import Glm5NextVisionModel
+from .weight import iter_expert_pieces, iter_vision_weights, iter_weights, nvfp4_expert_spec
 
 __all__ = [
+    "nvfp4_expert_spec",
     "Glm5NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextVisionModel",
+    "VisionConfig",
     "parse_config",
+    "parse_vision_config",
+    "iter_vision_weights",
     "iter_weights",
-    "load_nvfp4_expert_sources",
+    "iter_expert_pieces",
 ]

@@ -137,21 +137,31 @@ def test_props_declares_what_the_front_door_accepts() -> None:
     assert props["modalities"] == {"vision": False, "video": False, "audio": False}
 
 
-def test_the_advertisement_follows_the_tuple_the_api_checks() -> None:
-    """Never from the model's own abilities: a checkpoint with a vision tower loaded is
-    still refused an image by this API, so advertising vision because the weights are
-    there would be a node promising what it then rejects. Teaching the API a part type
-    must move the advertisement with it, without anyone remembering to."""
-    import freetoken.server.node_metrics as nm
+def test_the_advertisement_follows_what_the_process_serves() -> None:
+    """Never from the model's abilities on paper, and never from a hand-kept list.
 
-    originale = nm.ACCEPTED_CONTENT_PART_TYPES
-    try:
-        nm.ACCEPTED_CONTENT_PART_TYPES = ("text", "image_url")
-        assert nm.build_props(_state(), _doc(), "0.1.2")["modalities"]["vision"] is True
-    finally:
-        nm.ACCEPTED_CONTENT_PART_TYPES = originale
+    ``config.served_modalities`` is the union of the encoder towers this PROCESS built. The
+    same field decides whether an image is accepted (``mm.media.image_reject_reason``) and
+    what ``/v1/stats`` publishes as ``input_modalities``: three statements from one source, so
+    a node cannot advertise an ability its own front door refuses.
 
-    assert nm.build_props(_state(), _doc(), "0.1.2")["modalities"]["vision"] is False
+    The GGUF of a vision-capable release is the case that makes the difference. Its header
+    carries no vision section, so no tower is built and no image can be answered -- however
+    multimodal the original checkpoint is.
+    """
+    from freetoken.server.node_metrics import build_props
+
+    stato = _state()
+    assert build_props(stato, _doc(), "0.1.2")["modalities"] == {
+        "vision": False, "video": False, "audio": False
+    }
+
+    object.__setattr__(stato.config, "served_modalities", frozenset({"image"}))
+    modalita = build_props(stato, _doc(), "0.1.2")["modalities"]
+    assert modalita == {"vision": True, "video": False, "audio": False}
+
+    object.__setattr__(stato.config, "served_modalities", frozenset({"image", "video"}))
+    assert build_props(stato, _doc(), "0.1.2")["modalities"]["video"] is True
 
 
 def test_the_slot_field_is_the_one_ServerArgs_has() -> None:

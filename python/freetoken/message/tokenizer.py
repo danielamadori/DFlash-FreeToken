@@ -75,6 +75,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     # Prefix-cache tenancy, taken off the credential by the api server. None keeps the single
     # shared tree: every deployment that does not ask for partitions is unaffected.
     cache_ns: str | None = None
+    images: List[bytes] | None = None
 
 
 @dataclass

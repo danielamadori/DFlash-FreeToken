@@ -143,7 +143,7 @@ def test_base_model_refuses_hidden_state_capture_by_default():
         model.enable_hidden_state_capture([0])
 
 
-def test_muse_glimmer_capture_uses_the_hf_layer_offset():
+def test_muse_glimmer_capture_uses_the_hf_layer_offset(monkeypatch):
     """Entry 0 is the embedding output and entry i+1 layer i, as DFlash indexes them."""
     from types import SimpleNamespace
     from freetoken.models.muse_glimmer.model import MuseGlimmerModel
@@ -158,8 +158,17 @@ def test_muse_glimmer_capture_uses_the_hf_layer_offset():
     # Bypass __init__: allocating real weights needs a checkpoint and a GPU, and the
     # layout logic under test does not depend on either.
     model = object.__new__(MuseGlimmerModel)
+    import freetoken.models.muse_glimmer.model as _mm
+    monkeypatch.setattr(_mm, "get_global_ctx",
+                        lambda: SimpleNamespace(batch=SimpleNamespace(mm_embeds=None)))
     model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.zeros(len(ids), 4))
     model.embed_norm = SimpleNamespace(forward=lambda x: x)
+    # upstream passa l'embedding per _NormedEmbedding, cosi' le righe immagine
+    # (gia' normalizzate dalla torre) non vengono normalizzate due volte.
+    model._normed_embedding = SimpleNamespace(
+        forward=lambda ids: model.embed_norm.forward(model.embed_tokens.forward(ids)),
+        num_embeddings=4,
+    )
     model.norm = SimpleNamespace(forward=lambda x: x)
     model.layers = SimpleNamespace(op_list=[_StubLayer(1.0), _StubLayer(2.0), _StubLayer(4.0)])
     model._capture_layer_ids = ()
@@ -284,7 +293,7 @@ def test_draft_projects_through_a_quantized_head_without_its_last_position_slice
     assert out.shape == (1, 4, 3)
 
 
-def test_qwen3_capture_materialises_the_carried_residual():
+def test_qwen3_capture_materialises_the_carried_residual(monkeypatch):
     """Qwen3 carries the residual to the next layer, so the capture must add it in."""
     from types import SimpleNamespace
     from freetoken.models.qwen3.model import Qwen3Model
@@ -300,6 +309,9 @@ def test_qwen3_capture_materialises_the_carried_residual():
             return torch.full_like(x, self._delta), new_residual
 
     model = object.__new__(Qwen3Model)
+    import freetoken.models.qwen3.model as _mm
+    monkeypatch.setattr(_mm, "get_global_ctx",
+                        lambda: SimpleNamespace(batch=SimpleNamespace(mm_embeds=None)))
     model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.ones(len(ids), 4))
     model.norm = SimpleNamespace(forward=lambda x, residual: (residual + x, None))
     model.layers = SimpleNamespace(op_list=[_StubLayer(2.0), _StubLayer(3.0)])
@@ -345,7 +357,7 @@ def test_rejection_sample_accepts_the_matching_prefix():
     assert int(next_token) == 5  # the target's own token at the first rejected position
 
 
-def test_qwen3_5_moe_capture_materialises_the_carried_residual() -> None:
+def test_qwen3_5_moe_capture_materialises_the_carried_residual(monkeypatch) -> None:
     """The MoE family is why FreeToken is used here at all: DFlash has to reach it too.
 
     Same carried-residual contract as the dense Qwen3, so the same materialisation
@@ -364,6 +376,9 @@ def test_qwen3_5_moe_capture_materialises_the_carried_residual() -> None:
             return torch.full_like(x, self._delta), new_residual
 
     model = object.__new__(Qwen3_5Model)
+    import freetoken.models.qwen3_5_moe.model as _mm
+    monkeypatch.setattr(_mm, "get_global_ctx",
+                        lambda: SimpleNamespace(batch=SimpleNamespace(mm_embeds=None)))
     model.embed_tokens = SimpleNamespace(forward=lambda ids: torch.ones(len(ids), 4))
     model.norm = SimpleNamespace(forward_add_residual=lambda x, residual: (residual + x, None))
     model.layers = SimpleNamespace(op_list=[_StubLayer(2.0), _StubLayer(3.0)])

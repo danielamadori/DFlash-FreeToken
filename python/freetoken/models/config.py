@@ -1,21 +1,11 @@
 from __future__ import annotations
-import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 
 from freetoken.attention.base import AttnType
 
-# State-dict key prefixes for the (optional) vision stack. Used both to drop the vision
-# config (so the tower is never built) and to skip the matching tensors in the FTW reader.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.")
-_VISION_TRUE = {"1", "true", "yes", "on"}
-
-
-def vision_load_enabled() -> bool:
-    """Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
-    resident, never-quantized (bf16) GPU weights that text-only serving never touches, so we
-    skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set."""
-    return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
+# State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
 
 
 def detect_expert_quant(hf_config: Any) -> str:
@@ -98,6 +88,18 @@ class RotaryConfig:
     max_position: int
     base: float
     scaling: Dict[str, Any] | None
+    # 3-axis rope sections; None keeps the 1-D rope path, set only when the model serves vision
+    mrope_section: list | None = None
+    mrope_layout: str = "contiguous"  # see freetoken.layers.rotary.build_section_table
+
+
+def mrope_layout_from_rope_params(rope_params: Any) -> str:
+    """rope_parameters flags -> layout name: mrope_interleaved_glm, else mrope_interleaved, else contiguous."""
+    if rope_params.get("mrope_interleaved_glm"):
+        return "interleaved_glm"
+    if rope_params.get("mrope_interleaved"):
+        return "interleaved"
+    return "contiguous"
 
 
 @dataclass(frozen=True)
@@ -170,6 +172,8 @@ class SWAAttentionGroupConfig(BaseAttentionGroupConfig):
     head_dim: int
     rotary_config: RotaryConfig
     sliding_window: int
+    # image token spans attend to each other in both directions on these layers
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,7 +264,11 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
-    moe_backend: str = "fused"
+    moe_strategy: str = "fused"
+    # where routed experts decode (gpu / cpu / hybrid); set by the engine from the flags, it gates which expert kernels can serve
+    decode_target: str = "gpu"
+    # The QuantConfig the engine builds from the checkpoint; layers ask it for their method.
+    quant: Any | None = None
     # ----- optional, model-specific extensions (default keeps other models intact) -----
     moe_enabled: bool = False
     # Weight quantization of the MoE experts only. "none" keeps the default BF16
@@ -268,26 +276,13 @@ class ModelConfig:
     # "fp8_block" is DeepSeek-V3-style 128x128 block-fp8 (weight fp8-e4m3 +
     # weight_scale_inv per block), also applied to the dense projections.
     expert_quant: str = "none"
-    # NVFP4 routed-expert GEMM backend (--nvfp4-backend); injected from EngineConfig.
-    nvfp4_backend: str = "triton"
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).
     weight_block_size: tuple[int, int] | None = None
-    # Weight quantization of the *dense* attention / GatedDeltaNet projections (separate
-    # from the routed experts above). "fp8_pertensor" keeps them fp8-e4m3 + a per-output-row
-    # scale and runs a W8A16 kernel (modelopt MIXED_PRECISION); "none" leaves them bf16
-    # (dequant-at-load for any other dense quant, e.g. NVFP4 shared_expert/lm_head).
+    # the checkpoint's quant kind for the dense attention / GatedDeltaNet projections, detected by the family's parse_config for its reader
     attn_quant: str = "none"
-    # Weight quantization of the *dense* NVFP4 MLP projections -- the shared expert, and dense
-    # (non-MoE) MLP layers -- which NVFP4 checkpoints store as packed FP4 like the routed
-    # experts. "nvfp4" keeps them packed and runs the W4A16 dense kernels (quartering their
-    # decode weight traffic); "none" dequantizes them to bf16 at load. Set independently of the
-    # routed experts and lm_head: e.g. pure-NVFP4 Qwen3.5 has bf16 attn + bf16 lm_head but FP4
-    # shared experts, so this is "nvfp4" while attn_quant / lm_head_quant are "none".
+    # the checkpoint's quant kind for the dense MLP projections (shared expert, dense layers), detected the same way
     dense_quant: str = "none"
-    # Weight quantization of the lm_head. "nvfp4" keeps the (untied) FP4 head native (W4A16) --
-    # the bf16 dequant of this ~1 GB matrix was the single largest decode kernel; "none" leaves
-    # it bf16. Separate from dense_quant because only some NVFP4 checkpoints quantize lm_head
-    # (modelopt MIXED_PRECISION does; pure NVFP4 leaves it bf16).
+    # the checkpoint's quant kind for the lm_head, detected the same way (only some NVFP4 exports quantize it)
     lm_head_quant: str = "none"
     # Routed-expert bank ggml types for ``expert_quant == "gguf"``, as
     # ``(gate_up_type, down_type)``. Unlike the other quant tags, which name a *format*
@@ -384,6 +379,14 @@ class ModelConfig:
     @property
     def is_multimodal(self) -> bool:
         return self.vision_config is not None
+
+    @property
+    def model_is_mrope(self) -> bool:
+        """True when any full-attention layer uses 3-axis (t/h/w) rope positions."""
+        return any(
+            getattr(getattr(g, "rotary_config", None), "mrope_section", None) is not None
+            for g in self.attention_groups
+        )
 
     @property
     def has_hybrid_attention(self) -> bool:

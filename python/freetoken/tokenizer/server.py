@@ -26,6 +26,7 @@ from freetoken.message import (
     UserMsg,
     UserReply,
 )
+from freetoken.mm.config import MultimodalConfig
 from freetoken.utils import (
     ZmqPullQueue,
     ZmqPushQueue,
@@ -124,18 +125,17 @@ def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply]]:
+) -> tuple[List[UserMsg], List[UserReply]]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
     """
-    ok_msgs: List[TokenizeMsg] = []
-    ok_tensors: List[torch.Tensor] = []
+    backend: List[UserMsg] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            user_msg = tokenize_manager.tokenize([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -149,7 +149,7 @@ def _tokenize_requests(
             continue
         # A zero-token prompt would trip the scheduler's input_len > 0 invariant and
         # crash the worker; reject it here as a terminal error instead.
-        if tokens.numel() == 0:
+        if user_msg.input_ids.numel() == 0:
             errors.append(
                 UserReply(
                     uid=msg.uid,
@@ -159,9 +159,8 @@ def _tokenize_requests(
                 )
             )
             continue
-        ok_msgs.append(msg)
-        ok_tensors.append(tokens)
-    return ok_msgs, ok_tensors, errors
+        backend.append(user_msg)
+    return backend, errors
 
 
 @torch.inference_mode()
@@ -176,6 +175,7 @@ def tokenize_worker(
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
+    mm: MultimodalConfig | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
     send_frontend = ZmqPushQueue(frontend_addr, create=False, encoder=BaseFrontendMsg.encoder)
@@ -184,10 +184,12 @@ def tokenize_worker(
     tokenizer = load_tokenizer(tokenizer_path)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
 
+    from freetoken.mm.processor import get_mm_processor
+
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, get_mm_processor(tokenizer_path, mm))
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -287,9 +289,7 @@ def tokenize_worker(
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
                 t_before = time.monotonic() if ENV.TTFT_MARKS else 0.0
-                ok_msgs, ok_tensors, errors = _tokenize_requests(
-                    tokenize_manager, tokenize_msg, logger
-                )
+                backend, errors = _tokenize_requests(tokenize_manager, tokenize_msg, logger)
                 if ENV.TTFT_MARKS:
                     # The chat template and the tokenizer sit on the critical path of the
                     # first token: without this number there is no telling whether the
@@ -301,17 +301,22 @@ def tokenize_worker(
                         len(tokenize_msg), (t_before - t_received) * 1000,
                         (time.monotonic() - t_before) * 1000, time.monotonic(),
                     )
+                # Prefix-cache tenancy travels with the REQUEST, not with the tokenizer, and
+                # _tokenize_requests now builds the UserMsg itself: the two fields are attached
+                # here instead. Paired by uid, never by position -- a request that failed to
+                # encode is dropped in there, so the two lists are not the same length.
+                per_uid = {m.uid: m for m in tokenize_msg}
+                for um in backend:
+                    src = per_uid.get(um.uid)
+                    if src is None:
+                        continue
+                    um.cache_ns = src.cache_ns
+                    um.cache_public_len = _public_prefix_len(tokenize_manager, src, um.input_ids)
                 if errors:
                     send_frontend.put(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
-                if ok_msgs:
-                    backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params,
-                                cache_ns=msg.cache_ns,
-                                cache_public_len=_public_prefix_len(tokenize_manager, msg, t))
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
-                    ]
+                if backend:
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(

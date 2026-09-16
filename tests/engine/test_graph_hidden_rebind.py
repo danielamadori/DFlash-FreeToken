@@ -108,6 +108,7 @@ def _decode_batch(bs: int = 1) -> Batch:
 def _runner(model: FakeModel, graph: FakeGraph, hidden) -> GraphRunner:
     """A replay-ready runner over CPU buffers, as if bs=1 had been captured."""
     runner = GraphRunner.__new__(GraphRunner)
+    runner.mrope = False
     runner.model = model
     runner.attn_backend = FakeAttnBackend()
     runner.graph_bs_list = [1]
@@ -198,6 +199,7 @@ def test_capture_keeps_the_captured_forwards_store_not_the_warmups(monkeypatch):
     )
 
     runner = GraphRunner.__new__(GraphRunner)
+    runner.mrope = False
     runner.model = model
     runner.attn_backend = FakeAttnBackend()
     runner.graph_bs_list = [1, 2]

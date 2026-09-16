@@ -6,13 +6,10 @@ from freetoken.core import get_global_ctx
 import os
 
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
-from freetoken.layers import BaseOP, LinearColParallelMerged
-
-from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
-from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
+from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
+from freetoken.layers.quantization import QuantConfig
 
 from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
-from .quant_linear import make_replicated_quant
 from freetoken.kvcache.linear_state_pool import copy_state_rows, zero_state_rows
 
 
@@ -136,8 +133,8 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
-        conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
-        attn_quant: str = "none",
+        conv_kernel_size, rms_norm_eps, layer_id, *, quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -157,25 +154,27 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self.value_dim = num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
-        # qkv|z carry a weight scale (block-fp8 weight_scale_inv, or per-tensor FP8
-        # weight_scale); b|a stay bf16. Both quant modes therefore split the four-way
-        # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
-        self._block_fp8 = expert_quant == "fp8_block"
-        self._pertensor_fp8 = attn_quant == "fp8_pertensor"
-        self._fp8 = self._block_fp8 or self._pertensor_fp8
+        # quantized checkpoints quantize qkv|z but not b|a, so the fusion splits into a qkvz GEMM and a ba GEMM with their own schemes (matches sglang / vLLM)
+        self._split_in_proj = (
+            quant_config is not None and quant_config.scheme_for(f"{prefix}.in_proj_qkvz") is not None
+        )
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
-        if self._fp8:
-            ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
-            self.in_proj_qkvz = ColMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+        if self._split_in_proj:
+            self.in_proj_qkvz = LinearColParallelMerged(
+                hidden_size, [self.conv_dim, self.value_dim], has_bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.in_proj_qkvz",
             )
             self.in_proj_ba = LinearColParallelMerged(
-                hidden_size, [num_v_heads, num_v_heads], has_bias=False
+                hidden_size, [num_v_heads, num_v_heads], has_bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.in_proj_ba",
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
-            self.in_proj = LinearColParallelMerged(hidden_size, self._in_proj_split, has_bias=False)
+            self.in_proj = LinearColParallelMerged(
+                hidden_size, self._in_proj_split, has_bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.in_proj",
+            )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
@@ -183,12 +182,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # *.A_log / *.dt_bias from the model-dtype downcast.
         self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
         self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
-        self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
-        # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
-        # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
-        # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
-        self.out_proj = make_replicated_quant(
-            expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+        self.norm = GatedRMSNorm(head_v_dim, eps=rms_norm_eps)
+        self.out_proj = LinearReplicated(
+            self.value_dim, hidden_size, has_bias=False,
+            quant_config=quant_config, prefix=f"{prefix}.out_proj",
         )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
@@ -309,7 +306,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # rows for one sequence), so the phase flag is the wrong test here; row count is right.
         if _FORWARD_TIMING and total > fla.cu_seqlens.numel() - 1 and not torch.cuda.is_current_stream_capturing():
             _t_proj0 = torch.cuda.Event(enable_timing=True); _t_proj0.record()
-        if self._fp8:
+        if self._split_in_proj:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)

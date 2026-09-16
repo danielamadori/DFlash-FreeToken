@@ -5,8 +5,13 @@ from types import SimpleNamespace
 import pytest
 
 from freetoken.attention import AttnType
-from freetoken.models.config import FullAttentionGroupConfig, LinearGatedDeltaGroupConfig
+from freetoken.models.config import (
+    FullAttentionGroupConfig,
+    LinearGatedDeltaGroupConfig,
+)
 from freetoken.models.qwen4_exp.config import parse_config
+
+from .common import LOVEDHEART_NVFP4_FP8, NVIDIA_NVFP4, QWEN_FP8, RADIXARK_NVFP4
 
 
 def _text_config():
@@ -208,3 +213,60 @@ def test_eos_token_id_list_uses_the_first_entry():
     hf = _hf_config()
     hf.text_config.eos_token_id = [base, base + 1]
     assert parse_config(hf).qwen4_args.ngram_boundary_token_id == base
+
+
+def _vision_config():
+    return SimpleNamespace(
+        hidden_size=1152, depth=27, num_heads=16, intermediate_size=4304, patch_size=16, temporal_patch_size=2,
+        spatial_merge_size=2, num_position_embeddings=2304, out_hidden_size=2560, in_channels=3,
+        deepstack_visual_indexes=[],
+    )
+
+
+def test_vision_turns_on_mrope_and_the_tower():
+    hf = _hf_config()
+    hf.vision_config = _vision_config()
+    config = parse_config(hf)
+    assert config.is_multimodal and config.model_is_mrope
+    assert config.rotary_config.mrope_section == [11, 11, 10]
+    assert config.rotary_config.mrope_layout == "interleaved" and config.rotary_config.rotary_dim == 64
+    assert config.vision_config.out_hidden_size == 2560 and config.vision_config.deepstack_visual_indexes == ()
+    assert config.qwen4_args.image_token_id == 248056
+
+
+def test_text_only_keeps_the_1d_rope():
+    config = parse_config(_hf_config())
+    assert not config.is_multimodal and not config.model_is_mrope and config.rotary_config.mrope_section is None
+# the merged-projection prefixes the model asks the QuantConfig about (attention.py / gdn.py)
+DENSE_PREFIXES = (
+    "model.layers.3.self_attn.qkv_proj", "model.layers.3.self_attn.o_proj",
+    "model.layers.0.linear_attn.in_proj_qkvz", "model.layers.0.linear_attn.out_proj",
+)
+BF16_PREFIXES = (
+    "model.layers.0.linear_attn.in_proj_ba", "model.layers.0.mlp.shared_expert.gate_up_proj",
+    "model.layers.3.self_attn.indexer.index_qk_proj", "lm_head",
+)
+
+
+def _quant(hf, tmp_path):
+    from freetoken.models.register import checkpoint_quant_config, get_model_spec
+
+    return checkpoint_quant_config(str(tmp_path), hf, get_model_spec(hf.architectures[0]))
+
+
+def test_block_fp8_dense_schemes(tmp_path):
+    quant = _quant(_hf_config(LOVEDHEART_NVFP4_FP8), tmp_path)
+    for prefix in DENSE_PREFIXES:
+        scheme = quant.scheme_for(prefix)
+        assert str(scheme.kind) == "fp8_block" and scheme.has("weight_scale_inv"), prefix
+    for prefix in BF16_PREFIXES:
+        assert quant.scheme_for(prefix) is None, prefix
+    assert str(quant.scheme_for("model.layers.0.mlp.experts").kind) == "nvfp4"
+    assert parse_config(_hf_config(LOVEDHEART_NVFP4_FP8)).expert_quant == "nvfp4"
+
+
+@pytest.mark.parametrize("quantization_config", [RADIXARK_NVFP4, NVIDIA_NVFP4, None], ids=["RadixArk", "nvidia", "bf16"])
+def test_released_checkpoints_keep_the_dense_projections_bf16(quantization_config, tmp_path):
+    quant = _quant(_hf_config(quantization_config), tmp_path)
+    for prefix in DENSE_PREFIXES + BF16_PREFIXES:
+        assert quant.scheme_for(prefix) is None, prefix

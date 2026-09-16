@@ -29,40 +29,22 @@ from freetoken.layers import (
     VocabParallelEmbedding,
 )
 from freetoken.layers.mhc import hc_contract, hc_expand, mhc_fused_post_pre, mhc_post, mhc_pre
-from freetoken.models.blocks import BaseLLMModel
+from freetoken.models.blocks import BaseLLMModel, embed_input_ids
 from freetoken.utils import nvtx_annotate
 
 from .attention import Glm5NextAttention
 from .kda import Glm5NextKDA
 from .mlp import Glm5NextGatedMLP
 from .moe import Glm5NextSparseBlock
+from .vision import Glm5NextVisionModel
 
 if TYPE_CHECKING:
+    from freetoken.message import MMItem
     from freetoken.models.config import ModelConfig
 
 
-class Glm5Fp8LMHead(ParallelLMHead):
-    """W8A16 lm_head (fp8-e4m3 weight + per-row scale, quantized at load); the
-    full-vocab decode GEMV reads the whole head every step -- fp8 halves it.
-    Same contract as glm_moe_dsa's GlmFp8LMHead."""
-
-    def __init__(self, num_embeddings: int, embedding_dim: int):
-        super().__init__(num_embeddings, embedding_dim, tie_word_embeddings=False)
-        self.weight = torch.empty(num_embeddings, embedding_dim, dtype=torch.float8_e4m3fn)
-        self.weight_scale = torch.empty(num_embeddings, dtype=torch.float32)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
-
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
-            indices = batch.attn_metadata.get_last_indices(batch.size)
-            x = x[indices].contiguous()
-        return fp8_pertensor_linear(x, self.weight, self.weight_scale)
-
-
 class Glm5NextDecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
         args = config.glm5_args
         self._layer_id = layer_id
         self._is_last = layer_id == config.num_layers - 1
@@ -74,15 +56,15 @@ class Glm5NextDecoderLayer(BaseOP):
         self._sinkhorn = args.mhc_sinkhorn_iterations
 
         if args.is_kda_layer(layer_id):
-            self.self_attn: BaseOP = Glm5NextKDA(config, layer_id)
+            self.self_attn: BaseOP = Glm5NextKDA(config, layer_id, prefix=f"{prefix}.self_attn")
         else:
-            self.self_attn = Glm5NextAttention(config, layer_id)
+            self.self_attn = Glm5NextAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         if layer_id >= config.first_k_dense_replace:
-            self.mlp: BaseOP = Glm5NextSparseBlock(config, layer_id)
+            self.mlp: BaseOP = Glm5NextSparseBlock(config, layer_id, prefix=f"{prefix}.mlp")
         else:
             self.mlp = Glm5NextGatedMLP(
-                config.hidden_size, config.intermediate_size,
-                quant=config.dense_quant, swiglu_limit=config.swiglu_limit,
+                config.hidden_size, config.intermediate_size, swiglu_limit=config.swiglu_limit,
+                quant_config=config.quant, prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(size=config.hidden_size, eps=args.norm_eps)
         self.post_attention_layernorm = RMSNorm(size=config.hidden_size, eps=args.norm_eps)
@@ -156,18 +138,18 @@ class Glm5NextDecoderLayer(BaseOP):
 
 
 class Glm5NextModel(BaseOP):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
         )
         self.layers = OPList(
-            [Glm5NextDecoderLayer(config, i) for i in range(config.num_layers)]
+            [Glm5NextDecoderLayer(config, i, prefix=f"{prefix}.layers.{i}") for i in range(config.num_layers)]
         )
         self.norm = RMSNorm(size=config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        x = self.embed_tokens.forward(input_ids)
+        x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)
         residual = post = comb = None
         for layer in self.layers.op_list:
             x, residual, post, comb = layer.forward(x, residual, post, comb)
@@ -178,17 +160,14 @@ class Glm5NextForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self._config = config
         self.model = Glm5NextModel(config)
-        if config.lm_head_quant == "fp8_pertensor" and not config.tie_word_embeddings:
-            self.lm_head: BaseOP = Glm5Fp8LMHead(
-                num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
-            )
-        else:
-            self.lm_head = ParallelLMHead(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-                tie_word_embeddings=config.tie_word_embeddings,
-                tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
-            )
+        self.lm_head = ParallelLMHead(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            tie_word_embeddings=config.tie_word_embeddings,
+            tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
+        )
 
     def prepare_for_runtime(self) -> None:
         """Post-load, pre-KV-sizing hook: materialize the DSA layers' bmm-ready
@@ -204,4 +183,17 @@ class Glm5NextForCausalLM(BaseLLMModel):
         return self.lm_head.forward(output)
 
 
-__all__ = ["Glm5NextForCausalLM"]
+class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        if config.is_multimodal:
+            self.visual = Glm5NextVisionModel(config.vision_config)
+
+    def place_encoder_weights(self, mode: str) -> None:
+        self.visual.place_weights(mode)
+
+    def encode(self, item: MMItem) -> torch.Tensor:
+        return self.visual.forward(item.feature, [item.grid_thw])
+
+
+__all__ = ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"]

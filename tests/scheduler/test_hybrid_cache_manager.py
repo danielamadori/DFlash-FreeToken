@@ -25,7 +25,7 @@ def _pool(num_slots=16):
 def _pend(ids):
     # int32 to match production Req.input_ids dtype (fast_compare_key needs consistent dtype)
     t = torch.tensor(ids, dtype=torch.int32)
-    return SimpleNamespace(input_ids=t, input_len=len(ids), mm_embeds=None, cache_ns=None, cache_public_len=0)
+    return SimpleNamespace(input_ids=t, input_len=len(ids), mm_items=None, cache_ns=None, cache_public_len=0)
 
 
 def test_hybrid_cache_manager_donate_then_hit():

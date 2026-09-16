@@ -23,7 +23,7 @@ from .gguf import (
 )
 from .gguf_experts import gguf_expert_types, load_gguf_expert_sources
 from .model import DeepseekV4ForCausalLM
-from .weight import iter_weights, load_dsfp4_expert_sources
+from .weight import iter_expert_pieces, iter_weights
 
 __all__ = [
     "DeepseekV4Args",
@@ -38,4 +38,5 @@ __all__ = [
     "is_gguf_model",
     "gguf_expert_types",
     "load_gguf_expert_sources",
+    "iter_expert_pieces",
 ]
