@@ -500,6 +500,19 @@ class Scheduler(SchedulerIOMixin):
                         )
                         if finished:
                             break
+                    if finished and j < last:
+                        # EOS or a stop string landed INSIDE the block, so the loop stopped
+                        # appending -- but commit_verified had already advanced cached_len and
+                        # device_len over the whole accepted block. Left alone, the request
+                        # reaches cache_req with cached_len > len(input_ids), and the insert
+                        # truncates the key and the pages to the SHORTER key
+                        # (hybrid_radix_cache.insert): the surplus pages go neither into the
+                        # tree nor back to the allocator, and the returned match length does
+                        # not name them. One page per occurrence, never recovered, until
+                        # check_integrity fires on an idle scheduler and the engine stops for
+                        # good. Rewind to the tokens actually emitted and hand the positions
+                        # in between back to the allocator.
+                        self._rewind_truncated_block(req)
                 else:
                     finished = self._commit_one_token(req, next_tokens_cpu[i], reply)
 
@@ -548,6 +561,33 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _rewind_truncated_block(self, req: Req) -> None:
+        """Put a request whose speculative block ended early back on the plain-decode invariant.
+
+        After ``commit_verified`` the request holds ``cached_len = first_position + accepted``
+        and ``device_len = cached_len + 1``, which assumes every committed token gets appended.
+        When EOS or a stop string lands among the accepted candidates the commit loop breaks,
+        so ``input_ids`` stops short and the two disagree -- the one state the rest of the
+        engine never expects, because every other path keeps ``len(input_ids) == device_len``.
+
+        Restore that: the emitted sequence is ``input_ids`` and nothing else, so device_len is
+        its length, cached_len is one less (the last token stays pending, exactly as in plain
+        decode), and the KV positions in between go back to the allocator. Without this they
+        are lost -- the finish path would hand ``insert`` a key shorter than its pages, and
+        insert truncates both to the key without reporting it.
+
+        The GDN live state is NOT rewound with it. ``rollback.rewind(accepted)`` already left
+        it encoding the full accepted block, and there is no second rewind to run here; at the
+        shortened node it would be an over-advanced state that a future prefix hit would
+        COW-restore. The flag makes the hybrid finish path free it instead of donating it,
+        which costs this one finished request its snapshot and keeps the tree honest."""
+        valid = int(req.input_ids.numel())
+        if valid - 1 < req.cached_len:
+            self.cache_manager.free_rejected_positions(req, range(valid - 1, req.cached_len))
+        req.cached_len = valid - 1
+        req.device_len = valid
+        req.spec_block_truncated = True
 
     def _commit_one_token(
         self,

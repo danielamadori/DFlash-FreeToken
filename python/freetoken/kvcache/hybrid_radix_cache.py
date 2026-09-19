@@ -111,6 +111,17 @@ class HybridRadixCache:
         ``ns``. A new span that crosses the boundary is cut in two, so the shared system
         section stays shared instead of being swallowed into the first session that arrives.
         """
+        # Key and pages must name the same tokens. They did not once: a request whose
+        # speculative block ended on an EOS among the accepted candidates arrived with
+        # cached_len past len(input_ids), the align_down below truncated BOTH to the shorter
+        # key, and the surplus pages went neither into the tree nor back to the allocator --
+        # and `matched` does not name them, so the caller could not free them either. One
+        # page per occurrence, and the engine stopped for good when check_integrity finally
+        # noticed. Silence was the whole defect, so this is loud.
+        assert len(kv_indices) == len(input_ids), (
+            f"insert: {len(input_ids)} token but {len(kv_indices)} pages -- the caller is "
+            f"naming pages its key does not cover"
+        )
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
         node, matched = self._walk(input_ids, ns, public_len)

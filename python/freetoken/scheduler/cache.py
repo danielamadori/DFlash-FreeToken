@@ -394,7 +394,18 @@ class CacheManager:
             # remain as reuse points).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
-            if insert_len == req.cached_len and insert_len > 0:
+            # spec_block_truncated: the request's block ended on an EOS among the accepted
+            # candidates, so the scheduler rewound cached_len to the tokens actually emitted
+            # (_rewind_truncated_block) but could not rewind the GDN live state with it --
+            # it still encodes the full accepted block. Donating it here would attach an
+            # over-advanced state to a shorter prefix, the same hazard the page_size>1 skip
+            # below guards against. Free everything instead; one finished request loses its
+            # reuse point, which is cheaper than a wrong COW restore on a future hit.
+            if (
+                insert_len == req.cached_len
+                and insert_len > 0
+                and not req.spec_block_truncated
+            ):
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx,
                     req.cache_ns, req.cache_public_len)

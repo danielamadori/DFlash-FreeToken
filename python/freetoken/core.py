@@ -100,6 +100,15 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # A speculative block ended before its last committed token (EOS or a stop string landed
+    # among the accepted candidates, so the commit loop broke early). commit_verified had
+    # already advanced cached_len over the WHOLE accepted block, so the scheduler rewinds it
+    # to the tokens actually emitted and frees the positions in between -- but the GDN live
+    # state cannot be rewound with it: rollback.rewind(accepted) already left it encoding
+    # cached_len-before-the-rewind tokens. Donating it at the shortened node would attach an
+    # over-advanced state to a shorter prefix, and a future hit would COW-restore it. This
+    # flag tells the hybrid finish path to free that state instead of donating it.
+    spec_block_truncated: bool = False
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
