@@ -188,6 +188,13 @@ def parse_args(
             # response carried no tool_calls, so the caller saw prose.
             or "qwen3.8" in marker
             or "qwen3_8" in marker
+            # The GGUF says it too: general.architecture is `qwen35`, and it
+            # reaches the marker through model_type and architectures. Without
+            # this line the ONLY thing choosing the right parser for a production
+            # Qwen3.8 GGUF is the string "Qwen3.8" in the FILE NAME. Measured
+            # 2026-09-23: rename the file, or put it behind a symlink, and the
+            # chain fell all the way to the final branch.
+            or "qwen35" in marker
             or ("qwen3" in marker and "coder" in marker)
         ):
             return "qwen3_coder"
@@ -201,7 +208,25 @@ def parse_args(
             return "glm47"
         if "mistral" in marker:
             return "mistral"
-        return "llama3"
+        # NO CATCH-ALL. This used to `return "llama3"`, so every model the
+        # chain did not recognise got llama3's dialect: the model emits its tool
+        # call correctly, the parser finds nothing, and THE CALLER SEES PROSE --
+        # no error, no log, tool success silently at zero. The comment above
+        # records that exact incident happening once already, and the cure
+        # applied then was to add one more substring to the chain, which leaves
+        # the next unrecognised model in the same place.
+        #
+        # A wrong parser is worse than no parser, and both are worse than a
+        # refusal that names the model. `_infer_reasoning_parser` below already
+        # ends with None rather than a guess; here silence costs tool calls, so
+        # this one stops instead.
+        raise ValueError(
+            f"cannot infer --tool-call-parser for {model_path!r} "
+            f"(marker: {marker!r}). Known dialects: deepseekv32, gemma4, glm47, "
+            "gpt_oss, minimax, minimax_m3, mistral, muse_glimmer, qwen25, "
+            "qwen3_coder. Pass --tool-call-parser explicitly: guessing one makes "
+            "the model's tool calls come back as prose, with no error anywhere."
+        )
 
     def _infer_reasoning_parser(model_path: str) -> str | None:
         try:
