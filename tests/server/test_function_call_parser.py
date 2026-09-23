@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 import json
 
 import pytest
@@ -369,7 +370,14 @@ def _infer_from(module) -> "callable":
     return spazio["_infer_tool_call_parser"]
 
 
-@pytest.mark.parametrize("modulo", ["freetoken.server.args", "freetoken.engine.args"])
+#: I moduli che definiscono la regola del dialetto. Ne resta UNO, ed e' quello
+#: che il motore importa davvero; `test_la_regola_vive_in_un_modulo_solo` fa
+#: fallire la suite se ne ricompare un secondo. La parametrizzazione resta
+#: perche' l'elenco e' l'unico posto da cambiare se un giorno tornassero a
+#: essere due -- e allora quel test lo dira' per primo.
+_MODULI_ARGS = ["freetoken.server.args"]
+
+@pytest.mark.parametrize("modulo", _MODULI_ARGS)
 def test_the_whole_qwen3_8_family_gets_the_xml_dialect(modulo: str, senza_rete):
     """Qwen3.8-27B emits the qwen3_coder XML, and only "-Flash" was enumerated.
 
@@ -455,7 +463,6 @@ def _architetture_servibili() -> list[str]:
     raise AssertionError("_MODEL_REGISTRY non trovato in register.py")
 
 
-_MODULI_ARGS = ["freetoken.server.args", "freetoken.engine.args"]
 
 
 @pytest.mark.parametrize("modulo", _MODULI_ARGS)
@@ -492,16 +499,16 @@ def test_every_servable_architecture_resolves_to_a_real_dialect(modulo: str, sen
 
 @pytest.mark.parametrize("modulo", _MODULI_ARGS)
 def test_the_family_is_read_from_the_architecture_not_from_the_file_name(modulo: str, senza_rete):
-    """The GGUF header says `qwen35`, and that is what must decide -- in BOTH copies.
+    """The GGUF header says `qwen35`, and that is what must decide.
 
     `general.architecture` reaches the marker through model_type and architectures, so the
     engine can know the family of a renamed file or a symlink. The chain checked qwen3_5 and
     qwen3.5 and not qwen35, which left the production Qwen3.8 GGUF depending on the string
     "Qwen3.8" being in the FILE NAME -- and the wrong dialect is silent.
 
-    Pinned on both args modules because both carry a copy of the rule: the fix that added
-    this line went into `engine.args`, which nothing at runtime imports, so the node kept
-    the old answer while the commit said otherwise.
+    This line first went into `engine/args.py`, which nothing at runtime imported, so the
+    node kept the old answer while the commit said otherwise. That copy is gone now --
+    see `test_la_regola_vive_in_un_modulo_solo`, which keeps it gone.
     """
     import importlib
 
@@ -525,3 +532,44 @@ def test_an_unservable_model_is_refused_by_name(modulo: str, senza_rete):
 
     with pytest.raises(ValueError, match="tool-call-parser"):
         dedurre("/models/Phi-4-mini-instruct")
+
+
+def test_la_regola_vive_in_un_modulo_solo():
+    """One rule, one module -- and it must be the module the engine imports.
+
+    Why this test exists. `_infer_tool_call_parser` lived in two files:
+    `server/args.py`, which `server/launch.py` imports, and `engine/args.py`, which
+    nothing at runtime imported. Three separate fixes were written into the dead copy.
+    Each time the commit message was true and the engine's behaviour did not change --
+    the third time it was the qwen35 branch, so the production GGUF kept picking its
+    dialect from the FILE NAME while the fix sat in a module no process loaded.
+
+    Deleting the copy fixes today. This test fixes it for good: it fails the moment a
+    second definition appears anywhere under `python/freetoken`, whatever the file is
+    called -- so the next person to copy the rule finds out from a red test instead of
+    from a node that answers with the wrong dialect and no error.
+
+    The third assertion is the one that makes the check mean something: the surviving
+    definition must sit next to the `launch.py` that loads it. One copy in the WRONG
+    module would satisfy the count and still be dead code.
+    """
+    radice = pathlib.Path(__file__).resolve().parents[2] / "python" / "freetoken"
+    definizioni = sorted(
+        percorso.relative_to(radice).as_posix()
+        for percorso in radice.rglob("*.py")
+        if "def _infer_tool_call_parser" in percorso.read_text(encoding="utf-8", errors="replace")
+    )
+    assert definizioni, "la regola del dialetto e' sparita del tutto"
+    assert len(definizioni) == 1, (
+        f"la regola e' duplicata in {definizioni}: una copia prendera' le correzioni e "
+        f"l'altra restera' quella viva, come e' gia' successo tre volte"
+    )
+    assert definizioni == ["server/args.py"], (
+        f"la regola sta in {definizioni[0]}, ma il motore importa `server/args.py` "
+        f"(`server/launch.py`, `from .args import parse_args`): li' dentro e' codice morto"
+    )
+    launch = (radice / "server" / "launch.py").read_text(encoding="utf-8")
+    assert "from .args import parse_args" in launch, (
+        "`launch.py` non importa piu' `server/args.py`: questo test stava verificando "
+        "un legame che non esiste piu', e va rifatto sul modulo che importa adesso"
+    )
