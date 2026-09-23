@@ -245,7 +245,7 @@ class RadixPrefixCache(BasePrefixCache):
             evicted_indices.append(node.value)
             self.evictable_size -= node.length
             parent = node.parent
-            del parent.children[self.key_fn(node._key)]
+            del parent.children[node.child_key()]
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
@@ -263,7 +263,7 @@ class RadixPrefixCache(BasePrefixCache):
         )
 
     def check_integrity(self) -> None:
-        pass
+        check_children_filing(self.root_node)
 
     def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
         nodes: List[RadixTreeNode] = [self.root_node]
@@ -314,6 +314,27 @@ class RadixPrefixCache(BasePrefixCache):
             node.timestamp = tic
 
         return node, prefix_len
+
+
+def check_children_filing(root: RadixTreeNode) -> None:
+    """Every node sits in its parent's dict under the key that parent would look it up by.
+
+    The tree FILES a child under ``child_key()``, which carries the owner when the node has
+    one, and it used to UNFILE it under the bare page key. Filing and unfiling disagreed, and
+    the first eviction of an owned node took the worker down with a KeyError -- while every
+    ref count and slot id was perfectly correct, which is why the checks that existed saw
+    nothing. This is the invariant the key shape must keep, wherever that shape changes next.
+    """
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        for chiave, figlio in n.children.items():
+            assert figlio.parent is n, "a child whose parent is a different node"
+            assert chiave == figlio.child_key(), (
+                f"node filed under {chiave!r} but its parent looks it up as "
+                f"{figlio.child_key()!r}"
+            )
+            stack.append(figlio)
 
 
 def _get_key_fn(page_size: int) -> KEY_FN:

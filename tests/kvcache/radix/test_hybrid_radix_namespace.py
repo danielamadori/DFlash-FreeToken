@@ -133,3 +133,52 @@ def test_insert_reports_what_the_tree_already_had_not_where_it_cut():
     matched, _ = c.insert(ids(1, 9), slots(2, base=50), mamba_value=8, ns="bob",
                           public_len=PAGE)
     assert matched == PAGE, "one page was already there; only that page is redundant"
+
+
+def test_a_namespaced_node_can_be_evicted_at_all():
+    """Filed under one key and deleted under another: the engine died on the first eviction.
+
+    ``child_key`` files a namespaced node under ``(page_key, ns)`` -- deliberately, so two
+    sessions sending identical tokens do not land on the same slot. Every READ was taught the
+    pair (``_walk`` tries the bare key, then the owned one). The three ``_unlink``s were not:
+    they delete ``key_fn(node._key)``, the bare key, which for an owned node is not in the
+    parent's dict at all.
+
+    In production this is `KeyError: 198` inside ``_unlink`` from ``evict_mamba``, the worker
+    dead and the API server down with it -- 198 being the token id, because ``key_fn`` at
+    ``--page-size 1`` is ``x[0].item()``. It is deterministic, not a race: the first owned node
+    to be evicted takes the process with it. The GDN pool is simply the one that fills first.
+
+    Nothing caught it because the whole eviction battery runs through an adapter that never
+    passes ``ns``, and the namespace tests never evict.
+    """
+    c = _cache()
+    c.insert(ids(1, 2), slots(2), mamba_value=7, ns="alice")
+    c.insert(ids(3, 4), slots(2, base=50), mamba_value=8, ns="alice")
+    # Nothing holds a lock, so both snapshots are evictable and the tree must survive it.
+    ev = c.evict_mamba(2)
+    assert len(ev.mamba_slots) == 2
+    c.check_integrity()
+    assert c.match_prefix(ids(1, 2), ns="alice").cached_len == 0
+
+
+def test_the_tree_checks_that_a_node_is_where_its_parent_filed_it():
+    """The invariant that was broken was never asserted, so it broke in production instead.
+
+    ``check_integrity`` looked at slots and ref counts -- both of which were perfectly fine
+    while the children dict was keyed one way and read another. A structural check is what
+    turns the next key-shape change into a failing test rather than a dead worker.
+    """
+    c = _cache()
+    c.insert(ids(1, 2), slots(2), mamba_value=7, ns="alice")
+    c.check_integrity()
+
+    # Re-file one node under a key that is not its own: the check must see it.
+    nodo = next(n for n in _tutti(c) if n.ns == "alice")
+    del nodo.parent.children[nodo.child_key()]
+    nodo.parent.children["non e' la sua chiave"] = nodo
+    try:
+        c.check_integrity()
+    except AssertionError:
+        return
+    raise AssertionError("a node filed under the wrong key went unnoticed")

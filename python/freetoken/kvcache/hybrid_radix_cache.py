@@ -23,7 +23,7 @@ import torch
 from freetoken.utils import align_down
 
 from .base import BaseCacheHandle
-from .radix_cache import RadixTreeNode, _get_key_fn
+from .radix_cache import RadixTreeNode, _get_key_fn, check_children_filing
 
 
 @dataclass(frozen=True)
@@ -255,6 +255,7 @@ class HybridRadixCache:
         # (KV/page conservation is checked by CacheManager.check_integrity.)
         for n in self._snapshot_nodes():
             assert n.mamba_value is not None and n.mamba_ref_count >= 0 and n.ref_count >= 0
+        check_children_filing(self.root)
 
     # ---------------------------------------------------------------- helpers
     def _free_node_mamba(self, node: RadixTreeNode, out: List[int]) -> None:
@@ -266,7 +267,9 @@ class HybridRadixCache:
 
     def _unlink(self, node: RadixTreeNode) -> RadixTreeNode:
         parent = node.parent
-        del parent.children[self.key_fn(node._key)]
+        # child_key(), not key_fn(_key): an owned node is FILED under (page key, ns), so
+        # deleting the bare key raised KeyError on the first eviction of one.
+        del parent.children[node.child_key()]
         return parent
 
     def _cascade_tombstone_leaves(self, parent: RadixTreeNode, kv_out: List[torch.Tensor]):

@@ -29,7 +29,7 @@ import torch
 from freetoken.utils import align_down
 
 from .base import BaseCacheHandle
-from .radix_cache import RadixTreeNode, _get_key_fn
+from .radix_cache import RadixTreeNode, _get_key_fn, check_children_filing
 
 
 @dataclass(frozen=True)
@@ -416,11 +416,12 @@ class SWARadixCache:
             assert n.ref_count >= n.swa_ref_count, "full_ref must be >= swa_ref"
             if n.swa_tombstone:
                 assert n.swa_ref_count == 0, "a tombstoned node cannot hold a swa lock"
+        check_children_filing(self.root)
 
     # ---------------------------------------------------------------- helpers
     def _unlink(self, node: RadixTreeNode) -> RadixTreeNode:
         parent = node.parent
-        del parent.children[self.key_fn(node._key)]
+        del parent.children[node.child_key()]
         return parent
 
     def _cascade_swa_tombstone_leaves(
