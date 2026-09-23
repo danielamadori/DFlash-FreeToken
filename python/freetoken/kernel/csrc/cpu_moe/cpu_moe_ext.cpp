@@ -576,6 +576,15 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 // probed functionally at startup (memops_probe); anything unsupported (Windows WDDM,
 // vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
 #if defined(_WIN32)
+// NOMINMAX BEFORE windows.h, OR std::min STOPS COMPILING 480 LINES BELOW.
+// windows.h defines min and max as object-like macros, so `std::min(K, b0 +
+// 128)` in fp8_roundtrip_bf16 preprocesses to `std::(K, b0 + 128)` and MSVC
+// reports C2589 "invalid token on the right of ::" at that line -- pointing at
+// correct, portable code and saying nothing about the include that broke it.
+// Defining it here rather than in setup.py keeps the fix beside the cause: the
+// next file to include windows.h needs the same line, and a compiler flag in
+// another file would not tell it so.
+#define NOMINMAX
 #include <windows.h>
 static void* cumemop_dlopen() { return (void*)::LoadLibraryA("nvcuda.dll"); }
 static void* cumemop_dlsym(void* h, const char* n) {
