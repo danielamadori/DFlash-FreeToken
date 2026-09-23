@@ -5,6 +5,7 @@ import errno
 import gc
 import math
 import os
+import warnings
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -1469,12 +1470,54 @@ def _ensure_expandable_segments() -> None:
     """
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
-    try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
-    except Exception as exc:  # pragma: no cover - depends on torch build
-        logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
+    # READ the outcome, do not declare it. `_set_allocator_settings` is a PARSER: it
+    # accepts the string and does not promise the allocator will honour it. Measured on
+    # the Windows node, two consecutive lines of the same startup log:
+    #
+    #   INFO  Enabled expandable_segments (override via PYTORCH_ALLOC_CONF)
+    #   UserWarning: expandable_segments not supported on this platform
+    #                                              (c10/cuda/CUDAAllocatorConfig.h)
+    #
+    # So every Windows startup asserted, on the memory-allocator line, the opposite of
+    # what torch had just said. Anyone chasing a memory failure on such a node would
+    # read that the segments were on while they were off. The refusal arrives as a
+    # warning, not as an exception, which is why the `except` below never saw it.
+    with warnings.catch_warnings(record=True) as avvisi:
+        warnings.simplefilter("always")
+        try:
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        except Exception as exc:  # pragma: no cover - depends on torch build
+            logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
+            return
+        rifiuto = _rifiuto_degli_expandable_segments(avvisi)
+        # Gli avvisi che non c'entrano tornano a chi li aspettava: catturarli per
+        # leggerne uno e poi buttarli sarebbe lo stesso difetto un livello piu' in la'.
+        for avviso in avvisi:
+            if str(avviso.message) != rifiuto:
+                warnings.warn_explicit(
+                    avviso.message, avviso.category, avviso.filename, avviso.lineno
+                )
+    if rifiuto is not None:
+        logger.warning_rank0(
+            f"expandable_segments NOT enabled: this platform refused the setting ({rifiuto}). "
+            "The allocator keeps its default behaviour, so reserved memory can grow well "
+            "past the peak allocation under alloc/free churn."
+        )
         return
     logger.info_rank0("Enabled expandable_segments (override via PYTORCH_ALLOC_CONF)")
+
+
+def _rifiuto_degli_expandable_segments(avvisi) -> str | None:
+    """Il testo dell'avviso con cui la piattaforma ha rifiutato, o None se non c'e'.
+
+    Separata perche' e' l'unico pezzo provabile senza Windows: al chiamante si puo'
+    passare un elenco di avvisi finto e verificare tutti e due i rami.
+    """
+    for avviso in avvisi:
+        testo = str(avviso.message)
+        if "expandable_segments" in testo and "not supported" in testo:
+            return testo
+    return None
 
 
 def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
