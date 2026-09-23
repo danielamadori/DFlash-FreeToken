@@ -365,7 +365,11 @@ def _infer_from(module) -> "callable":
     fine = inizio + 1
     while fine < len(righe) and (righe[fine].strip() == "" or righe[fine].startswith("        ")):
         fine += 1
-    spazio: dict = {}
+    # I globali del modulo, non un dizionario vuoto: la funzione usa ora
+    # `_config_dal_disco`, definito accanto a lei, e uno spazio vuoto lo
+    # trasformerebbe in un NameError -- cioe' in un test che fallisce per come
+    # e' scritto il test, non per come si comporta la regola.
+    spazio: dict = dict(vars(module))
     exec(textwrap.dedent("\n".join(righe[inizio:fine])), spazio)  # noqa: S102
     return spazio["_infer_tool_call_parser"]
 
@@ -573,3 +577,132 @@ def test_la_regola_vive_in_un_modulo_solo():
         "`launch.py` non importa piu' `server/args.py`: questo test stava verificando "
         "un legame che non esiste piu', e va rifatto sul modulo che importa adesso"
     )
+
+
+def test_la_config_non_si_legge_mai_dalla_rete_sul_percorso_di_avvio(tmp_path, monkeypatch):
+    """No socket may be opened while args are parsed -- and the config must still be read.
+
+    Why. `launch.py` calls `parse_args` before anything else, and the two parser-inference
+    functions asked `cached_load_hf_config` for the model config. For a `model_path` that is
+    not a local folder that goes to huggingface.co. Measured here by cutting every
+    connection instantly: **84 attempts and 23 s** for `Qwen/Qwen3-8B`, the same for an
+    invented name, and both functions paid it -- inside an `except Exception` that said
+    nothing. A node starting could hang for minutes in silence, and the suite fixture next
+    to this one records the same thing from the other side: a HEAD for a made-up name came
+    back 429 and the client waited 61 s, five retries deep.
+
+    The two halves of this test are one rule: read it from the disk, never from the wire.
+    Dropping the read entirely would also pass the first half and would be wrong -- a local
+    checkpoint whose folder name says nothing must still be recognised by its config.
+    """
+    import socket
+
+    tentativi: list = []
+
+    def _spia(self, indirizzo):
+        tentativi.append(indirizzo)
+        raise OSError("nessuna rete in questo test")
+
+    monkeypatch.setattr(socket.socket, "connect", _spia)
+
+    import importlib
+
+    # META\' UNO, attraverso la funzione VERA che il percorso di avvio chiama: un
+    # nome che non sta sul disco non deve aprire nessuna connessione. Passa di qui
+    # e non dal solo helper perche' un test che importa un nome nuovo fallirebbe
+    # sulla vecchia versione con un ImportError -- cioe' direbbe "la correzione non
+    # c'e'" invece di "il difetto c'e'", e sono due cose diverse.
+    dedurre = _infer_from(importlib.import_module("freetoken.server.args"))
+    assert dedurre("Qwen/Qwen3-8B") == "qwen25"
+    assert tentativi == [], (
+        f"{len(tentativi)} connessioni aperte mentre si leggono gli argomenti: "
+        f"e' il percorso di avvio, e un hub lento ci appende il nodo per minuti"
+    )
+
+    from freetoken.server.args import _config_dal_disco
+
+    assert _config_dal_disco("un-nome-inventato-che-non-esiste") == {}
+    assert tentativi == []
+
+    # meta' due: dal disco la config si legge ancora, ed e' quella che decide
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5", "architectures": ["Qwen35ForCausalLM"],
+        "hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4,
+        "vocab_size": 100, "intermediate_size": 128, "max_position_embeddings": 128,
+    }), encoding="utf-8")
+    letta = _config_dal_disco(str(tmp_path))
+    assert letta.get("model_type") == "qwen3_5", (
+        "la config locale non viene piu' letta: un checkpoint la cui cartella non dice "
+        "la famiglia non sarebbe piu' riconosciuto"
+    )
+    assert tentativi == []
+
+
+def test_il_nome_da_solo_da_lo_stesso_dialetto_che_dava_la_rete(senza_rete):
+    """What the 23 s of hub lookups bought, in the cases that were measured: nothing.
+
+    These are the answers the chain gave WITH the network read, re-checked without it. They
+    are here so that "we stopped reading the config from the hub" is a measured claim about
+    the dialect and not only about the latency.
+    """
+    import importlib
+
+    dedurre = _infer_from(importlib.import_module("freetoken.server.args"))
+
+    assert dedurre("Qwen/Qwen3-8B") == "qwen25"
+    assert dedurre("Qwen3.8-27B") == "qwen3_coder"
+    assert dedurre("meta-llama/Meta-Llama-3.1-8B-Instruct") == "llama3"
+    # e cio' che il nome non dice resta un rifiuto che nomina il modello, non un'attesa muta
+    with pytest.raises(ValueError, match="cannot infer"):
+        dedurre("un-nome-che-non-dice-la-famiglia")
+
+
+def test_un_percorso_assoluto_resta_locale_anche_se_non_esiste(monkeypatch):
+    """"Local" is decided by the SHAPE of the name, not by whether the file is there.
+
+    This is the half the first version of the fix got wrong, and 36 tests in
+    `test_parser_auto_selection.py` caught it: they name a checkpoint `/models/anon` --
+    a folder whose name says nothing, whose `config.json` is what decides the family --
+    and they patch the loader instead of creating it. Skipping the read for anything
+    absent turned every one of them into a refusal.
+
+    What the shape buys, measured by cutting every connection and counting attempts:
+
+        /models/anon        absolute            0 connections   0.03 s
+        ./anon              explicitly relative 0 connections   0.00 s
+        models/anon         a name              84 connections  23.14 s
+        Qwen/Qwen3-8B       a name              84 connections  23.14 s
+
+    So an absolute path that is not there still gets read -- and fails on the disk, in
+    30 ms, naming the missing file. That is the right failure: it is a broken
+    deployment, not a slow network.
+    """
+    import freetoken.utils
+    from freetoken.server.args import _config_dal_disco, _e_un_percorso_locale
+
+    chiamate: list = []
+
+    class _Finta:
+        def to_dict(self):
+            return {"model_type": "qwen3_5"}
+
+    def _finto_caricatore(percorso):
+        chiamate.append(percorso)
+        return _Finta()
+
+    monkeypatch.setattr(freetoken.utils, "cached_load_hf_config", _finto_caricatore)
+
+    assert _config_dal_disco("/models/anon") == {"model_type": "qwen3_5"}
+    assert chiamate == ["/models/anon"], "un percorso assoluto assente non e' stato letto"
+
+    chiamate.clear()
+    assert _config_dal_disco("Qwen/Qwen3-8B") == {}
+    assert chiamate == [], "un nome dell'hub e' stato mandato al caricatore"
+
+    # la forma, riga per riga, come misurata
+    assert _e_un_percorso_locale("/models/anon")
+    assert _e_un_percorso_locale("./anon")
+    assert _e_un_percorso_locale("~/modelli/anon")
+    assert not _e_un_percorso_locale("models/anon")
+    assert not _e_un_percorso_locale("Qwen/Qwen3-8B")
+    assert not _e_un_percorso_locale("anon")

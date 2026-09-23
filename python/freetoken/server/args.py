@@ -144,6 +144,87 @@ def _json_object(text: str) -> dict:
     return value
 
 
+def _e_un_percorso_locale(model_path: str) -> bool:
+    """Se questo nome indica un posto su questo disco, e non un repo dell'hub.
+
+    La distinzione non e' estetica: e' esattamente la riga fra "lettura gratis" e
+    "chiamata a huggingface.co sul percorso di avvio". Misurato tagliando ogni
+    connessione all'istante, contando i tentativi:
+
+        /models/anon                       assoluto        0 connessioni   0,03 s
+        /percorso/inesistente/m.gguf       assoluto        0 connessioni   0,00 s
+        ./anon                             relativo espl.  0 connessioni   0,00 s
+        models/anon                        nome            84 connessioni  23,14 s
+        anon                               nome            84 connessioni  23,13 s
+        Qwen/Qwen3-8B                      nome            84 connessioni  23,14 s
+
+    Quindi NON e' "esiste sul disco": un percorso assoluto che non esiste resta
+    locale e va letto (fallira' sul disco, in 0,03 s, dicendo quale file manca).
+    Ed e' la forma del nome a decidere, perche' e' cio' che decide anche dentro
+    transformers. L'ultima riga copre il caso onesto di un percorso relativo
+    senza `./` che esiste davvero: leggerlo e' gratis ed e' giusto.
+    """
+    if os.path.isabs(os.path.expanduser(model_path)):
+        return True
+    if model_path.startswith((".", "~")):
+        return True
+    return os.path.exists(model_path)
+
+
+def _config_dal_disco(model_path: str) -> dict:
+    """La config del modello letta SOLO dal disco, mai dalla rete.
+
+    Perche' esiste. Questa lettura sta sul percorso di AVVIO -- `launch.py`
+    chiama `parse_args` prima di ogni altra cosa -- e chiedeva la config a
+    `cached_load_hf_config`, che per un `model_path` che non sia una cartella
+    locale la chiede a huggingface.co. Misurato su questa macchina, tagliando
+    le connessioni all'istante: **84 tentativi e 23 secondi** per un nome come
+    `Qwen/Qwen3-8B`, e altrettanti per un nome inventato. Con un hub che
+    risponde 429 -- misurato dalla suite: attesa di 61 s, cinque tentativi --
+    diventano minuti. Due funzioni la chiamavano, quindi l'attesa si pagava
+    due volte, e ogni volta dentro un `except Exception` che non diceva nulla:
+    **un nodo che parte poteva restare appeso minuti in silenzio.**
+
+    Cosa si perde. Per un NOME dell'hub non ancora scaricato il dialetto viene
+    dedotto dal solo nome. Nel caso misurato il nome bastava (`Qwen/Qwen3-8B`
+    -> `qwen25`, lo stesso identico esito, in 0,00 s invece di 23). Quando non
+    basta, la catena RIFIUTA nominando il modello e dicendo di passare
+    `--tool-call-parser`: un rifiuto in un secondo e' meglio di un'attesa muta
+    di minuti che finisce nello stesso punto.
+
+    Cosa NON si perde: i pesi vengono scaricati dopo, da `download_hf_weight`,
+    e quel percorso la rete la usa ancora -- li' l'attesa e' quello che l'utente
+    ha chiesto, ed e' visibile.
+
+    Ogni motivo per cui la config non si legge viene REGISTRATO. Era l'altra
+    meta' del difetto: `except Exception: cfg = {}` trasformava una rete
+    irraggiungibile, un JSON malformato e un percorso sbagliato tutti nello
+    stesso silenzio, e poi il dialetto veniva scelto dal nome senza che da
+    nessuna parte risultasse perche'.
+    """
+    logger = init_logger(__name__, "args")
+    if not _e_un_percorso_locale(model_path):
+        logger.info(
+            "config non letta per %r: e' un nome dell'hub, non un percorso su questo "
+            "disco. Il dialetto degli strumenti viene dedotto dal nome. (Leggerla "
+            "vorrebbe dire huggingface.co sul percorso di avvio: 84 tentativi e 23 s "
+            "misurati, minuti se l'hub limita.)",
+            model_path,
+        )
+        return {}
+    try:
+        from freetoken.utils import cached_load_hf_config
+
+        return cached_load_hf_config(model_path).to_dict()
+    except Exception as errore:
+        logger.warning(
+            "config di %r non leggibile (%s: %s): il dialetto degli strumenti viene "
+            "dedotto dal nome. Se il nome non basta, l'avvio si ferma dicendolo.",
+            model_path, type(errore).__name__, errore,
+        )
+        return {}
+
+
 def parse_args(
     args: List[str],
     run_shell: bool = False,
@@ -195,12 +276,7 @@ def parse_args(
         return gpu_arg(value)
 
     def _infer_tool_call_parser(model_path: str) -> str:
-        try:
-            from freetoken.utils import cached_load_hf_config
-
-            cfg = cached_load_hf_config(model_path).to_dict()
-        except Exception:
-            cfg = {}
+        cfg = _config_dal_disco(model_path)
 
         text_cfg = cfg.get("text_config") or {}
         candidates = [
@@ -290,12 +366,7 @@ def parse_args(
         )
 
     def _infer_reasoning_parser(model_path: str) -> str | None:
-        try:
-            from freetoken.utils import cached_load_hf_config
-
-            cfg = cached_load_hf_config(model_path).to_dict()
-        except Exception:
-            cfg = {}
+        cfg = _config_dal_disco(model_path)
 
         text_cfg = cfg.get("text_config") or {}
         candidates = [
