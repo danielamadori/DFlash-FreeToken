@@ -208,6 +208,14 @@ def parse_args(
             return "glm47"
         if "mistral" in marker:
             return "mistral"
+        # Llama is a FAMILY WITH A DIALECT, not the fallback it was mistaken for: it has a
+        # loader in the registry (LlamaForCausalLM), a detector of its own (llama3 ->
+        # Llama32Detector) and a --tool-call-parser choice with that name. It reached that
+        # dialect only through the catch-all below, so removing the catch-all -- rightly --
+        # also removed the only rule that names llama, and every llama node stopped starting
+        # instead of serving. Measured: without this branch, LlamaForCausalLM raised.
+        if "llama" in marker:
+            return "llama3"
         # NO CATCH-ALL. This used to `return "llama3"`, so every model the
         # chain did not recognise got llama3's dialect: the model emits its tool
         # call correctly, the parser finds nothing, and THE CALLER SEES PROSE --
@@ -223,7 +231,7 @@ def parse_args(
         raise ValueError(
             f"cannot infer --tool-call-parser for {model_path!r} "
             f"(marker: {marker!r}). Known dialects: deepseekv32, gemma4, glm47, "
-            "gpt_oss, minimax, minimax_m3, mistral, muse_glimmer, qwen25, "
+            "gpt_oss, llama3, minimax, minimax_m3, mistral, muse_glimmer, qwen25, "
             "qwen3_coder. Pass --tool-call-parser explicitly: guessing one makes "
             "the model's tool calls come back as prose, with no error anywhere."
         )

@@ -370,7 +370,7 @@ def _infer_from(module) -> "callable":
 
 
 @pytest.mark.parametrize("modulo", ["freetoken.server.args", "freetoken.engine.args"])
-def test_the_whole_qwen3_8_family_gets_the_xml_dialect(modulo: str):
+def test_the_whole_qwen3_8_family_gets_the_xml_dialect(modulo: str, senza_rete):
     """Qwen3.8-27B emits the qwen3_coder XML, and only "-Flash" was enumerated.
 
     Measured through the cluster gateway: the 27B answered a tools request with
@@ -410,3 +410,118 @@ def test_the_xml_dialect_needs_its_own_detector():
 
     sbagliato = FunctionCallParser(TOOLS, tool_call_parser="qwen25").parse_non_stream(uscita)
     assert sbagliato.calls == []
+
+
+@pytest.fixture
+def senza_rete(monkeypatch):
+    """No hub lookup while the substring chain is under test.
+
+    ``_infer_tool_call_parser`` asks ``cached_load_hf_config`` first, and for a name that is
+    not a local folder that goes to huggingface.co. Measured from this suite: a HEAD for a
+    made-up name came back 429 and the client waited 61 s, five retries deep -- one test name
+    cost more than the whole file. The rule being pinned here is the one built from the
+    marker, so the lookup is made to fail the way it fails for an unreachable hub.
+    """
+
+    def _niente_rete(percorso):
+        raise FileNotFoundError(f"nessuna rete nei test: {percorso}")
+
+    monkeypatch.setattr("freetoken.utils.cached_load_hf_config", _niente_rete)
+
+
+def _architetture_servibili() -> list[str]:
+    """The architecture keys of the model registry, read from its source.
+
+    Importing ``freetoken.models.register`` pulls the model packages in and costs this
+    suite minutes; the registry is a dict literal, so its keys are read off the syntax
+    tree instead. The count is asserted so a registry that stops being a literal fails
+    here loudly rather than silently testing nothing.
+    """
+    import ast
+    import io
+    import os
+
+    import freetoken
+
+    sorgente = os.path.join(os.path.dirname(freetoken.__file__), "models", "register.py")
+    albero = ast.parse(io.open(sorgente, encoding="utf-8").read())
+    for nodo in ast.walk(albero):
+        bersaglio = getattr(nodo, "target", None)
+        nome = getattr(bersaglio, "id", None)
+        if nome == "_MODEL_REGISTRY" and isinstance(nodo.value, ast.Dict):
+            chiavi = [k.value for k in nodo.value.keys if isinstance(k, ast.Constant)]
+            assert len(chiavi) >= 30, f"registro letto male: {len(chiavi)} architetture"
+            return chiavi
+    raise AssertionError("_MODEL_REGISTRY non trovato in register.py")
+
+
+_MODULI_ARGS = ["freetoken.server.args", "freetoken.engine.args"]
+
+
+@pytest.mark.parametrize("modulo", _MODULI_ARGS)
+def test_every_servable_architecture_resolves_to_a_real_dialect(modulo: str, senza_rete):
+    """Whatever this engine can serve, `--tool-call-parser auto` must name a dialect for it.
+
+    The chain no longer ends with a catch-all, and that is right -- guessing hands the
+    caller a tool call as prose with no error anywhere. But a refusal is only right for a
+    model this engine cannot serve: refusing one that is in the registry turns a silent
+    wrong dialect into a node that will not start at all, which is worse and was measured:
+    with the catch-all removed and no `llama` branch, LlamaForCausalLM -- a family with its
+    own loader, its own detector and its own `--tool-call-parser llama3` -- raised.
+
+    So the invariant is the registry, not a list kept by hand: every architecture the model
+    register can load must come out of the chain as a dialect the parser actually has.
+    """
+    import importlib
+
+    dedurre = _infer_from(importlib.import_module(modulo))
+    archi = _architetture_servibili()
+    rifiutate: dict[str, str] = {}
+    sconosciute: dict[str, str] = {}
+    for arch in archi:
+        try:
+            dialetto = dedurre(arch)
+        except Exception as exc:  # noqa: BLE001 -- the point is to report every one
+            rifiutate[arch] = f"{type(exc).__name__}"
+            continue
+        if dialetto not in SUPPORTED_TOOL_CALL_PARSERS:
+            sconosciute[arch] = dialetto
+    assert not rifiutate, f"{modulo}: architetture servibili senza dialetto: {rifiutate}"
+    assert not sconosciute, f"{modulo}: dialetti inesistenti: {sconosciute}"
+
+
+@pytest.mark.parametrize("modulo", _MODULI_ARGS)
+def test_the_family_is_read_from_the_architecture_not_from_the_file_name(modulo: str, senza_rete):
+    """The GGUF header says `qwen35`, and that is what must decide -- in BOTH copies.
+
+    `general.architecture` reaches the marker through model_type and architectures, so the
+    engine can know the family of a renamed file or a symlink. The chain checked qwen3_5 and
+    qwen3.5 and not qwen35, which left the production Qwen3.8 GGUF depending on the string
+    "Qwen3.8" being in the FILE NAME -- and the wrong dialect is silent.
+
+    Pinned on both args modules because both carry a copy of the rule: the fix that added
+    this line went into `engine.args`, which nothing at runtime imports, so the node kept
+    the old answer while the commit said otherwise.
+    """
+    import importlib
+
+    dedurre = _infer_from(importlib.import_module(modulo))
+
+    assert dedurre("Qwen35GGUFForCausalLM") == "qwen3_coder"
+    assert dedurre("Qwen35MoeGGUFForCausalLM") == "qwen3_coder"
+    # the family named by the architecture, with no help from the path
+    assert dedurre("/srv/pesi/modello-anonimo.gguf qwen35 Qwen35GGUFForCausalLM") == "qwen3_coder"
+    # and the family that lost its only mapping when the catch-all went away
+    assert dedurre("LlamaForCausalLM") == "llama3"
+    assert dedurre("/models/Meta-Llama-3.1-8B-Instruct") == "llama3"
+
+
+@pytest.mark.parametrize("modulo", _MODULI_ARGS)
+def test_an_unservable_model_is_refused_by_name(modulo: str, senza_rete):
+    """No catch-all: a model the chain does not know stops startup and names itself."""
+    import importlib
+
+    dedurre = _infer_from(importlib.import_module(modulo))
+
+    with pytest.raises(ValueError, match="tool-call-parser"):
+        dedurre("/models/Phi-4-mini-instruct")
