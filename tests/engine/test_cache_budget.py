@@ -503,3 +503,27 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_a_context_capped_by_the_pool_says_so(caplog):
+    """The engine refuses at the lower of ceiling and pool, and used to do it without a word.
+
+    The Dell served 27931 tokens of context against a configured 65536 and nobody could say
+    where the number came from: it is not a knob, it is whatever pool the VRAM free at startup
+    bought, so it lands somewhere new after every restart. Two agents and several days went
+    into re-deriving from the outside a fact the process had at hand.
+    """
+    from freetoken.engine.engine import _enforced_seq_len
+
+    with caplog.at_level("WARNING"):
+        assert _enforced_seq_len(65536, 27931, "KV budget") == 27931
+    riga = caplog.text
+    assert "27931" in riga and "65536" in riga, "both halves, or it cannot be diagnosed"
+    assert "startup" in riga, "and the cause: the pool follows the free VRAM, not the ceiling"
+
+    # The ceiling winning is the ordinary case and says nothing.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert _enforced_seq_len(27931, 65536, "KV budget") == 27931
+        assert _enforced_seq_len(65536, 65536, "KV budget") == 65536
+    assert caplog.text == ""

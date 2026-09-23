@@ -375,3 +375,72 @@ def test_a_node_without_a_gguf_still_answers_with_its_dtype(monkeypatch) -> None
     assert _model_ftype({}, config) == "BF16"
     # And a node whose config names no model at all never opens a file to find out.
     assert _model_ftype({}, SimpleNamespace(dtype="torch.bfloat16")) == "BF16"
+
+
+def test_the_two_halves_of_the_min_are_published_when_they_disagree() -> None:
+    """Keeping the min was right; keeping it QUIETLY is what cost the days.
+
+    The Dell published 27931 and nobody -- not the hub, not the node's own agent -- could say
+    where the number came from: it is not a knob anyone set, it is whatever KV pool the free
+    VRAM happened to buy at startup, so it lands somewhere new after every restart while the
+    max_seq_len that is supposed to explain it sits unchanged in the config.
+
+    Same shape the chain already reads: the hub answers /v1/models with n_ctx plus
+    n_ctx_observed and n_ctx_differs_because exactly when two numbers disagree.
+    """
+    p = build_props(_state(), _doc(ctx=128000, total=121899), "0")
+    assert p["default_generation_settings"]["n_ctx"] == 121899, "the engine still refuses here"
+    assert p["n_ctx_configured"] == 128000
+    assert p["n_ctx_kv_pool"] == 121899
+    perche = p["n_ctx_differs_because"]
+    assert "128000" in perche and "121899" in perche
+    assert "startup" in perche, "the cause, not just the two numbers"
+
+
+def test_nothing_extra_is_published_when_the_two_agree() -> None:
+    """A reader who sees the keys knows something is being resolved; one who does not, knows
+    nothing is. Fields that are always there say neither."""
+    p = build_props(_state(), _doc(ctx=121899, total=121899), "0")
+    for chiave in ("n_ctx_configured", "n_ctx_kv_pool", "n_ctx_differs_because"):
+        assert chiave not in p
+    # Nor when one of the two facts is simply missing: absent is not a disagreement.
+    d = _doc(ctx=65536)
+    d["kv"] = None
+    assert "n_ctx_differs_because" not in build_props(_state(), d, "0")
+
+
+def test_the_pool_is_reported_in_tokens_in_the_divergence_too() -> None:
+    """``total_pages`` is a page count. Publishing it raw beside a token ceiling would name the
+    disagreement and then misstate it by a factor of page_size."""
+    stato = SimpleNamespace(config=SimpleNamespace(max_running_req=1, page_size=16,
+                                                   model_path=None))
+    p = build_props(stato, _doc(ctx=200000, total=8000), "0")
+    assert p["n_ctx_kv_pool"] == 128000 and p["default_generation_settings"]["n_ctx"] == 128000
+
+
+def test_props_answers_the_same_context_before_and_after_the_first_chat() -> None:
+    """The pool is a fact from the moment the server is ready, not from the first request.
+
+    ``total_pages`` is stamped on generation replies, so before anyone chatted /v1/stats had no
+    kv block at all and /props -- reporting min(ceiling, pool) -- quietly published the ceiling
+    instead. The same node answered two different contexts depending on whether traffic had
+    arrived, with nothing to say which one you were looking at. compute_cache_pools already
+    ships the real allocation in the readiness meta for exactly this reason.
+    """
+    from freetoken.server.stats import StatsTracker, build_stats
+
+    config = SimpleNamespace(
+        served_model_name="m", max_seq_len=65536, page_size=1,
+        served_modalities=frozenset(), max_running_req=4, model_path="/m.gguf",
+        model_config=SimpleNamespace(has_linear_attention=False, has_swa_attention=False,
+                                     is_moe=False, dsv4_args=None),
+    )
+    stato = SimpleNamespace(config=config, stats=StatsTracker(), ready_at=None,
+                            instance_id="i", gpus=[], cache_pools={"num_pages": 27931})
+
+    freddo = build_props(stato, build_stats(stato, 0, 0), "0")
+    assert freddo["default_generation_settings"]["n_ctx"] == 27931
+    assert freddo["n_ctx_configured"] == 65536
+
+    stato.stats.kv_total_pages = 27931  # what the first reply would have stamped
+    assert build_props(stato, build_stats(stato, 0, 0), "0") == freddo

@@ -85,13 +85,58 @@ def _ctx_effettivo(card: dict, doc: dict, page_size: int) -> int:
     it would advertise a SIXTEENTH of the context it holds, and a router would turn away
     prompts the node answers: the same defect this function exists to remove, pointing the
     other way.
+
+    The min is KEPT and the disagreement is not swallowed with it: ``_divergenza_ctx`` publishes
+    both halves and the reason beside this number whenever the two differ.
     """
     tetto = _ctx_per_slot(card)
-    pagine = int(((doc.get("kv") or {}).get("total_pages")) or 0)
-    fondo = pagine * max(int(page_size or 1), 1)
+    fondo = _fondo_kv(doc, page_size)
     if tetto and fondo:
         return min(tetto, fondo)
     return tetto or fondo
+
+
+def _fondo_kv(doc: dict, page_size: int) -> int:
+    """The KV pool in TOKENS: ``total_pages`` is a page count and a page holds ``page_size``."""
+    pagine = int(((doc.get("kv") or {}).get("total_pages")) or 0)
+    return pagine * max(int(page_size or 1), 1)
+
+
+def _divergenza_ctx(card: dict, doc: dict, page_size: int) -> dict:
+    """The two halves of the ``min`` above, published whenever they disagree -- and nothing
+    when they agree.
+
+    The ``min`` is right: the engine refuses at the lower number, and advertising the other
+    would leave this node the only party in the chain believing a figure it will not serve.
+    But taking the lower number and saying nothing else DELETES THE DISAGREEMENT, and that is
+    what cost the days. The Dell published 27931 and no one -- not the hub, not the node's own
+    agent -- could say where it came from: it is not a knob anybody set, it is the pool the
+    free VRAM happened to buy at startup, so it lands somewhere new after every restart while
+    ``max_seq_len`` sits unchanged in the config that is supposed to explain it.
+
+    So the winner stays in ``n_ctx``, where the watcher reads it, and the loser is published
+    beside it with the reason. The shape is the one the chain already knows: the hub answers
+    ``/v1/models`` with ``n_ctx`` + ``n_ctx_observed`` + ``n_ctx_differs_because`` exactly when
+    two numbers disagree, and drops the extra fields when they do not. The names here are this
+    engine's own because the pair is a different pair -- the hub's is declared-vs-engine, this
+    one is ceiling-vs-pool -- and reusing a name for another meaning is the defect this file
+    removes elsewhere.
+    """
+    tetto = _ctx_per_slot(card)
+    fondo = _fondo_kv(doc, page_size)
+    if not tetto or not fondo or tetto == fondo:
+        return {}
+    return {
+        "n_ctx_configured": tetto,
+        "n_ctx_kv_pool": fondo,
+        "n_ctx_differs_because": (
+            f"max_seq_len is configured at {tetto} while the KV pool allocated at startup "
+            f"holds {fondo} tokens. The engine refuses at the lower of the two, so n_ctx is "
+            f"{min(tetto, fondo)}. The pool is sized from the VRAM free when this process "
+            "started, not from the ceiling, so it changes across restarts while the "
+            "configured ceiling does not."
+        ),
+    }
 
 
 # The ServerArgs field that holds how many requests run at once. Spelled out here, once,
@@ -121,7 +166,8 @@ def build_props(state: Any, doc: dict, version: str) -> dict:
     config = getattr(state, "config", None)
     card = doc.get("model") or {}
     slots = _slots(config)
-    return {
+    page_size = getattr(config, "page_size", 1)
+    props = {
         "model_alias": card.get("id"),
         "model_path": getattr(config, "model_path", None),
         "model_ftype": _model_ftype(card, config),
@@ -132,9 +178,13 @@ def build_props(state: Any, doc: dict, version: str) -> dict:
         "endpoint_metrics": True,
         "modalities": _modalities(config),
         "default_generation_settings": {
-            "n_ctx": _ctx_effettivo(card, doc, getattr(config, "page_size", 1))
+            "n_ctx": _ctx_effettivo(card, doc, page_size)
         },
     }
+    # Only when they disagree, so a reader who sees the keys knows something is being resolved
+    # and a reader who does not see them knows nothing is.
+    props.update(_divergenza_ctx(card, doc, page_size))
+    return props
 
 
 _FTYPE_PER_DTYPE = {

@@ -138,10 +138,18 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     config = state.config
     ready_at = getattr(state, "ready_at", None)
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
+    # total_pages is stamped on generation replies, i.e. NOT UNTIL THE FIRST CHAT. Until then
+    # this block was null and every reader of it answered with something else without saying so:
+    # /props reports min(ceiling, pool) and, with no pool, quietly published the ceiling instead
+    # -- the same node answering two different contexts depending on whether anyone had chatted
+    # yet. compute_cache_pools already ships the real allocation in the readiness meta for this
+    # very reason; read it here so the pool is one fact from the moment the server is ready.
+    pools = getattr(state, "cache_pools", None) or {}
+    kv_total_pages = tr.kv_total_pages or int(pools.get("num_pages", 0) or 0)
     kv = (
-        {"used_pages": tr.kv_used_pages, "total_pages": tr.kv_total_pages,
+        {"used_pages": tr.kv_used_pages, "total_pages": kv_total_pages,
          "page_size": getattr(config, "page_size", 1)}
-        if tr.kv_total_pages > 0 else None
+        if kv_total_pages > 0 else None
     )
     mamba = (
         {"used_slots": tr.mamba_used_slots, "total_slots": tr.mamba_total_slots}

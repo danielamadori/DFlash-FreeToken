@@ -80,6 +80,28 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
+def _enforced_seq_len(config_max: int, pool_tokens: int, event: str) -> int:
+    """The ceiling requests are really refused at, plus a line whenever it is not the configured one.
+
+    ``max_seq_len`` is what the operator asked for; ``pool_tokens`` is what the KV pool the
+    free-VRAM ratio bought can hold. The two are sized independently, the lower one wins, and
+    the scheduler refuses there -- which until now happened without a word anywhere. A node
+    then advertised a context nobody could trace back to a knob: it moves on every restart,
+    because the pool moves with the VRAM that was free at startup, and the configured ceiling
+    it lost against was never printed beside it.
+    """
+    enforced = min(config_max, pool_tokens)
+    if pool_tokens < config_max:
+        logger.warning_rank0(
+            f"{event}: context capped to {enforced} tokens by the KV pool ({pool_tokens} "
+            f"tokens), below the configured max_seq_len {config_max}. The pool is sized from "
+            "the VRAM free at startup, so this number moves across restarts while the "
+            "configured ceiling does not: raise --memory-ratio, free VRAM before starting, or "
+            "lower --max-seq-len to the figure this node can actually serve."
+        )
+    return enforced
+
+
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
     """Column count for the page table. ``_write_page_table`` writes WHOLE trailing pages, so the
     highest column touched is ``align_ceil(max_seq_len, page_size) - 1`` -- which the 32-alignment
@@ -462,7 +484,7 @@ class Engine:
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
+        self.max_seq_len = _enforced_seq_len(config.max_seq_len, num_tokens, "KV budget")
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
             (config.max_running_req + 1, aligned_max_seq_len),
@@ -920,7 +942,7 @@ class Engine:
 
     def _refresh_seq_state(self, config) -> None:
         num_tokens = self.num_pages * config.page_size
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
+        self.max_seq_len = _enforced_seq_len(config.max_seq_len, num_tokens, "cache rebuild")
         aligned_max_seq_len = _page_table_width(self.max_seq_len, config.page_size)
         if aligned_max_seq_len != self.page_table.shape[1]:
             # max_seq_len changed (e.g. KV grew past the startup token budget); the page table
