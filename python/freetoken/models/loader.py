@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import struct
+import sys
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
@@ -25,7 +26,7 @@ class MergeRule:
     slots: tuple[str, ...]
 
 
-def iter_shard_tensors(file: str, device) -> Iterator[tuple[str, torch.Tensor]]:
+def iter_shard_tensors(file: str, device: torch.device | str) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield every tensor of one safetensors shard, already on ``device``.
 
     ``safe_open(..., device="cuda:0")`` reads the shard straight into VRAM with
@@ -60,8 +61,53 @@ def iter_shard_tensors(file: str, device) -> Iterator[tuple[str, torch.Tensor]]:
     import safetensors
 
     with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-        for raw_name in f.keys():
-            yield raw_name, f.get_tensor(raw_name)
+        names = list(f.keys())
+        for index, raw_name in enumerate(names):
+            try:
+                tensor = f.get_tensor(raw_name)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    _shard_read_failure(file, raw_name, index, len(names), device, exc)
+                ) from exc
+            yield raw_name, tensor
+
+
+def _shard_read_failure(
+    file: str,
+    name: str,
+    index: int,
+    total: int,
+    device: torch.device | str,
+    exc: BaseException,
+) -> str:
+    """The facts a reader of a failed shard read needs, none of which torch's message carries.
+
+    "Attempted to access the data pointer on an invalid python storage" names neither the
+    shard, nor its size, nor the device it was being read into, so it reads like a corrupt
+    checkpoint. safetensors maps the WHOLE shard as one torch storage and slices it per
+    tensor, so the thing that failed is the shard mapping, not the tensor: the size and the
+    position in the file are what tell a shared mapping apart from a bad tensor.
+    """
+    try:
+        size = f"{os.path.getsize(file)} bytes"
+    except OSError as size_exc:  # reported, not swallowed: the size is part of the diagnosis
+        size = f"size unreadable ({size_exc})"
+    versions = [f"torch {torch.__version__}", f"platform {sys.platform}"]
+    safetensors_version = getattr(sys.modules.get("safetensors"), "__version__", None)
+    if safetensors_version is not None:
+        versions.insert(0, f"safetensors {safetensors_version}")
+    if torch.cuda.is_initialized():
+        try:
+            free, total_vram = torch.cuda.mem_get_info()
+            versions.append(f"free VRAM {free} of {total_vram} bytes")
+        except RuntimeError as vram_exc:  # reported: a dead context is itself the diagnosis
+            versions.append(f"free VRAM unreadable ({vram_exc})")
+    return (
+        f"{file} ({size}): reading tensor {index + 1} of {total}, {name!r}, into "
+        f"{device} failed with {type(exc).__name__}: {exc}. safetensors maps the whole "
+        f"shard as one torch storage and slices it per tensor, so a storage error here is "
+        f"about the shard mapping, not about this tensor. [{', '.join(versions)}]"
+    )
 
 
 def shard_tensor(

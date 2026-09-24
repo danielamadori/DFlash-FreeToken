@@ -38,10 +38,8 @@ def iter_weights(
             desc="Loading weights",
             disable=not tp_info.is_primary(),
         ):
-            # Not safe_open(device=...) directly: reading straight into VRAM works
-            # on some builds and not others, and where it fails it does so partway
-            # through the file, not on the first tensor. iter_shard_tensors tries it
-            # and finishes through host memory if it breaks, saying so.
+            # iter_shard_tensors opens the shard ONCE and does NOT fall back to host
+            # memory: its docstring says why both halves of that are deliberate.
             for raw_name, raw in iter_shard_tensors(file, device):
                 name = raw_name.removeprefix("language_model.")
                 tensor = shard_tensor(

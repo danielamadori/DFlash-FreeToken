@@ -201,3 +201,86 @@ def test_stacked_expert_pieces_pair_each_layer_in_arrival_order():
     assert torch.equal(pieces[1][3]["gate_up"], torch.full((2, 3, 4), 2.0))
     with pytest.raises(ValueError, match="Missing MoE expert source layers"):
         list(stacked_expert_pieces(tensors[:3], config))
+
+
+class _FakeShard:
+    """A safe_open handle whose second tensor raises the torch storage error."""
+
+    def __init__(self, failing: str | None, message: str) -> None:
+        self._failing = failing
+        self._message = message
+
+    def __enter__(self) -> "_FakeShard":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
+
+    def keys(self) -> list[str]:
+        return [
+            "model.embed_tokens.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.norm.weight",
+        ]
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        if self._failing is not None and name == self._failing:
+            raise RuntimeError(self._message)
+        return torch.zeros(2)
+
+
+def test_shard_read_error_names_the_shard_device_and_position(tmp_path, monkeypatch):
+    """A storage failure inside safetensors must not reach the caller unlabelled.
+
+    The message torch raises names neither the file, nor its size, nor the device, so it
+    reads like a corrupt checkpoint; the engine then wraps it in WeightLoadError and the
+    log says only that "the checkpoint cannot be read".
+    """
+    import sys
+
+    from freetoken.models.loader import iter_shard_tensors
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"\x00" * 4096)
+    torch_message = "Attempted to access the data pointer on an invalid python storage."
+    failing = "model.layers.0.self_attn.q_proj.weight"
+    fake = SimpleNamespace(
+        __version__="0.8.0",
+        safe_open=lambda file, framework, device: _FakeShard(failing, torch_message),
+    )
+    monkeypatch.setitem(sys.modules, "safetensors", fake)
+
+    with pytest.raises(RuntimeError) as raised:
+        list(iter_shard_tensors(str(shard), "cuda:0"))
+
+    message = str(raised.value)
+    assert str(shard) in message
+    assert "4096 bytes" in message
+    assert "cuda:0" in message
+    assert failing in message
+    assert "tensor 2 of 3" in message
+    assert "safetensors 0.8.0" in message
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == torch_message
+
+
+def test_shard_read_error_does_not_fire_on_a_healthy_shard(tmp_path, monkeypatch):
+    import sys
+
+    from freetoken.models.loader import iter_shard_tensors
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"\x00" * 16)
+    fake = SimpleNamespace(
+        __version__="0.8.0",
+        safe_open=lambda file, framework, device: _FakeShard(None, ""),
+    )
+    monkeypatch.setitem(sys.modules, "safetensors", fake)
+
+    names = [name for name, _ in iter_shard_tensors(str(shard), "cpu")]
+
+    assert names == [
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.norm.weight",
+    ]
