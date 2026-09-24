@@ -1489,14 +1489,23 @@ def _ensure_expandable_segments() -> None:
         except Exception as exc:  # pragma: no cover - depends on torch build
             logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
             return
-        rifiuto = _rifiuto_degli_expandable_segments(avvisi)
-        # Gli avvisi che non c'entrano tornano a chi li aspettava: catturarli per
-        # leggerne uno e poi buttarli sarebbe lo stesso difetto un livello piu' in la'.
-        for avviso in avvisi:
-            if str(avviso.message) != rifiuto:
-                warnings.warn_explicit(
-                    avviso.message, avviso.category, avviso.filename, avviso.lineno
-                )
+        # Una COPIA, e presa qui dentro: fuori dal blocco `avvisi` non e' piu'
+        # alimentata, e dentro lo e' ancora -- iterarla mentre la si alimenta e'
+        # un ciclo che non finisce. Misurato il 2026-09-24 su questo nodo: il
+        # processo di caricamento cresceva di 2 GiB ogni 6 secondi senza mai
+        # fermarsi, e py-spy lo ha trovato fermo esattamente su quella riga.
+        catturati = list(avvisi)
+    # La RI-EMISSIONE sta FUORI dal blocco che cattura. Dentro, ogni avviso
+    # rimesso in circolo verrebbe ricatturato, la lista crescerebbe di uno e il
+    # ciclo avrebbe un elemento in piu' da fare: non termina.
+    rifiuto = _rifiuto_degli_expandable_segments(catturati)
+    # Gli avvisi che non c'entrano tornano a chi li aspettava: catturarli per
+    # leggerne uno e poi buttarli sarebbe lo stesso difetto un livello piu' in la'.
+    for avviso in catturati:
+        if str(avviso.message) != rifiuto:
+            warnings.warn_explicit(
+                avviso.message, avviso.category, avviso.filename, avviso.lineno
+            )
     if rifiuto is not None:
         logger.warning_rank0(
             f"expandable_segments NOT enabled: this platform refused the setting ({rifiuto}). "

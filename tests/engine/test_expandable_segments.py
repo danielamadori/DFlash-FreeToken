@@ -156,3 +156,56 @@ def test_su_una_piattaforma_che_li_accetta_il_log_lo_dice(monkeypatch, caplog):
     detto = "\n".join(r.getMessage() for r in caplog.records)
     assert "Enabled expandable_segments" in detto
     assert "NOT enabled" not in detto
+
+
+def test_la_riemissione_non_si_rialimenta(monkeypatch):
+    """Re-emitting inside the recording block never ends, and it cost a production node.
+
+    What happened on 2026-09-24. The first version of this function re-emitted the
+    unrelated warnings from INSIDE ``with warnings.catch_warnings(record=True) as avvisi``
+    and iterated ``avvisi`` itself. Every re-emitted warning was recorded straight back
+    into that same list, so the loop grew its own iterable by one on each pass and never
+    terminated -- allocating as it went. Measured on the engine's loading child: **2 GiB
+    every 6 seconds, without ever stopping**, VRAM flat at 1.3 GiB the whole time, until
+    the machine ran out and the OOM killer took the engine. Five separate hypotheses were
+    chased before ``py-spy dump`` put the process exactly on that line.
+
+    The test runs the function in a thread and fails if it has not returned in five
+    seconds: a hang is the failure being pinned, so it has to be bounded rather than
+    asserted on a value. It also checks the honest half -- that the unrelated warning
+    still reaches the caller exactly ONCE, because "never re-emit" would pass the timeout
+    and silently swallow what the caller was waiting for.
+    """
+    import threading
+
+    from freetoken.engine import engine as motore
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+
+    def _emette_un_avviso_estraneo(_impostazione: str) -> None:
+        warnings.warn("una cosa che non c'entra", UserWarning, stacklevel=2)
+
+    monkeypatch.setattr(
+        motore.torch.cuda.memory, "_set_allocator_settings", _emette_un_avviso_estraneo
+    )
+
+    fuori: list = []
+
+    def _gira() -> None:
+        with warnings.catch_warnings(record=True) as riemessi:
+            warnings.simplefilter("always")
+            motore._ensure_expandable_segments()
+            fuori.extend(str(a.message) for a in riemessi)
+
+    filo = threading.Thread(target=_gira, daemon=True)
+    filo.start()
+    filo.join(timeout=5.0)
+
+    assert not filo.is_alive(), (
+        "_ensure_expandable_segments non e' tornata in 5 secondi: la ri-emissione sta "
+        "dentro il blocco che cattura, quindi il ciclo si rialimenta e non termina"
+    )
+    assert fuori == ["una cosa che non c'entra"], (
+        f"l'avviso estraneo doveva tornare al chiamante una volta sola, e' tornato {fuori}"
+    )
