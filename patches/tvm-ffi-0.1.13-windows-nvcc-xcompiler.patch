@@ -1,0 +1,57 @@
+Subject: [PATCH] tvm-ffi: -Xcompiler takes ONE argument, so /O2 became an input file
+
+apache-tvm-ffi builds an nvcc command line that nvcc refuses, on Windows only,
+and it blocks every JIT kernel FreeToken compiles at startup. Measured on the
+Dell (Windows 11, CUDA 12.6, RTX 3050) on 2026-09-25 with
+apache-tvm-ffi==0.1.13.post3, which pyproject.toml pins.
+
+WHAT HAPPENS. `-Xcompiler` forwards ONE argument to the host compiler. Given
+["-Xcompiler", "/std:c++17", "/O2"], nvcc hands /std:c++17 to cl.exe and is left
+holding /O2 as a free token, which it reads as a SECOND input file:
+
+    nvcc fatal : A single input file is required for a non-link phase when an
+                 outputfile is specified
+
+The engine dies with that, on freetoken__index_3072_2_128_1_false_*, after the
+weights have already loaded -- so it looks like a runtime fault rather than a
+build one: /v1/models answers 200, and the first real generation returns 503.
+
+REPRODUCED IN ONE LINE, not inferred. With a .cu containing only
+`__global__ void k(){}`:
+
+    -Xcompiler /std:c++17 /O2   -> nvcc fatal: A single input file is required
+                                   (character for character, the engine's error)
+    -Xcompiler /std:c++17,/O2   -> passes argument parsing
+
+WINDOWS ONLY, and that is why nobody has hit it. The Linux branch of the same
+function (line ~427) is ["-std=c++17", "-O2"] with no -Xcompiler, because there
+it is not needed. This patch touches the Windows branch alone, so a Linux node
+applying it changes nothing.
+
+NOT FIXED BY UPGRADING, and not avoidable from our side. Checked, not assumed:
+0.1.14.post1 -- the latest -- carries the identical line 418. And
+extension.py:450 does `cuda_cflags = default_cuda_cflags + extra_cuda_cflags`:
+it SUMS, so anything FreeToken passes is appended and the free token stays.
+
+WHY A VERSIONED PATCH AND NOT AN EDIT IN THE VENV. Editing the installed file
+works tonight and makes that machine differ from a clean install WITHOUT IT
+BEING VISIBLE -- which is the class of invisible divergence that undermines
+exactly the cross-node comparability these measurements exist for. A patch in
+the repository means a clean install REBUILDS the same divergence instead of
+not having it: a machine that differs in a declared way. The MacBook Air M2
+already carries patches/llama.cpp-moestream-metrics.patch for the same reason.
+
+UPSTREAM: not yet reported at the time of writing. Put the link here when it is,
+and delete this file when a released version carries the fix.
+
+--- a/tvm_ffi/cpp/extension.py
++++ b/tvm_ffi/cpp/extension.py
+@@ -415,7 +415,7 @@
+         ]
+         default_cflags += _win_warnings
+         default_cxxflags += _win_warnings
+-        default_cuda_cflags = ["-Xcompiler", "/std:c++17", "/O2"]
++        default_cuda_cflags = ["-Xcompiler", "/std:c++17,/O2"]
+         default_ldflags = [
+             "/DLL",
+             f"/LIBPATH:{tvm_ffi_lib_path}",
