@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -246,7 +247,7 @@ def test_shard_read_error_names_the_shard_device_and_position(tmp_path, monkeypa
     failing = "model.layers.0.self_attn.q_proj.weight"
     fake = SimpleNamespace(
         __version__="0.8.0",
-        safe_open=lambda file, framework, device: _FakeShard(failing, torch_message),
+        safe_open=lambda file, framework, device, backend: _FakeShard(failing, torch_message),
     )
     monkeypatch.setitem(sys.modules, "safetensors", fake)
 
@@ -273,7 +274,7 @@ def test_shard_read_error_does_not_fire_on_a_healthy_shard(tmp_path, monkeypatch
     shard.write_bytes(b"\x00" * 16)
     fake = SimpleNamespace(
         __version__="0.8.0",
-        safe_open=lambda file, framework, device: _FakeShard(None, ""),
+        safe_open=lambda file, framework, device, backend: _FakeShard(None, ""),
     )
     monkeypatch.setitem(sys.modules, "safetensors", fake)
 
@@ -284,3 +285,124 @@ def test_shard_read_error_does_not_fire_on_a_healthy_shard(tmp_path, monkeypatch
         "model.layers.0.self_attn.q_proj.weight",
         "model.norm.weight",
     ]
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [("win32", "pread"), ("linux", "mmap"), ("darwin", "mmap")],
+)
+def test_safetensors_backend_auto_is_pread_only_on_windows(
+    platform: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """auto follows the platform, because the defect it dodges is a Windows mechanism.
+
+    safe_open's mmap backend takes one non-shared (FILE_MAP_COPY) view of the whole shard
+    and Windows charges system commit for the full file size against it; Linux overcommit
+    means there is nothing there to dodge, so auto must not change the read there.
+    """
+    import sys
+
+    from freetoken.env import ENV
+    from freetoken.models.loader import safetensors_backend
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(ENV.SAFETENSORS_BACKEND, "value", "auto")
+
+    assert safetensors_backend() == expected
+
+
+@pytest.mark.parametrize("requested", ["mmap", "pread"])
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_safetensors_backend_explicit_value_beats_the_platform(
+    requested: str, platform: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from freetoken.env import ENV
+    from freetoken.models.loader import safetensors_backend
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(ENV.SAFETENSORS_BACKEND, "value", requested)
+
+    assert safetensors_backend() == requested
+
+
+def test_safetensors_backend_rejects_an_unknown_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unrecognised value raises and lists what is accepted -- it does not fall back.
+
+    Nothing upstream catches it: EnvStr parses with str(), which never fails, so a typo
+    reaches this function intact and a silent default here would serve it forever.
+    """
+    from freetoken.env import ENV
+    from freetoken.models.loader import safetensors_backend
+
+    monkeypatch.setattr(ENV.SAFETENSORS_BACKEND, "value", "pwrite")
+
+    with pytest.raises(ValueError) as raised:
+        safetensors_backend()
+
+    message = str(raised.value)
+    assert "FREETOKEN_SAFETENSORS_BACKEND='pwrite'" in message
+    for valid in ("'auto'", "'mmap'", "'pread'"):
+        assert valid in message
+
+
+def test_iter_shard_tensors_passes_the_resolved_backend_to_safe_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The resolved backend must reach safe_open, not merely be computed.
+
+    A backend that is decided and then dropped leaves the Windows node exactly where it
+    started -- mapping the whole shard, and failing whenever the commit limit is low
+    enough that minute -- while every log line claims it is reading instead.
+    """
+    import sys
+
+    from freetoken.env import ENV
+    from freetoken.models.loader import iter_shard_tensors
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"\x00" * 16)
+    seen: list[str] = []
+
+    # the default mirrors safe_open's own, so a backend that never leaves the loader shows
+    # up as "<not passed>" instead of as a TypeError with no reading in it
+    def opened(file: str, framework: str, device: str, backend: str = "<not passed>") -> _FakeShard:
+        seen.append(backend)
+        return _FakeShard(None, "")
+
+    monkeypatch.setitem(
+        sys.modules, "safetensors", SimpleNamespace(__version__="0.8.0", safe_open=opened)
+    )
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    for value in ("auto", "mmap", "pread"):
+        monkeypatch.setattr(ENV.SAFETENSORS_BACKEND, "value", value)
+        list(iter_shard_tensors(str(shard), "cpu"))
+
+    assert seen == ["pread", "mmap", "pread"]
+
+
+def test_shard_read_failure_names_the_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Which backend was reading is the first thing to change when the shard read fails."""
+    import sys
+
+    from freetoken.env import ENV
+    from freetoken.models.loader import iter_shard_tensors
+
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"\x00" * 4096)
+    failing = "model.layers.0.self_attn.q_proj.weight"
+    fake = SimpleNamespace(
+        __version__="0.8.0",
+        safe_open=lambda file, framework, device, backend: _FakeShard(failing, "boom"),
+    )
+    monkeypatch.setitem(sys.modules, "safetensors", fake)
+    monkeypatch.setattr(ENV.SAFETENSORS_BACKEND, "value", "pread")
+
+    with pytest.raises(RuntimeError) as raised:
+        list(iter_shard_tensors(str(shard), "cpu"))
+
+    assert "backend pread" in str(raised.value)

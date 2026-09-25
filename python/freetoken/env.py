@@ -163,6 +163,30 @@ class EnvClassSingleton:
     # one more mantissa bit, but it saturates at 448, and attention leans on the outliers that
     # clips. Default stays auto because this is a deliberate trade, not a free win.
     KV_CACHE_DTYPE = EnvStr("auto")
+    # safetensors storage backend for reading a shard: auto (default) | mmap | pread.
+    # "auto" is pread on Windows and mmap everywhere else. The default differs by platform
+    # because the MECHANISM does, not out of caution: safe_open's mmap backend takes ONE
+    # non-shared (FILE_MAP_COPY) view of the whole shard, and Windows charges SYSTEM COMMIT
+    # for the entire file size against such a view. Measured on a 16 GB Windows 11 node
+    # (GlobalMemoryStatusEx) with a 2944 MB shard: commit 52056 of 62914 MB before, +2956 MB
+    # for one mapping, +5900 MB with a second one still live. The limit is not fixed either
+    # -- Windows grows the page file under pressure -- so two identical attempts a minute
+    # apart meet two different limits, which is why the load failed INTERMITTENTLY, at the
+    # first get_tensor, with "Attempted to access the data pointer on an invalid python
+    # storage": the assert fires on the parent storage of the failed shard mapping.
+    #
+    # pread reads the bytes instead of mapping them and takes no such charge: +1143 MB for
+    # the same shard on the same device (an overestimate, it paid the CUDA init), and faster
+    # in 4 pairs out of 4, between 2.2x and 4.2x, arms alternated with the order flipped
+    # every pair. The DIRECTION is measured; the magnitude is not (5.08x spread inside one
+    # arm, on a card throttling to 30 W). On Linux overcommit means the defect does not
+    # exist at all, so changing the default there would be changing at random.
+    #
+    # DECLARED LIMIT, AND NOT MEASURABLE ON THIS CLUSTER: when the file is larger than
+    # physical RAM, mmap can drop clean pages while pread cannot -- that copy is ours. The
+    # direction could reverse there, and no node here can prove it, because the two nodes
+    # small enough to hit the case are Apple Silicon, where this engine does not run.
+    SAFETENSORS_BACKEND = EnvStr("auto")
 
     def __new__(cls):
         # single instance

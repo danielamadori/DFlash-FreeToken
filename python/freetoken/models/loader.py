@@ -11,12 +11,41 @@ from dataclasses import dataclass
 from typing import Iterable, Iterator
 
 import torch
+from freetoken.env import ENV
 from freetoken.utils import div_ceil, download_hf_weight
 
 logger = logging.getLogger(__name__)
 
 SPLIT_DIM_0 = (".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj")
 SPLIT_DIM_1 = (".o_proj", ".down_proj")
+
+SAFETENSORS_BACKENDS = ("mmap", "pread")
+
+
+def safetensors_backend() -> str:
+    """``safe_open`` storage backend, from FREETOKEN_SAFETENSORS_BACKEND ("auto" = per platform).
+
+    auto is pread on Windows and mmap elsewhere, because what it avoids is a Windows
+    mechanism and not a Windows suspicion: the mmap backend takes one non-shared
+    (FILE_MAP_COPY) view of the whole shard, and Windows charges system commit for the full
+    file size against it, so a shard that fits in RAM several times over still fails when
+    the commit limit says no -- and that limit moves, because the page file grows under
+    pressure, which is what made the failure intermittent. env.py carries the numbers, and
+    the one case this cluster cannot measure: a file larger than physical RAM, where mmap
+    can drop clean pages and pread cannot.
+
+    Requires safetensors >= 0.8: 0.7.0 and earlier have no ``backend`` keyword and raise
+    TypeError. That is the floor pyproject.toml declares.
+    """
+    name = str(ENV.SAFETENSORS_BACKEND).lower()
+    if name in ("auto", ""):
+        return "pread" if sys.platform.startswith("win") else "mmap"
+    if name not in SAFETENSORS_BACKENDS:
+        raise ValueError(
+            f"FREETOKEN_SAFETENSORS_BACKEND={name!r} is not one of "
+            f"{'auto'!r}, {', '.join(map(repr, SAFETENSORS_BACKENDS))}"
+        )
+    return name
 
 
 @dataclass(frozen=True)
@@ -57,17 +86,22 @@ def iter_shard_tensors(file: str, device: torch.device | str) -> Iterator[tuple[
     them. The same goes for loaders that need the handle itself (``get_slice``, a
     ``set(f.keys())`` to look ahead, a handle held open across shards). Those are
     already opening once, which is the part that matters.
+
+    The single open is not enough on Windows, because one mapping is already too many
+    there: see ``safetensors_backend``, which picks how the bytes are served and which the
+    other families still do not ask -- they open with the library default.
     """
     import safetensors
 
-    with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+    backend = safetensors_backend()
+    with safetensors.safe_open(file, framework="pt", device=str(device), backend=backend) as f:
         names = list(f.keys())
         for index, raw_name in enumerate(names):
             try:
                 tensor = f.get_tensor(raw_name)
             except RuntimeError as exc:
                 raise RuntimeError(
-                    _shard_read_failure(file, raw_name, index, len(names), device, exc)
+                    _shard_read_failure(file, raw_name, index, len(names), device, backend, exc)
                 ) from exc
             yield raw_name, tensor
 
@@ -78,6 +112,7 @@ def _shard_read_failure(
     index: int,
     total: int,
     device: torch.device | str,
+    backend: str,
     exc: BaseException,
 ) -> str:
     """The facts a reader of a failed shard read needs, none of which torch's message carries.
@@ -87,12 +122,16 @@ def _shard_read_failure(
     checkpoint. safetensors maps the WHOLE shard as one torch storage and slices it per
     tensor, so the thing that failed is the shard mapping, not the tensor: the size and the
     position in the file are what tell a shared mapping apart from a bad tensor.
+
+    The backend is in there because it is the first thing to change when this fires: under
+    mmap the shard was mapped and the size is what Windows charged to the commit limit,
+    under pread it was read and the size is what was copied.
     """
     try:
         size = f"{os.path.getsize(file)} bytes"
     except OSError as size_exc:  # reported, not swallowed: the size is part of the diagnosis
         size = f"size unreadable ({size_exc})"
-    versions = [f"torch {torch.__version__}", f"platform {sys.platform}"]
+    versions = [f"torch {torch.__version__}", f"platform {sys.platform}", f"backend {backend}"]
     safetensors_version = getattr(sys.modules.get("safetensors"), "__version__", None)
     if safetensors_version is not None:
         versions.insert(0, f"safetensors {safetensors_version}")

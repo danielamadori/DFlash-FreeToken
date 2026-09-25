@@ -51,7 +51,9 @@ dependencies = [
     "prompt_toolkit>=3.0,<4",
     "pydantic>=2.9,<3",
     "pyzmq>=27,<28",
-    "safetensors>=0.6,<1",
+    # floor: safe_open's `backend` keyword ("mmap" | "pread") arrives in 0.8.0 -- 0.7.0 and
+    # 0.6.x raise TypeError on it, and the loader passes it on every shard open.
+    "safetensors>=0.8,<1",
     # WINDOWS ONLY, AND NOT OPTIONAL THERE. asyncio on Windows runs a Proactor
     # event loop, which has no add_reader; pyzmq needs one, and falls back to
     # tornado's selector thread when it can find tornado. Without it the engine
