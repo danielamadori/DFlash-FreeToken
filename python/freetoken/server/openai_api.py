@@ -34,6 +34,7 @@ from .generation import (
     ToolCallsDelta,
     generate_events,
     generate_full,
+    generate_full_watching,
     prerender_error,
     render_messages,
     resolve_sampling,
@@ -217,7 +218,8 @@ async def handle_chat_completion(
         return StreamingResponse(chunks, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
+        result = await generate_full_watching(
+            uid, spec, state, source="/v1/chat/completions", request=request)
     except GenerationError as exc:
         return create_error_response(str(exc), code=exc.code)
     message: dict[str, Any] = {"role": "assistant", "content": result.content}

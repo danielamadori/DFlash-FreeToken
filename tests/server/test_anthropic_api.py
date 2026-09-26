@@ -458,6 +458,11 @@ class FakeState:
         async for chunk in gen:
             yield chunk
 
+    async def await_with_cancellation(self, awaitable, request, uid):
+        # The double for the whole-answer twin: this file does not exercise the hang-up, only
+        # that the adapter routes through it.
+        return await awaitable
+
 
 def _client(fake):
     from fastapi.testclient import TestClient

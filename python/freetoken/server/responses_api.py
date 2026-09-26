@@ -71,6 +71,7 @@ from .generation import (
     ToolCallStart,
     generate_events,
     generate_full,
+    generate_full_watching,
     render_messages,
     resolve_sampling,
     split_tool_lists,
@@ -173,7 +174,8 @@ async def handle_responses(
         return StreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/responses")
+        result = await generate_full_watching(
+            uid, spec, state, source="/v1/responses", request=request)
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
     response = build_responses_response(result, req, response_id, created, cache_report=cache_report)

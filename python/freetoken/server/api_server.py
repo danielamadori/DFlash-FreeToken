@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal
+from typing import Any, Awaitable, Callable, Dict, List, Literal
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -38,6 +38,7 @@ from pydantic import BaseModel
 from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
+from .generation import QueueFullError
 from .control_api import register_control_routes
 from .node_metrics import register_node_metrics_routes
 from .openai_api import register_openai_routes
@@ -48,6 +49,9 @@ from .responses_api import register_responses_routes
 from .stats import StatsTracker
 
 logger = init_logger(__name__, "FrontendAPI")
+
+# How often a non-streamed generation checks whether its caller is still there.
+_DISCONNECT_POLL_S = 0.5
 
 _GLOBAL_STATE = None
 # Recommended sampling defaults from the checkpoint's generation_config.json, applied to
@@ -371,6 +375,23 @@ class FrontendManager:
             asyncio.create_task(self.abort_user(uid))
             raise
 
+    async def await_with_cancellation(self, awaitable: "Awaitable[Any]", request: Request, uid: int) -> Any:
+        """The non-streamed twin of stream_with_cancellation. A streamed answer notices the hang-up
+        between chunks; a whole answer never yields, so without this poll nothing notices at all."""
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=_DISCONNECT_POLL_S)
+                if done:
+                    return task.result()
+                if await request.is_disconnected():
+                    logger.info("Client disconnected for user %s", uid)
+                    raise asyncio.CancelledError
+        except asyncio.CancelledError:
+            task.cancel()
+            asyncio.create_task(self.abort_user(uid))
+            raise
+
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
         if uid in self.ack_map:
@@ -436,6 +457,13 @@ def _stats_doc() -> dict:
 
 
 register_control_routes(app, get_global_state, lambda: _MODEL_SAMPLING)
+async def _queue_full(_: Request, exc: Exception) -> JSONResponse:
+    # 429 and not 503: the engine is healthy, it is this caller's turn that cannot be taken.
+    return JSONResponse(status_code=429, content={"error": str(exc)},
+                        headers={"Retry-After": "5"})
+
+
+app.add_exception_handler(QueueFullError, _queue_full)
 register_accounting_routes(app, get_global_state)
 # /props and /metrics at the ROOT, not under /v1: that is where a llama.cpp-shaped watcher
 # looks, and until these existed a node running this engine reported heartbeats and never a

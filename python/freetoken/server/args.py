@@ -45,6 +45,9 @@ class ServerArgs(SchedulerConfig):
     # The workers read it to leave the shell's foreground process group, so the ^C that cancels
     # a turn cannot also kill the engine — see server/launch.py:_detach_process_group.
     shell_mode: bool = False
+    # Cap on requests admitted but not yet terminal, 0 disables it. Without a cap every caller
+    # that hangs up on a non-streamed path leaves its generation behind: 1725 of them on 2026-09-26.
+    max_waiting_req: int = 64
     served_model_name: str | None = None
     tool_call_parser: str = "llama3"
     # Reasoning parser that splits <think> reasoning from content for OpenAI
@@ -443,6 +446,14 @@ def parse_args(
         dest="max_running_req",
         default=ServerArgs.max_running_req,
         help="The maximum number of running requests.",
+    )
+
+    parser.add_argument(
+        "--max-waiting-requests",
+        type=int,
+        dest="max_waiting_req",
+        default=ServerArgs.max_waiting_req,
+        help="The maximum number of admitted-but-unfinished requests; 0 disables the cap.",
     )
 
     parser.add_argument(

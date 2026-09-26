@@ -62,6 +62,11 @@ class GenerationError(ValueError):
         self.code = code
 
 
+class QueueFullError(RuntimeError):
+    """Admission refused because too many requests are already admitted and not yet terminal.
+    Deliberately not a ValueError: the request is well formed, so it must not be read as a 400."""
+
+
 # --------------------------------------------------------------------------- #
 # Protocol-neutral generation events.
 #
@@ -381,7 +386,12 @@ def strip_cache_ns(model: str | None) -> str | None:
 
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
-    calls this — it takes the neutral spec, not a wire request type."""
+    calls this -- it takes the neutral spec, not a wire request type."""
+    cap = int(getattr(state.config, "max_waiting_req", 0) or 0)
+    if cap > 0 and int(state.stats.active) >= cap:
+        raise QueueFullError(
+            f"{state.stats.active} requests are already admitted and the cap is {cap}"
+        )
     _ttft_begin(time.monotonic())
     refs = collect_image_refs(spec.messages)
     images = await _resolve_images(refs, state) if refs else None
@@ -684,6 +694,18 @@ async def generate_full(
             completion_tokens=result.completion_tokens if result else 0,
             error=error,
         )
+
+
+async def generate_full_watching(
+    uid: int, spec: GenSpec, state: Any, *, source: str, request: Any
+) -> GenResult:
+    """generate_full, plus the abort a hung-up caller deserves. Every non-streamed adapter goes
+    through here so the streamed and whole-answer paths cancel alike."""
+    coro = generate_full(uid, spec, state, source=source)
+    if request is None:
+        return await coro
+    result: GenResult = await state.await_with_cancellation(coro, request, uid)
+    return result
 
 
 async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
