@@ -1,0 +1,116 @@
+Subject: [PATCH] tvm-ffi: the Windows branch is written by halves
+
+THREE DEFECTS, ONE FAMILY, and they are reported together on purpose: each one
+is only reachable once the previous is repaired, so three separate reports would
+read as three unlucky bugs instead of one branch nobody exercises. Measured on
+the Dell (Windows 11, CUDA 12.6, MSVC, RTX 3050) against
+apache-tvm-ffi==0.1.13.post3, which DFlash-FreeToken pins; 0.1.14.post1, the
+latest at the time of writing, carries the same code.
+
+The Linux branch of the same function is correct in all three places. That is
+the point: nobody compiles CUDA kernels through this package on Windows, so the
+branch has never been run end to end.
+
+--- 1. `-Xcompiler` takes ONE argument, so /O2 became an input file
+
+    default_cuda_cflags = ["-Xcompiler", "/std:c++17", "/O2"]
+
+nvcc forwards /std:c++17 to cl.exe and is left holding /O2, which it reads as a
+SECOND input file. Reproduced on a .cu containing one empty kernel:
+
+    -Xcompiler /std:c++17 /O2   -> nvcc fatal: A single input file is required
+                                   for a non-link phase when an outputfile is
+                                   specified
+    -Xcompiler /std:c++17,/O2   -> argument analysis passes
+
+--- 2. once it compiles, /std:c++17 wins over the caller's /std:c++20
+
+Not fixed here -- DFlash-FreeToken handles it on its own side, and it is named
+because it is the same branch and the same mechanism. nvcc puts its own
+-std=c++20 on the host line FIRST and every -Xcompiler group AFTER, so tvm-ffi's
+/std:c++17 ends up the LAST /std: on cl's line and wins. Headers that need C++20
+(<concepts>, <source_location>) then fail with C2039. The caller appends
+-Xcompiler /std:c++20,/Zc:__cplusplus, which wins by the same rule --
+/Zc:__cplusplus because MSVC otherwise reports __cplusplus as 199711 even when
+compiling C++20, and <source_location> hides behind that check.
+
+--- 3. the CUDA runtime library is never linked on Windows
+
+`cudart` appears EXACTLY ONCE in extension.py, at line 444, inside the
+non-Windows branch:
+
+    if with_cuda:
+        default_ldflags += ["-L{}".format(Path(_find_cuda_home()) / "lib64"),
+                            "-lcudart"]
+
+so the Windows link line carries neither the CUDA library path nor the runtime,
+and the link dies on the symbols that live in it:
+
+    cuda_0.o : error LNK2019: unresolved external symbol __cudaRegisterFatBinary
+    cuda_0.o : error LNK2019: ... __cudaRegisterFatBinaryEnd
+    cuda_0.o : error LNK2019: ... __cudaUnregisterFatBinary
+    cuda_0.o : error LNK2019: ... __cudaRegisterFunction
+    freetoken__index_3072_2_128_1_false.dll : fatal error LNK1120: 8 unresolved
+
+`lib/x64` and not `lib64`: verified on this machine, where
+v12.6/lib/x64/cudart.lib exists and v12.6/lib64 does not. `_find_cuda_home()`
+resolves correctly from CUDA_PATH.
+
+WHY A VERSIONED PATCH AND NOT AN EDIT IN THE VENV. Editing the installed package
+works today and makes this machine differ from a clean install WITHOUT IT BEING
+VISIBLE, which is the divergence that would undermine the cross-node
+comparability these measurements exist for. Versioned, a clean install rebuilds
+the same divergence instead of lacking it. The MacBook Air M2 already carries
+patches/llama.cpp-moestream-metrics.patch for the same reason.
+
+--- WHAT THIS PATCH DOES AND DOES NOT TOUCH
+
+Only defect 3. Defect 1 is repaired by `freetoken.kernel.utils` in the engine's
+OWN code, and that repair RAISES when it can no longer find the broken string,
+because absence means upstream has fixed it. Repairing it here too tripped that
+guard -- which did exactly its job. One defect, one fix, in the place that owns
+it. Defect 2 is likewise handled engine-side. Both are described above because
+a report that shows three instances of the same shape is a stronger argument
+than three separate ones.
+
+UPSTREAM: not yet reported. Put the link here when it is, and delete this file
+when a released version carries the fix.
+
+--- 4. and the CUDA path has a space in it
+
+Found by fixing 3 and running again, which is how every one of these was found.
+The standard CUDA location on Windows is
+"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6", and an unquoted
+/LIBPATH: is split on the space:
+
+    LINK : fatal error LNK1181: cannot open input file 'Files\NVIDIA.obj'
+
+So the path is quoted here. The neighbouring f"/LIBPATH:{tvm_ffi_lib_path}" is
+not, and has never shown it, because that path lives inside the venv where there
+is no space -- the same defect waiting for a machine whose user name has one.
+
+WHAT WAS ACTUALLY PROVEN, and the wording matters because it is easy to widen.
+With this patch and the engine-side repairs, on the Dell the engine BUILDS ITS
+KERNELS, LOADS, AND ANSWERS: 18 tokens, finish_reason=stop, ready 65 s after
+launch, 4777 MiB of VRAM. That is "the Windows branch gets as far as generating",
+NOT "the Windows branch is repaired" -- each of these four was only reachable
+once the previous was fixed, so a fifth may sit further along the path.
+
+--- a/tvm_ffi/cpp/extension.py
++++ b/tvm_ffi/cpp/extension.py
+@@ -421,6 +421,15 @@ def _generate_ninja_build(  # noqa: PLR0915, PLR0912
+             f"/LIBPATH:{tvm_ffi_lib_path}",
+             f"{tvm_ffi_lib_name}.lib",
+         ]
++        if with_cuda:
++            default_ldflags += [
++                # QUOTED: the standard CUDA path on Windows contains a space
++                # ("C:\Program Files\NVIDIA GPU Computing Toolkit\..."), and left
++                # unquoted the linker splits it -- LNK1181: cannot open input
++                # file 'Files\NVIDIA.obj'.
++                '/LIBPATH:"{}"'.format(Path(_find_cuda_home()) / "lib" / "x64"),
++                "cudart.lib",
++            ]
+     else:
+         default_cflags = ["-fPIC", "-O2"]
+         default_cxxflags = ["-std=c++17", "-fPIC", "-O2"]
