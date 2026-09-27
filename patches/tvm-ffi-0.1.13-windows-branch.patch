@@ -73,8 +73,11 @@ it. Defect 2 is likewise handled engine-side. Both are described above because
 a report that shows three instances of the same shape is a stronger argument
 than three separate ones.
 
-UPSTREAM: not yet reported. Put the link here when it is, and delete this file
-when a released version carries the fix.
+UPSTREAM: https://github.com/apache/tvm-ffi/issues/822 (opened 2026-09-28).
+Delete this file when a released version carries the fix -- and note that the
+engine-side repair in `freetoken.kernel.utils` will say so by itself: it RAISES
+when it can no longer find the broken string, because absence means upstream
+fixed it.
 
 --- 4. and the CUDA path has a space in it
 
