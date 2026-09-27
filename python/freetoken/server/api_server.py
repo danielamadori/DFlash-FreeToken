@@ -1126,8 +1126,37 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         daemon=True,
     ).start()
 
-    if run_shell:
-        _serve_and_run_shell(host, port)
-        return
-    # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
-    uvicorn.run(app, host=host, port=port)
+    # A FAILED START MUST NOT LEAVE THE WORKERS BEHIND. Everything from here can raise --
+    # uvicorn failing to bind, the shell path, a fault while weights load -- and until this
+    # guard existed none of the three teardown paths ran in that case: shutdown() is the
+    # orderly stop, the SIGTERM/SIGHUP handler needs a signal, and the shell's finally needs
+    # the shell. So the parent died with a traceback and the spawned workers stayed alive
+    # holding VRAM.
+    #
+    # MEASURED ON THE DELL, twice: after a failed start, three multiprocessing.spawn workers
+    # with a dead parent, one holding 3982 MiB of a 6001 MiB card -- enough to make the NEXT
+    # attempt fail with "Not enough memory for KV cache", which is a false fault standing in
+    # for the real one and sends the diagnosis somewhere else. An earlier attempt left 10.9 GB.
+    #
+    # BaseException on purpose: a KeyboardInterrupt during load leaves the same orphans as an
+    # error does. The exception is re-raised untouched -- this only cleans up, it never decides
+    # that a failure was not a failure.
+    #
+    # WHAT THIS DOES NOT COVER, and cannot: SIGKILL of the parent, or an OOM kill. No code
+    # inside a process runs after that. Closing it needs the OS to hold the relationship --
+    # PR_SET_PDEATHSIG on Linux, a Job Object with KILL_ON_JOB_CLOSE on Windows -- which is a
+    # different change and is not this one.
+    try:
+        if run_shell:
+            _serve_and_run_shell(host, port)
+            return
+        # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
+        uvicorn.run(app, host=host, port=port)
+    except BaseException:
+        if not _SHUTTING_DOWN.is_set():
+            _SHUTTING_DOWN.set()
+            logger.error("The API server is going down on an error; tearing down the backend "
+                         "workers so they do not outlive it and hold VRAM")
+            _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
+            _reap_backend_workers(_GLOBAL_STATE.backend_processes)
+        raise
