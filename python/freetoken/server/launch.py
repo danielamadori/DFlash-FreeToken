@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from freetoken.distributed import DistributedInfo
+from freetoken.server.windows_job import install_kill_on_close_job
 from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
@@ -157,6 +158,19 @@ def launch_server(
 
         mp.set_start_method("spawn", force=True)
         detach = server_args.shell_mode  # see _detach_process_group
+
+        # BEFORE THE FIRST SPAWN, and that ordering is the whole point: on
+        # Windows a process started by a process already inside a job belongs to
+        # that job automatically, so joining here means every worker below is
+        # covered from the instant it exists. Adopting each one after `start()`
+        # would leave a window -- and a crash during startup, which is when the
+        # orphans were seen both times, falls exactly into it.
+        #
+        # It is the only teardown that survives `Stop-Process -Force`, an OOM
+        # kill or a power loss, because it is enforced by the kernel and not by
+        # code we get to run. No-op off Windows, and a warning naming what is
+        # not covered if it cannot be installed.
+        install_kill_on_close_job()
 
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue = mp.Queue()
