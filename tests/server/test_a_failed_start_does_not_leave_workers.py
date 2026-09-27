@@ -58,21 +58,20 @@ def tre_worker(monkeypatch: pytest.MonkeyPatch) -> list[FakeWorker]:
 
 
 def _corri_e_falli(monkeypatch: pytest.MonkeyPatch, errore: BaseException) -> None:
-    """The tail of run_api_server, reproduced: uvicorn raises where it would really raise."""
-    def boom(*_a: Any, **_k: Any) -> None:
-        raise errore
+    """Calls THE GUARD ITSELF, not a copy of it.
 
-    monkeypatch.setattr(api_server.uvicorn, "run", boom)
+    The first version of this file re-implemented the try/except inline, and changing
+    `except BaseException` to `except Exception` in the real code left three of four cases
+    green: the test was exercising its own copy. That is the same defect as checking a
+    deployment from the tree you edited -- the copy in hand answers, and it answers about
+    itself. Fixed by extracting the guard into `_teardown_workers_on_error` so there is one
+    implementation and the test reaches it.
+    """
     with pytest.raises(type(errore)):
         try:
-            api_server.uvicorn.run(None, host="127.0.0.1", port=1)
+            raise errore
         except BaseException:
-            if not api_server._SHUTTING_DOWN.is_set():
-                api_server._SHUTTING_DOWN.set()
-                api_server._terminate_backend_workers(
-                    api_server._GLOBAL_STATE.backend_processes)
-                api_server._reap_backend_workers(
-                    api_server._GLOBAL_STATE.backend_processes)
+            api_server._teardown_workers_on_error()
             raise
 
 
@@ -103,7 +102,7 @@ def test_la_guardia_e_nel_sorgente_e_dichiara_cosa_NON_copre() -> None:
     non eseguono nessun codice: chiuderli vuole PR_SET_PDEATHSIG o un Job Object, non questo."""
     import inspect
 
-    fonte = inspect.getsource(api_server.run_api_server)
-    assert "except BaseException" in fonte
+    assert "except BaseException" in inspect.getsource(api_server.run_api_server)
+    fonte = inspect.getsource(api_server._teardown_workers_on_error)
     assert "SIGKILL" in fonte
     assert "PR_SET_PDEATHSIG" in fonte

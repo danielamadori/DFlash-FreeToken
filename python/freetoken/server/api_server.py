@@ -89,6 +89,37 @@ def _terminate_backend_workers(processes: List[Any]) -> None:
             continue
 
 
+def _teardown_workers_on_error() -> None:
+    """Tear the backend workers down when the serve is going down on an error.
+
+    A FAILED START MUST NOT LEAVE THE WORKERS BEHIND, and until this existed none of the three
+    teardown paths ran in that case: ``shutdown()`` is the orderly stop, the SIGTERM/SIGHUP
+    handler needs a signal, and the shell's ``finally`` needs the shell. A traceback out of
+    ``run_api_server`` ran none of them, so the parent died and the spawned workers stayed alive
+    holding VRAM.
+
+    MEASURED ON THE DELL, twice: after a failed start, three multiprocessing.spawn workers with
+    a dead parent, one holding 3982 MiB of a 6001 MiB card -- enough to make the NEXT attempt
+    fail with "Not enough memory for KV cache", which is a false fault standing in for the real
+    one and sends the diagnosis elsewhere. An earlier attempt left 10.9 GB behind.
+
+    Does nothing when ``_SHUTTING_DOWN`` is already set: somebody has already torn them down,
+    and doing it again would hide who did it first.
+
+    WHAT IT DOES NOT COVER, and cannot: SIGKILL of the parent, or an OOM kill. No code inside a
+    process runs after either. Closing that needs the OS to hold the relationship --
+    PR_SET_PDEATHSIG on Linux, a Job Object with KILL_ON_JOB_CLOSE on Windows -- which is a
+    different change and not this one.
+    """
+    if _SHUTTING_DOWN.is_set():
+        return
+    _SHUTTING_DOWN.set()
+    logger.error("The API server is going down on an error; tearing down the backend workers "
+                 "so they do not outlive it and hold VRAM")
+    _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
+    _reap_backend_workers(_GLOBAL_STATE.backend_processes)
+
+
 def _exit_after_backend_death(grace_s: float) -> threading.Timer:
     def _stop() -> None:
         if _SHUTTING_DOWN.is_set():
@@ -1153,10 +1184,5 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         # uvicorn stays on the main thread (signal handling unchanged); ^C reaches the worker group.
         uvicorn.run(app, host=host, port=port)
     except BaseException:
-        if not _SHUTTING_DOWN.is_set():
-            _SHUTTING_DOWN.set()
-            logger.error("The API server is going down on an error; tearing down the backend "
-                         "workers so they do not outlive it and hold VRAM")
-            _terminate_backend_workers(_GLOBAL_STATE.backend_processes)
-            _reap_backend_workers(_GLOBAL_STATE.backend_processes)
+        _teardown_workers_on_error()
         raise
