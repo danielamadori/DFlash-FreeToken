@@ -128,7 +128,8 @@ def _swa_page_size(config: Any) -> int:
     return 1
 
 
-def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
+def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int,
+                p95_window: tuple[int, int] = (0, 0)) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
     pages + the pool's own page_size (tokens = pages x page_size). gpus: the engine's GPU as
@@ -178,6 +179,10 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "active": tr.active,
             "completed": tr.completed,
             "p95_ms": p95_ms,
+            # The window p95_ms was computed over: how many requests, and the seconds they
+            # span. Added because the number alone is unreadable -- see RequestRing.p95_window.
+            "p95_window_requests": p95_window[0],
+            "p95_window_seconds": p95_window[1],
             "ttft_mean_ms": ttft_mean_ms,
             "prompt_tokens_total": tr.prompt_tokens_total,
             "completion_tokens_total": tr.completion_tokens_total,

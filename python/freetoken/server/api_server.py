@@ -481,7 +481,8 @@ def _stats_doc() -> dict:
     from .stats import build_stats
 
     doc = build_stats(
-        get_global_state(), request_ring.requests_p95_ms(), request_ring.requests_ttft_mean_ms()
+        get_global_state(), request_ring.requests_p95_ms(), request_ring.requests_ttft_mean_ms(),
+        request_ring.requests_p95_window()
     )
     doc["model"]["sampling"] = _MODEL_SAMPLING or {}
     return doc

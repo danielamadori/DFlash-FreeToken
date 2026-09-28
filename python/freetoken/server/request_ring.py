@@ -7,6 +7,7 @@ reads the same ring. Purely in-process — request_logger.py still owns the on-d
 from __future__ import annotations
 
 import math
+import datetime
 from collections import deque
 from dataclasses import asdict, dataclass
 
@@ -60,6 +61,36 @@ class RequestRing:
         k = max(0, math.ceil(0.95 * len(durs)) - 1)
         return int(durs[k])
 
+    def p95_window(self) -> tuple[int, int]:
+        """How many requests the p95 covers, and how many seconds they span.
+
+        A NUMBER WITHOUT ITS WINDOW CANNOT BE READ, and this one's window is worse than either
+        obvious guess: it is not «since start» and not «the last five minutes», it is THE LAST
+        512 REQUESTS -- so how long it covers depends entirely on the traffic. On a busy engine
+        that is a minute; on a quiet one it is the whole uptime.
+
+        MEASURED ON THETHING, 2026-09-28: p95_ms read 541.9 s while a real request answered in
+        55 ms, a factor of ten thousand, because 27 of the 73 requests in the ring were one
+        agent's measurement campaign and twelve of those ran over 300 seconds. The same field,
+        read three days earlier during a real incident, said 18.7 hours and was CORRECT: the
+        queue truly was the state. Same field, same reading, opposite validity, and nothing
+        saying which.
+
+        So the window is reported beside the number instead of being guessed. It does not fix
+        the ambiguity -- only the reader can -- but it gives the reader what they need.
+        """
+        if not self._buf:
+            return 0, 0
+        istanti = []
+        for _idx, rec in self._buf:
+            try:
+                istanti.append(datetime.datetime.fromisoformat(rec.ts))
+            except (ValueError, TypeError):
+                continue
+        if len(istanti) < 2:
+            return len(self._buf), 0
+        return len(self._buf), int((max(istanti) - min(istanti)).total_seconds())
+
     def ttft_mean_ms(self) -> int:
         """Mean TTFT over the records that have one."""
         vals = [rec.ttft_ms for _idx, rec in self._buf if rec.ttft_ms is not None]
@@ -85,6 +116,10 @@ def requests_since(cursor: int, limit: int) -> tuple[list[dict], int]:
 
 def requests_p95_ms() -> int:
     return _RING.p95_ms()
+
+
+def requests_p95_window() -> tuple[int, int]:
+    return _RING.p95_window()
 
 
 def requests_ttft_mean_ms() -> int:
