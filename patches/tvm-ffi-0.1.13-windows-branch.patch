@@ -73,8 +73,11 @@ it. Defect 2 is likewise handled engine-side. Both are described above because
 a report that shows three instances of the same shape is a stronger argument
 than three separate ones.
 
-UPSTREAM: not yet reported. Put the link here when it is, and delete this file
-when a released version carries the fix.
+UPSTREAM: https://github.com/apache/tvm-ffi/issues/822 (opened 2026-09-28).
+Delete this file when a released version carries the fix -- and note that the
+engine-side repair in `freetoken.kernel.utils` will say so by itself: it RAISES
+when it can no longer find the broken string, because absence means upstream
+fixed it.
 
 --- 4. and the CUDA path has a space in it
 
@@ -96,10 +99,33 @@ launch, 4777 MiB of VRAM. That is "the Windows branch gets as far as generating"
 NOT "the Windows branch is repaired" -- each of these four was only reachable
 once the previous was fixed, so a fifth may sit further along the path.
 
+--- 5. the same unquoted /LIBPATH: on the tvm-ffi path -- LATENT, NOT REPRODUCED
+
+    f"/LIBPATH:{tvm_ffi_lib_path}"
+
+Identical to 4 and one line above it, and it has never split on a space only
+because that path lives inside the venv. It waits for a machine whose user name
+contains one. Quoting a path that has no spaces is still correct, so it is fixed
+here too and the trap is gone before anybody meets it.
+
+It is written down as LATENT on purpose: this one was not reproduced, and a
+repair whose evidence is different from its neighbour's should say so. Its
+premise -- "the venv path has no space" -- is a condition that can change
+underneath it.
+
 --- a/tvm_ffi/cpp/extension.py
 +++ b/tvm_ffi/cpp/extension.py
-@@ -421,6 +421,15 @@ def _generate_ninja_build(  # noqa: PLR0915, PLR0912
-             f"/LIBPATH:{tvm_ffi_lib_path}",
+@@ -418,9 +418,23 @@ def _generate_ninja_build(  # noqa: PLR0915, PLR0912
+         default_cuda_cflags = ["-Xcompiler", "/std:c++17", "/O2"]
+         default_ldflags = [
+             "/DLL",
+-            f"/LIBPATH:{tvm_ffi_lib_path}",
++            # QUOTED TOO, and this one is LATENT -- not reproduced. It has never
++            # split on a space because tvm_ffi_lib_path lives inside the venv,
++            # and it waits for a machine whose user name has one. Quoting a path
++            # without spaces is still correct, so the fix costs nothing and the
++            # trap goes away before somebody meets it.
++            '/LIBPATH:"{}"'.format(tvm_ffi_lib_path),
              f"{tvm_ffi_lib_name}.lib",
          ]
 +        if with_cuda:
